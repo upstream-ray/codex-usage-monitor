@@ -1,5 +1,5 @@
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -24,15 +24,41 @@ pub const WM_APP: u32 = 0x8000;
 pub const WM_APP_USAGE_UPDATED: u32 = WM_APP + 1;
 pub const WM_APP_TRAY: u32 = WM_APP + 3;
 
-/// Get the taskbar window handle
-pub fn find_taskbar() -> Option<HWND> {
-    unsafe {
-        let class = wide_str("Shell_TrayWnd");
-        match FindWindowW(PCWSTR::from_raw(class.as_ptr()), PCWSTR::null()) {
-            Ok(h) if h != HWND::default() => Some(h),
-            _ => None,
+#[derive(Clone, Copy, Debug)]
+pub struct TaskbarWindow {
+    pub hwnd: HWND,
+    pub rect: RECT,
+}
+
+pub fn find_taskbars() -> Vec<TaskbarWindow> {
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let taskbars = &mut *(lparam.0 as *mut Vec<TaskbarWindow>);
+        let mut class_name = [0u16; 64];
+        let len = unsafe { GetClassNameW(hwnd, &mut class_name) };
+        if len > 0 {
+            let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
+            if class_name == "Shell_TrayWnd" || class_name == "Shell_SecondaryTrayWnd" {
+                if let Some(rect) = get_taskbar_rect(hwnd).or_else(|| get_window_rect_safe(hwnd)) {
+                    taskbars.push(TaskbarWindow { hwnd, rect });
+                }
+            }
         }
+        BOOL(1)
     }
+
+    let mut taskbars: Vec<TaskbarWindow> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut taskbars as *mut _ as isize));
+    }
+    taskbars.sort_by_key(|taskbar| {
+        (
+            taskbar.rect.top,
+            taskbar.rect.left,
+            taskbar.rect.bottom,
+            taskbar.rect.right,
+        )
+    });
+    taskbars
 }
 
 /// Find a child window by class name
@@ -54,6 +80,15 @@ pub fn find_child_window(parent: HWND, class_name: &str) -> Option<HWND> {
 /// Get taskbar position via SHAppBarMessage
 pub fn get_taskbar_rect(taskbar_hwnd: HWND) -> Option<RECT> {
     unsafe {
+        let mut class_name = [0u16; 64];
+        let len = GetClassNameW(taskbar_hwnd, &mut class_name);
+        if len > 0 {
+            let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
+            if class_name == "Shell_SecondaryTrayWnd" {
+                return get_window_rect_safe(taskbar_hwnd);
+            }
+        }
+
         let mut abd = APPBARDATA {
             cbSize: std::mem::size_of::<APPBARDATA>() as u32,
             hWnd: taskbar_hwnd,

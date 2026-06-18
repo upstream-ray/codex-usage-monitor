@@ -78,9 +78,11 @@ struct AppState {
     update_status: UpdateStatus,
     last_update_check_unix: Option<u64>,
 
+    taskbar_index: usize,
     tray_offset: i32,
     dragging: bool,
     drag_start_mouse_x: i32,
+    drag_start_client_x: i32,
     drag_start_offset: i32,
 
     widget_visible: bool,
@@ -123,8 +125,6 @@ const IDM_LANG_RUSSIAN: u16 = 49;
 const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 50;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
-
-const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
@@ -203,6 +203,8 @@ fn settings_path() -> PathBuf {
 struct SettingsFile {
     #[serde(default)]
     tray_offset: i32,
+    #[serde(default)]
+    taskbar_index: usize,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -221,6 +223,7 @@ impl Default for SettingsFile {
     fn default() -> Self {
         Self {
             tray_offset: 0,
+            taskbar_index: 0,
             poll_interval_ms: default_poll_interval(),
             language: None,
             last_update_check_unix: None,
@@ -274,6 +277,7 @@ fn save_state_settings() {
     if let Some(s) = state.as_ref() {
         save_settings(&SettingsFile {
             tray_offset: s.tray_offset,
+            taskbar_index: s.taskbar_index,
             poll_interval_ms: s.poll_interval_ms,
             language: s
                 .language_override
@@ -364,6 +368,103 @@ fn toggle_widget_visibility(hwnd: HWND) {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
     }
+}
+
+fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
+    let taskbars = native_interop::find_taskbars();
+    if taskbars.is_empty() {
+        diagnose::log("taskbar not found; using fallback popup window");
+        return false;
+    }
+
+    let index = requested_index.min(taskbars.len().saturating_sub(1));
+    let taskbar = taskbars[index];
+    diagnose::log(format!(
+        "taskbar selected index={index} count={} hwnd={:?} rect=({}, {}, {}, {})",
+        taskbars.len(),
+        taskbar.hwnd,
+        taskbar.rect.left,
+        taskbar.rect.top,
+        taskbar.rect.right,
+        taskbar.rect.bottom
+    ));
+
+    let old_hook = {
+        let mut state = lock_state();
+        state.as_mut().and_then(|s| s.win_event_hook.take())
+    };
+    if let Some(hook) = old_hook {
+        native_interop::unhook_win_event(hook);
+    }
+
+    native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
+
+    let tray_notify = native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd");
+    if tray_notify.is_some() {
+        diagnose::log("TrayNotifyWnd found");
+    } else {
+        diagnose::log("TrayNotifyWnd not found");
+    }
+
+    let hook = tray_notify.and_then(|tray_hwnd| {
+        let thread_id = native_interop::get_window_thread_id(tray_hwnd);
+        native_interop::set_tray_event_hook(thread_id, on_tray_location_changed)
+    });
+    if hook.is_some() {
+        diagnose::log("tray event hook installed");
+    } else {
+        diagnose::log("tray event hook could not be installed");
+    }
+
+    let mut state = lock_state();
+    if let Some(s) = state.as_mut() {
+        s.taskbar_hwnd = Some(taskbar.hwnd);
+        s.tray_notify_hwnd = tray_notify;
+        s.win_event_hook = hook;
+        s.taskbar_index = index;
+        s.embedded = true;
+    }
+    true
+}
+
+fn taskbar_at_point(pt: POINT) -> Option<(usize, native_interop::TaskbarWindow)> {
+    native_interop::find_taskbars()
+        .into_iter()
+        .enumerate()
+        .find(|(_, taskbar)| {
+            pt.x >= taskbar.rect.left
+                && pt.x < taskbar.rect.right
+                && pt.y >= taskbar.rect.top
+                && pt.y < taskbar.rect.bottom
+        })
+}
+
+fn tray_left_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT) -> i32 {
+    let mut tray_left = taskbar_rect.right;
+    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
+        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
+            tray_left = tray_rect.left;
+        }
+    }
+    tray_left
+}
+
+fn clamp_offset_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT, offset: i32) -> i32 {
+    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
+    let max_offset = (tray_left - taskbar_rect.left - total_widget_width()).max(0);
+    offset.clamp(0, max_offset)
+}
+
+fn offset_for_drop_point(
+    taskbar_hwnd: HWND,
+    taskbar_rect: RECT,
+    pt: POINT,
+    drag_start_client_x: i32,
+) -> i32 {
+    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
+    let desired_left = pt.x - taskbar_rect.left - drag_start_client_x;
+    let offset = tray_left - taskbar_rect.left - total_widget_width() - desired_left;
+    clamp_offset_for_taskbar(taskbar_hwnd, taskbar_rect, offset)
 }
 
 fn now_unix_secs() -> u64 {
@@ -1025,45 +1126,19 @@ pub fn run() {
                 last_poll_ok: false,
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
+                taskbar_index: settings.taskbar_index,
                 tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
+                drag_start_client_x: 0,
                 drag_start_offset: 0,
                 widget_visible: settings.widget_visible,
             });
         }
 
         // Try to embed in taskbar
-        if let Some(taskbar_hwnd) = native_interop::find_taskbar() {
-            diagnose::log(format!("taskbar found hwnd={:?}", taskbar_hwnd));
-            native_interop::embed_in_taskbar(hwnd, taskbar_hwnd);
+        if attach_to_taskbar(hwnd, settings.taskbar_index) {
             embedded = true;
-
-            let mut state = lock_state();
-            let s = state.as_mut().unwrap();
-            s.taskbar_hwnd = Some(taskbar_hwnd);
-            s.embedded = true;
-
-            let tray_notify = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd");
-            s.tray_notify_hwnd = tray_notify;
-            if tray_notify.is_some() {
-                diagnose::log("TrayNotifyWnd found");
-            } else {
-                diagnose::log("TrayNotifyWnd not found");
-            }
-
-            if let Some(tray_hwnd) = tray_notify {
-                let thread_id = native_interop::get_window_thread_id(tray_hwnd);
-                let hook = native_interop::set_tray_event_hook(thread_id, on_tray_location_changed);
-                s.win_event_hook = hook;
-                if hook.is_some() {
-                    diagnose::log("tray event hook installed");
-                } else {
-                    diagnose::log("tray event hook could not be installed");
-                }
-            }
-        } else {
-            diagnose::log("taskbar not found; using fallback popup window");
         }
 
         // If not embedded, fall back to topmost popup with SetLayeredWindowAttributes
@@ -1768,6 +1843,24 @@ fn position_at_taskbar() {
     }
 
     let widget_width = total_widget_width();
+    let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
+    let tray_offset = tray_offset.clamp(0, max_offset);
+    let offset_changed = {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            if s.tray_offset != tray_offset {
+                s.tray_offset = tray_offset;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
+    if offset_changed {
+        save_state_settings();
+    }
 
     let widget_height = sc(WIDGET_HEIGHT);
     let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
@@ -1979,31 +2072,24 @@ unsafe extern "system" fn wnd_proc(
                 return LRESULT(1);
             }
             if hit_test == 1 {
-                // HTCLIENT
-                let mut pt = POINT::default();
-                let _ = GetCursorPos(&mut pt);
-                let _ = ScreenToClient(hwnd, &mut pt);
-                if pt.x < sc(DIVIDER_HIT_ZONE) {
-                    let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
-                    SetCursor(cursor);
-                    return LRESULT(1);
-                }
+                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
+                SetCursor(cursor);
+                return LRESULT(1);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONDOWN => {
             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
-            if client_x < sc(DIVIDER_HIT_ZONE) {
-                let mut pt = POINT::default();
-                let _ = GetCursorPos(&mut pt);
-                let mut state = lock_state();
-                if let Some(s) = state.as_mut() {
-                    s.dragging = true;
-                    s.drag_start_mouse_x = pt.x;
-                    s.drag_start_offset = s.tray_offset;
-                }
-                SetCapture(hwnd);
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                s.dragging = true;
+                s.drag_start_mouse_x = pt.x;
+                s.drag_start_client_x = client_x;
+                s.drag_start_offset = s.tray_offset;
             }
+            SetCapture(hwnd);
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -2103,13 +2189,14 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let was_dragging = {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let drag_result = {
                 let mut state = lock_state();
                 if let Some(s) = state.as_mut() {
                     if s.dragging {
                         s.dragging = false;
-                        let offset = s.tray_offset;
-                        Some(offset)
+                        Some((s.taskbar_index, s.drag_start_client_x))
                     } else {
                         None
                     }
@@ -2117,8 +2204,28 @@ unsafe extern "system" fn wnd_proc(
                     None
                 }
             };
-            if was_dragging.is_some() {
+            if let Some((current_taskbar_index, drag_start_client_x)) = drag_result {
                 let _ = ReleaseCapture();
+                if let Some((target_index, target_taskbar)) = taskbar_at_point(pt) {
+                    if target_index != current_taskbar_index {
+                        let new_offset = offset_for_drop_point(
+                            target_taskbar.hwnd,
+                            target_taskbar.rect,
+                            pt,
+                            drag_start_client_x,
+                        );
+                        {
+                            let mut state = lock_state();
+                            if let Some(s) = state.as_mut() {
+                                s.tray_offset = new_offset;
+                            }
+                        }
+                        if attach_to_taskbar(hwnd, target_index) {
+                            position_at_taskbar();
+                            render_layered();
+                        }
+                    }
+                }
                 save_state_settings();
             }
             LRESULT(0)
