@@ -13,6 +13,7 @@ pub(super) const STRINGS: Strings = Strings {
     models: "模型",
     claude_code_model: "Claude Code",
     codex_model: "Codex",
+    antigravity_model: "Antigravity",
     settings: "設定",
     start_with_windows: "開機時啟動",
     reset_position: "重置位置",
@@ -41,6 +42,9 @@ pub(super) const STRINGS: Strings = Strings {
     token_expired_body: "請在終端機中執行 'claude'，然後使用 '/login' 並依照提示操作。完成後，請重新整理或重新啟動此應用程式。",
     codex_token_expired_title: "Codex 驗證錯誤",
     codex_token_expired_body: "請在終端機中執行 'codex'，並依照登入提示操作。完成後，請重新整理或重新啟動此應用程式。",
+    antigravity_token_expired_title: "Antigravity 驗證錯誤",
+    antigravity_token_expired_body: "請開啟 Antigravity 並重新登入。完成後，請重新整理或重新啟動此應用程式。",
     codex_window_title: "Codex 使用量監控",
+    antigravity_window_title: "Antigravity 使用量監控",
     second_suffix: "秒",
 };

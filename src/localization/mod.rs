@@ -4,10 +4,10 @@ mod french;
 mod german;
 mod japanese;
 mod korean;
+mod portuguese_brazil;
+mod russian;
 mod spanish;
 mod traditional_chinese;
-mod russian;
-mod portuguese_brazil;
 
 use windows::core::PWSTR;
 use windows::Win32::Globalization::{
@@ -147,6 +147,7 @@ pub struct Strings {
     pub models: &'static str,
     pub claude_code_model: &'static str,
     pub codex_model: &'static str,
+    pub antigravity_model: &'static str,
     pub settings: &'static str,
     pub start_with_windows: &'static str,
     pub reset_position: &'static str,
@@ -176,7 +177,10 @@ pub struct Strings {
     pub token_expired_body: &'static str,
     pub codex_token_expired_title: &'static str,
     pub codex_token_expired_body: &'static str,
+    pub antigravity_token_expired_title: &'static str,
+    pub antigravity_token_expired_body: &'static str,
     pub codex_window_title: &'static str,
+    pub antigravity_window_title: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {

@@ -13,6 +13,7 @@ pub(super) const STRINGS: Strings = Strings {
     models: "Modelle",
     claude_code_model: "Claude Code",
     codex_model: "Codex",
+    antigravity_model: "Antigravity",
     settings: "Einstellungen",
     start_with_windows: "Mit Windows starten",
     reset_position: "Position zurücksetzen",
@@ -41,6 +42,9 @@ pub(super) const STRINGS: Strings = Strings {
     token_expired_body: "Führen Sie 'claude' in einem Terminal aus, verwenden Sie dann '/login' und folgen Sie den Anweisungen. Aktualisieren oder starten Sie diese App anschließend neu.",
     codex_token_expired_title: "Codex-Authentifizierungsfehler",
     codex_token_expired_body: "Fuhren Sie 'codex' in einem Terminal aus und folgen Sie den Anmeldeanweisungen. Aktualisieren oder starten Sie diese App anschliessend neu.",
+    antigravity_token_expired_title: "Antigravity-Authentifizierungsfehler",
+    antigravity_token_expired_body: "Offnen Sie Antigravity und melden Sie sich erneut an. Aktualisieren oder starten Sie diese App anschliessend neu.",
     codex_window_title: "Codex-Nutzungsmonitor",
+    antigravity_window_title: "Antigravity-Nutzungsmonitor",
     second_suffix: "s",
 };
