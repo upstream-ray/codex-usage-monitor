@@ -9,7 +9,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Registry::*;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
@@ -130,6 +130,10 @@ const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
+/// How often the watchdog thread polls for an explorer.exe restart (which
+/// recreates the taskbar and wipes our tray-icon registration).
+const TASKBAR_WATCH_INTERVAL_SECS: u64 = 2;
+
 static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
@@ -155,6 +159,93 @@ fn refresh_dpi() {
             CURRENT_DPI.store(dpi, Ordering::Relaxed);
         }
     }
+}
+
+/// Spacing below which two relaunches are treated as a storm (e.g. explorer.exe
+/// crash-looping); when detected we back off instead of spawning in a tight loop.
+const RELAUNCH_THROTTLE_SECS: u64 = 10;
+const RELAUNCH_BACKOFF_SECS: u64 = 30;
+/// Environment flag set on a relaunched child so it waits for the previous
+/// instance's single-instance mutex instead of exiting immediately.
+const ENV_RELAUNCH: &str = "CCUM_RELAUNCH";
+/// Unix timestamp (seconds) of the relaunch that spawned this process, passed to
+/// the child so it can detect a relaunch storm.
+const ENV_LAST_RELAUNCH_UNIX: &str = "CCUM_LAST_RELAUNCH_UNIX";
+
+/// Relaunch the widget as a fresh process after explorer.exe has restarted.
+///
+/// When the shell restarts it destroys our embedded child window outright (the
+/// window is gone, not merely orphaned - `IsWindow` returns false) and leaves
+/// the UI thread parked in `GetMessage` with no window to recreate in place.
+/// Spawning a clean new process - which re-embeds into the freshly created
+/// taskbar - and exiting this one is the robust recovery. The child is flagged
+/// via `ENV_RELAUNCH` so it waits for this instance's single-instance mutex to
+/// be released before taking over (see the guard in `run`).
+fn relaunch_self() {
+    // Back off if we are relaunching very soon after the relaunch that spawned
+    // us: that signals the shell is crash-looping, not a one-off restart.
+    let now = now_unix_secs();
+    let last = std::env::var(ENV_LAST_RELAUNCH_UNIX)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if last != 0 && now.saturating_sub(last) < RELAUNCH_THROTTLE_SECS {
+        diagnose::log("relaunch storm detected; backing off before relaunching");
+        std::thread::sleep(Duration::from_secs(RELAUNCH_BACKOFF_SECS));
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            diagnose::log_error("watchdog: unable to resolve current executable", error);
+            return;
+        }
+    };
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match std::process::Command::new(exe)
+        .args(&args)
+        .env(ENV_RELAUNCH, "1")
+        .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
+        .spawn()
+    {
+        Ok(_) => {
+            diagnose::log("watchdog: relaunched fresh instance, exiting old one");
+            std::process::exit(0);
+        }
+        Err(error) => {
+            diagnose::log_error("watchdog: unable to spawn relaunched instance", error);
+        }
+    }
+}
+
+/// Detect explorer.exe restarts and recover from them.
+///
+/// Once explorer destroys the taskbar, our embedded child window is destroyed
+/// and the UI message loop is dead, so recovery cannot happen in-process. This
+/// dedicated thread (independent of the dead message loop) polls the taskbar
+/// handle and, when it changes, relaunches the widget as a fresh process.
+fn spawn_taskbar_watchdog() {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
+        let stored = {
+            let state = lock_state();
+            state.as_ref().and_then(|s| s.taskbar_hwnd)
+        };
+        // Only relevant once we have embedded into a taskbar at least once.
+        let Some(old) = stored else {
+            continue;
+        };
+        if let Some(new) = native_interop::find_taskbar() {
+            if new != old {
+                diagnose::log(format!(
+                    "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
+                    old.0, new.0
+                ));
+                relaunch_self();
+            }
+        }
+    });
 }
 
 fn load_embedded_app_icons() -> (HICON, HICON) {
@@ -900,15 +991,29 @@ pub fn run() {
     }
     diagnose::log("window::run started");
 
-    // Single-instance guard: silently exit if another instance is running
+    // Single-instance guard: silently exit if another instance is running.
+    // Exception: when relaunched after an explorer restart (ENV_RELAUNCH set),
+    // wait for the previous instance to release the mutex, then take over.
+    let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
     let mutex_name = native_interop::wide_str("Global\\ClaudeCodeUsageMonitor");
     let _mutex = unsafe {
-        let handle = CreateMutexW(None, false, PCWSTR::from_raw(mutex_name.as_ptr()));
+        let handle = CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr()));
         match handle {
             Ok(h) => {
                 if GetLastError() == ERROR_ALREADY_EXISTS {
-                    diagnose::log("startup aborted: another instance is already running");
-                    return;
+                    if is_relaunch {
+                        diagnose::log("relaunch: waiting for previous instance to exit");
+                        let wait_result = WaitForSingleObject(h, 10_000);
+                        if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
+                            diagnose::log(format!(
+                                "startup aborted: previous instance did not exit cleanly ({wait_result:?})"
+                            ));
+                            return;
+                        }
+                    } else {
+                        diagnose::log("startup aborted: another instance is already running");
+                        return;
+                    }
                 }
                 h
             }
@@ -1102,6 +1207,13 @@ pub fn run() {
                 .unwrap_or(POLL_15_MIN)
         };
         SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
+
+        // Watch for explorer.exe restarts so we can re-embed and re-add the tray
+        // icon (the shell discards tray registrations when it restarts). This
+        // runs on a dedicated thread, NOT a window timer: once explorer destroys
+        // the taskbar, our embedded child window stops receiving all messages
+        // (WM_TIMER included), so a timer would never fire again.
+        spawn_taskbar_watchdog();
 
         // Initial poll
         let send_hwnd = SendHwnd::from_hwnd(hwnd);
