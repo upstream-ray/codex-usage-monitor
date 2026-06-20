@@ -236,14 +236,14 @@ fn spawn_taskbar_watchdog() {
         let Some(old) = stored else {
             continue;
         };
-        if let Some(new) = native_interop::find_taskbar() {
-            if new != old {
-                diagnose::log(format!(
-                    "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
-                    old.0, new.0
-                ));
-                relaunch_self();
-            }
+        let taskbars = native_interop::find_taskbars();
+        if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
+            let new = taskbars[0].hwnd;
+            diagnose::log(format!(
+                "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
+                old.0, new.0
+            ));
+            relaunch_self();
         }
     });
 }
