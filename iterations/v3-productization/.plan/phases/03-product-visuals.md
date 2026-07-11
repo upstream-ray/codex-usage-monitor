@@ -1,6 +1,6 @@
 # Phase 03 — 产品视觉身份
 
-**Status**: `in progress`
+**Status**: `completed`
 **目标**: 用新的 Codex Usage 图标和一致素材替换上游视觉身份，并验证 Windows 显示质量。
 **前置**: Phase 02
 
@@ -17,7 +17,7 @@
 - [x] 生成 Windows 多尺寸 ICO 与仓库展示素材 (`scripts/generate_icons.py`; `src/icons/icon.ico`: 16/20/24/32/40/48/64/128/256; `.github/codex-usage-icon.png`)
 - [x] 接入构建资源、托盘图标和 README (`build.rs` 使用 `src/icons/icon.ico`; `src/tray_icon.rs`: Codex 加载态使用嵌入图标；`README.md`: `.github/codex-usage-icon.png`)
 - [x] 验证深浅主题、多 DPI 和实际任务栏渲染 (`target/codex-usage-icon-verification.png`: 16/32/48/128px 深浅背景；ICO 9 sizes；`target/codex-usage-embedded-icon.png`: 从 release EXE 反向提取；PID 9596 运行成功)
-- [~] 提交并推送视觉版本
+- [x] 提交并推送视觉版本 (commit `7ba3e3e`; `git push origin HEAD:main`)
 
 ## Notes
 
