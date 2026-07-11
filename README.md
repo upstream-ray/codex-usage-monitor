@@ -1,6 +1,8 @@
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+**English** | [简体中文](README.zh-CN.md)
+
 # Codex Usage
 
 <img src=".github/codex-usage-icon.png" alt="Codex Usage icon" width="96" height="96">
