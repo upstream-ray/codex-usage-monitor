@@ -27,7 +27,7 @@
 | # | 阶段 slug | 一句话目标 | 状态 |
 |---|---|---|---|
 | 01 | baseline-review | 审查、验证并提交当前定制基线 | completed |
-| 02 | public-release | 建立合规的公开仓库与独立发布渠道 | not started |
+| 02 | public-release | 建立合规的公开仓库与独立发布渠道 | in progress |
 | 03 | product-visuals | 建立新的产品图标和一致视觉身份 | not started |
 | 04 | install-upgrade | 提供可靠的安装、升级与卸载体验 | not started |
 | 05 | reliability | 强化错误处理、更新安全和长期运行稳定性 | not started |

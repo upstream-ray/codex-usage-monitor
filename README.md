@@ -44,13 +44,13 @@ If you use Claude Code through WSL, that is supported too. The monitor can read 
 
 ## Install
 
-Build the personalized release executable:
+Download `codex-usage.exe` from the [latest release](https://github.com/upstream-ray/codex-usage-monitor/releases/latest), or build it locally:
 
 ```powershell
 cargo build --release
 ```
 
-The executable is created at `target\release\codex-usage.exe`.
+Local builds create the executable at `target\release\codex-usage.exe`.
 
 ## Use
 
@@ -178,8 +178,8 @@ If the newer usage endpoint is unavailable, it can fall back to reading the rate
 
 ## Open Source
 
-This project is licensed under MIT.
+This project is licensed under the MIT License. The original [LICENSE](LICENSE) and copyright notice are preserved.
 
-Codex Usage is a personalized derivative of Code Zeno's Claude Code Usage Monitor. The original copyright notice and MIT license are preserved in [LICENSE](LICENSE).
+Codex Usage is a maintained derivative of [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor). Thanks to Craig Constable and the upstream contributors for the original project. Changes in this repository are not affiliated with or endorsed by the upstream maintainers or OpenAI.
 
 If you want to inspect the behavior or audit the code, everything is in this repository.
