@@ -44,5 +44,5 @@
 ## Open Questions
 
 - [x] GitHub 账户或组织归属、仓库最终 URL — `https://github.com/upstream-ray/codex-usage-monitor`
-- [ ] 正式 WinGet 包首次提交时机 — 预期在 phase 04 根据安装包与 Release 稳定性决定
+- [x] 正式 WinGet 包首次提交时机 — v1.6.0 manifest 已验证；向 `microsoft/winget-pkgs` 发起公共 PR 需用户单独确认
 - [x] 新图标最终方案 — 采用 A“C 形额度环 + 三条剩余量刻度”，青蓝/青柠/深海军蓝配色

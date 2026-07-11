@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
+
+PackageIdentifier: Ray.CodexUsage
+PackageVersion: 1.6.0
+InstallerType: portable
+Commands:
+- codex-usage
+ReleaseDate: 2026-07-11
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/upstream-ray/codex-usage-monitor/releases/download/v1.6.0/codex-usage.exe
+  InstallerSha256: 75761C6DFF9C833D0A6B7A09992CE53BD417CF4A5234C065E06B1968171E2222
+ManifestType: installer
+ManifestVersion: 1.12.0
