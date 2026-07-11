@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -70,6 +71,10 @@ struct AppState {
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_session_window: bool,
+    show_weekly_window: bool,
+    alert_threshold_percent: u8,
+    notified_quota_windows: BTreeSet<String>,
 
     data: Option<AppUsageData>,
 
@@ -132,6 +137,12 @@ const IDM_LANG_SIMPLIFIED_CHINESE: u16 = 51;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
+const IDM_SHOW_SESSION_WINDOW: u16 = 71;
+const IDM_SHOW_WEEKLY_WINDOW: u16 = 72;
+const IDM_ALERT_OFF: u16 = 80;
+const IDM_ALERT_10: u16 = 81;
+const IDM_ALERT_20: u16 = 82;
+const IDM_ALERT_30: u16 = 83;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
@@ -326,6 +337,14 @@ struct SettingsFile {
     show_codex: bool,
     #[serde(default = "default_show_antigravity")]
     show_antigravity: bool,
+    #[serde(default = "default_show_usage_window")]
+    show_session_window: bool,
+    #[serde(default = "default_show_usage_window")]
+    show_weekly_window: bool,
+    #[serde(default)]
+    alert_threshold_percent: u8,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    notified_quota_windows: Vec<String>,
 }
 
 impl Default for SettingsFile {
@@ -340,6 +359,10 @@ impl Default for SettingsFile {
             show_claude_code: false,
             show_codex: true,
             show_antigravity: false,
+            show_session_window: true,
+            show_weekly_window: true,
+            alert_threshold_percent: 0,
+            notified_quota_windows: Vec::new(),
         }
     }
 }
@@ -362,6 +385,10 @@ fn default_show_codex() -> bool {
 
 fn default_show_antigravity() -> bool {
     false
+}
+
+fn default_show_usage_window() -> bool {
+    true
 }
 
 fn load_settings() -> SettingsFile {
@@ -401,6 +428,14 @@ fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
     if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
         settings.show_codex = true;
     }
+    if !settings.show_session_window && !settings.show_weekly_window {
+        settings.show_session_window = true;
+    }
+    if !matches!(settings.alert_threshold_percent, 0 | 10 | 20 | 30) {
+        settings.alert_threshold_percent = 0;
+    }
+    settings.notified_quota_windows.sort();
+    settings.notified_quota_windows.dedup();
     settings
 }
 
@@ -429,7 +464,229 @@ fn save_state_settings() {
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
+            show_session_window: s.show_session_window,
+            show_weekly_window: s.show_weekly_window,
+            alert_threshold_percent: s.alert_threshold_percent,
+            notified_quota_windows: s.notified_quota_windows.iter().cloned().collect(),
         });
+    }
+}
+
+fn format_precise_reset_time(resets_at: Option<SystemTime>) -> Option<String> {
+    let seconds = resets_at?.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_date_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    Some(format!(
+        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC"
+    ))
+}
+
+fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += (month <= 2) as i64;
+    (year, month, day)
+}
+
+fn usage_tooltip(
+    model: &str,
+    usage: &crate::models::UsageData,
+    session_text: &str,
+    weekly_text: &str,
+    strings: Strings,
+    show_session_window: bool,
+    show_weekly_window: bool,
+) -> String {
+    let mut parts = Vec::new();
+    if show_session_window {
+        let exact = format_precise_reset_time(usage.session.resets_at)
+            .map(|value| format!(" ({value})"))
+            .unwrap_or_default();
+        parts.push(format!(
+            "{}: {}{}",
+            strings.session_window, session_text, exact
+        ));
+    }
+    if show_weekly_window {
+        let exact = format_precise_reset_time(usage.weekly.resets_at)
+            .map(|value| format!(" ({value})"))
+            .unwrap_or_default();
+        parts.push(format!(
+            "{}: {}{}",
+            strings.weekly_window, weekly_text, exact
+        ));
+    }
+    format!("{model} | {}", parts.join(" | "))
+}
+
+struct QuotaAlert {
+    kind: tray_icon::TrayIconKind,
+    title: String,
+    message: String,
+}
+
+fn collect_low_quota_alerts(state: &mut AppState, data: &AppUsageData) -> Vec<QuotaAlert> {
+    let threshold = state.alert_threshold_percent;
+    if threshold == 0 {
+        return Vec::new();
+    }
+
+    let strings = state.language.strings();
+    let mut alerts = Vec::new();
+    if state.show_claude_code {
+        if let Some(usage) = data.claude_code.as_ref() {
+            append_provider_alerts(
+                &mut alerts,
+                &mut state.notified_quota_windows,
+                threshold,
+                state.language,
+                tray_icon::TrayIconKind::Claude,
+                "claude",
+                strings.claude_code_model,
+                usage,
+                strings,
+            );
+        }
+    }
+    if state.show_codex {
+        if let Some(usage) = data.codex.as_ref() {
+            append_provider_alerts(
+                &mut alerts,
+                &mut state.notified_quota_windows,
+                threshold,
+                state.language,
+                tray_icon::TrayIconKind::Codex,
+                "codex",
+                strings.codex_model,
+                usage,
+                strings,
+            );
+        }
+    }
+    if state.show_antigravity {
+        if let Some(usage) = data.antigravity.as_ref() {
+            append_provider_alerts(
+                &mut alerts,
+                &mut state.notified_quota_windows,
+                threshold,
+                state.language,
+                tray_icon::TrayIconKind::Antigravity,
+                "antigravity",
+                strings.antigravity_model,
+                usage,
+                strings,
+            );
+        }
+    }
+    alerts
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_provider_alerts(
+    alerts: &mut Vec<QuotaAlert>,
+    notified: &mut BTreeSet<String>,
+    threshold: u8,
+    language: LanguageId,
+    kind: tray_icon::TrayIconKind,
+    provider_key: &str,
+    provider_label: &str,
+    usage: &crate::models::UsageData,
+    strings: Strings,
+) {
+    append_quota_alert(
+        alerts,
+        notified,
+        threshold,
+        language,
+        kind,
+        provider_key,
+        provider_label,
+        "session",
+        strings.session_window,
+        &usage.session,
+    );
+    append_quota_alert(
+        alerts,
+        notified,
+        threshold,
+        language,
+        kind,
+        provider_key,
+        provider_label,
+        "weekly",
+        strings.weekly_window,
+        &usage.weekly,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_quota_alert(
+    alerts: &mut Vec<QuotaAlert>,
+    notified: &mut BTreeSet<String>,
+    threshold: u8,
+    language: LanguageId,
+    kind: tray_icon::TrayIconKind,
+    provider_key: &str,
+    provider_label: &str,
+    window_key: &str,
+    window_label: &str,
+    section: &crate::models::UsageSection,
+) {
+    let prefix = format!("{provider_key}:{window_key}:");
+    let reset_key = section
+        .resets_at
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_secs().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let key = format!("{prefix}{reset_key}");
+    notified.retain(|existing| !existing.starts_with(&prefix) || existing == &key);
+
+    let remaining = poller::remaining_percentage(section.percentage).round() as u8;
+    if remaining > threshold || !notified.insert(key) {
+        return;
+    }
+
+    let reset = format_precise_reset_time(section.resets_at);
+    let (title, message) = if language == LanguageId::SimplifiedChinese {
+        (
+            format!("{provider_label} 额度提醒"),
+            format!(
+                "{window_label}额度仅剩 {remaining}%，重置时间：{}",
+                reset.unwrap_or_else(|| "未知".to_string())
+            ),
+        )
+    } else {
+        (
+            format!("{provider_label} quota alert"),
+            format!(
+                "{window_label} quota has {remaining}% remaining. Reset: {}",
+                reset.unwrap_or_else(|| "unknown".to_string())
+            ),
+        )
+    };
+    alerts.push(QuotaAlert {
+        kind,
+        title,
+        message,
+    });
+}
+
+fn tray_primary_percent(state: &AppState, session_percent: f64, weekly_percent: f64) -> f64 {
+    if state.show_session_window {
+        session_percent
+    } else {
+        weekly_percent
     }
 }
 
@@ -440,51 +697,85 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
             let mut icons = Vec::new();
             let strings = s.language.strings();
             if s.show_claude_code {
+                let tooltip = s
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.claude_code.as_ref())
+                    .map(|usage| {
+                        usage_tooltip(
+                            strings.claude_code_model,
+                            usage,
+                            &s.session_text,
+                            &s.weekly_text,
+                            strings,
+                            s.show_session_window,
+                            s.show_weekly_window,
+                        )
+                    })
+                    .unwrap_or_else(|| strings.window_title.to_string());
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Claude,
-                    percent: Some(usage_percent_for_display(s.language, s.session_percent)),
-                    tooltip: format!(
-                        "{} {}: {} | {}: {}",
-                        strings.claude_code_model,
-                        strings.session_window,
-                        s.session_text,
-                        strings.weekly_window,
-                        s.weekly_text
-                    ),
+                    percent: Some(usage_percent_for_display(
+                        s.language,
+                        tray_primary_percent(s, s.session_percent, s.weekly_percent),
+                    )),
+                    tooltip,
                 });
             }
             if s.show_codex {
+                let tooltip = s
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.codex.as_ref())
+                    .map(|usage| {
+                        usage_tooltip(
+                            strings.codex_model,
+                            usage,
+                            &s.codex_session_text,
+                            &s.codex_weekly_text,
+                            strings,
+                            s.show_session_window,
+                            s.show_weekly_window,
+                        )
+                    })
+                    .unwrap_or_else(|| strings.codex_window_title.to_string());
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Codex,
                     percent: Some(usage_percent_for_display(
                         s.language,
-                        s.codex_session_percent,
+                        tray_primary_percent(s, s.codex_session_percent, s.codex_weekly_percent),
                     )),
-                    tooltip: format!(
-                        "{} {}: {} | {}: {}",
-                        strings.codex_model,
-                        strings.session_window,
-                        s.codex_session_text,
-                        strings.weekly_window,
-                        s.codex_weekly_text
-                    ),
+                    tooltip,
                 });
             }
             if s.show_antigravity {
+                let tooltip = s
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.antigravity.as_ref())
+                    .map(|usage| {
+                        usage_tooltip(
+                            strings.antigravity_model,
+                            usage,
+                            &s.antigravity_session_text,
+                            &s.antigravity_weekly_text,
+                            strings,
+                            s.show_session_window,
+                            s.show_weekly_window,
+                        )
+                    })
+                    .unwrap_or_else(|| strings.antigravity_window_title.to_string());
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Antigravity,
                     percent: Some(usage_percent_for_display(
                         s.language,
-                        s.antigravity_session_percent,
+                        tray_primary_percent(
+                            s,
+                            s.antigravity_session_percent,
+                            s.antigravity_weekly_percent,
+                        ),
                     )),
-                    tooltip: format!(
-                        "{} {}: {} | {}: {}",
-                        strings.antigravity_model,
-                        strings.session_window,
-                        s.antigravity_session_text,
-                        strings.weekly_window,
-                        s.antigravity_weekly_text
-                    ),
+                    tooltip,
                 });
             }
             icons
@@ -1448,6 +1739,10 @@ pub fn run() {
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
+                show_session_window: settings.show_session_window,
+                show_weekly_window: settings.show_weekly_window,
+                alert_threshold_percent: settings.alert_threshold_percent,
+                notified_quota_windows: settings.notified_quota_windows.into_iter().collect(),
                 data: None,
                 poll_interval_ms: settings.poll_interval_ms,
                 retry_count: 0,
@@ -1574,6 +1869,8 @@ fn render_layered() {
         show_claude_code,
         show_codex,
         show_antigravity,
+        show_session_window,
+        show_weekly_window,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -1598,6 +1895,8 @@ fn render_layered() {
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                s.show_session_window,
+                s.show_weekly_window,
             ),
             None => return,
         }
@@ -1694,6 +1993,8 @@ fn render_layered() {
             show_claude_code,
             show_codex,
             show_antigravity,
+            show_session_window,
+            show_weekly_window,
             &codex_accent,
             &antigravity_accent,
         );
@@ -1771,6 +2072,8 @@ fn paint_content(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_session_window: bool,
+    show_weekly_window: bool,
     codex_accent: &Color,
     antigravity_accent: &Color,
 ) {
@@ -1834,6 +2137,7 @@ fn paint_content(
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
         let row2_y = height - sc(5) - sc(SEGMENT_H);
         let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
+        let single_row_y = (height - sc(SEGMENT_H)) / 2;
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -1857,52 +2161,64 @@ fn paint_content(
         );
         let old_font = SelectObject(hdc, font);
 
-        draw_row(
-            hdc,
-            content_x,
-            row1_y,
-            is_dark,
-            text_color,
-            strings.session_window,
-            session_pct,
-            session_text,
-            codex_session_pct,
-            codex_session_text,
-            antigravity_session_pct,
-            antigravity_session_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            accent,
-            codex_accent,
-            antigravity_accent,
-            track,
-            label_width,
-            text_width,
-        );
-        draw_row(
-            hdc,
-            content_x,
-            row2_y,
-            is_dark,
-            text_color,
-            strings.weekly_window,
-            weekly_pct,
-            weekly_text,
-            codex_weekly_pct,
-            codex_weekly_text,
-            antigravity_weekly_pct,
-            antigravity_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            accent,
-            codex_accent,
-            antigravity_accent,
-            track,
-            label_width,
-            text_width,
-        );
+        if show_session_window {
+            draw_row(
+                hdc,
+                content_x,
+                if show_weekly_window {
+                    row1_y
+                } else {
+                    single_row_y
+                },
+                is_dark,
+                text_color,
+                strings.session_window,
+                session_pct,
+                session_text,
+                codex_session_pct,
+                codex_session_text,
+                antigravity_session_pct,
+                antigravity_session_text,
+                show_claude_code,
+                show_codex,
+                show_antigravity,
+                accent,
+                codex_accent,
+                antigravity_accent,
+                track,
+                label_width,
+                text_width,
+            );
+        }
+        if show_weekly_window {
+            draw_row(
+                hdc,
+                content_x,
+                if show_session_window {
+                    row2_y
+                } else {
+                    single_row_y
+                },
+                is_dark,
+                text_color,
+                strings.weekly_window,
+                weekly_pct,
+                weekly_text,
+                codex_weekly_pct,
+                codex_weekly_text,
+                antigravity_weekly_pct,
+                antigravity_weekly_text,
+                show_claude_code,
+                show_codex,
+                show_antigravity,
+                accent,
+                codex_accent,
+                antigravity_accent,
+                track,
+                label_width,
+                text_width,
+            );
+        }
 
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
@@ -1958,6 +2274,7 @@ fn do_poll(send_hwnd: SendHwnd) {
     match poller::poll(show_claude_code, show_codex, show_antigravity) {
         Ok(data) => {
             let mut state = lock_state();
+            let mut quota_alerts = Vec::new();
             if let Some(s) = state.as_mut() {
                 if let Some(claude_code) = data.claude_code.as_ref() {
                     s.session_percent = claude_code.session.percentage;
@@ -1987,6 +2304,7 @@ fn do_poll(send_hwnd: SendHwnd) {
                     }
                 }
 
+                quota_alerts = collect_low_quota_alerts(s, &data);
                 s.data = Some(data);
                 s.last_poll_ok = true;
                 refresh_usage_texts(s);
@@ -2003,6 +2321,18 @@ fn do_poll(send_hwnd: SendHwnd) {
                 s.auth_error_paused_polling = false;
                 s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
                 s.auth_watch_snapshot.clear();
+            }
+            drop(state);
+
+            for alert in &quota_alerts {
+                tray_icon::notify_balloon(hwnd, alert.kind, &alert.title, &alert.message);
+                diagnose::log(format!(
+                    "low quota alert emitted title={} message={}",
+                    alert.title, alert.message
+                ));
+            }
+            if !quota_alerts.is_empty() {
+                save_state_settings();
             }
 
             unsafe {
@@ -2793,6 +3123,57 @@ unsafe extern "system" fn wnd_proc(
                     // Reset the poll timer with the new interval
                     SetTimer(hwnd, TIMER_POLL, new_interval, None);
                 }
+                IDM_SHOW_SESSION_WINDOW | IDM_SHOW_WEEKLY_WINDOW => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            match id {
+                                IDM_SHOW_SESSION_WINDOW
+                                    if s.show_weekly_window || !s.show_session_window =>
+                                {
+                                    s.show_session_window = !s.show_session_window;
+                                }
+                                IDM_SHOW_WEEKLY_WINDOW
+                                    if s.show_session_window || !s.show_weekly_window =>
+                                {
+                                    s.show_weekly_window = !s.show_weekly_window;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                    sync_tray_icons(hwnd);
+                }
+                IDM_ALERT_OFF | IDM_ALERT_10 | IDM_ALERT_20 | IDM_ALERT_30 => {
+                    let threshold = match id {
+                        IDM_ALERT_10 => 10,
+                        IDM_ALERT_20 => 20,
+                        IDM_ALERT_30 => 30,
+                        _ => 0,
+                    };
+                    let alerts = {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.alert_threshold_percent = threshold;
+                            if threshold == 0 {
+                                s.notified_quota_windows.clear();
+                                Vec::new()
+                            } else if let Some(data) = s.data.clone() {
+                                collect_low_quota_alerts(s, &data)
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    for alert in &alerts {
+                        tray_icon::notify_balloon(hwnd, alert.kind, &alert.title, &alert.message);
+                    }
+                    save_state_settings();
+                }
                 IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX | IDM_MODEL_ANTIGRAVITY => {
                     {
                         let mut state = lock_state();
@@ -2916,6 +3297,9 @@ fn show_context_menu(hwnd: HWND) {
             show_claude_code,
             show_codex,
             show_antigravity,
+            show_session_window,
+            show_weekly_window,
+            alert_threshold_percent,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -2930,6 +3314,9 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_claude_code,
                     s.show_codex,
                     s.show_antigravity,
+                    s.show_session_window,
+                    s.show_weekly_window,
+                    s.alert_threshold_percent,
                 ),
                 None => (
                     POLL_15_MIN,
@@ -2942,6 +3329,9 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     false,
                     false,
+                    true,
+                    true,
+                    0,
                 ),
             }
         };
@@ -3034,6 +3424,119 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             models_menu.0 as usize,
             PCWSTR::from_raw(models_label.as_ptr()),
+        );
+
+        // Usage window visibility submenu. Keep at least one window enabled.
+        let usage_menu = CreatePopupMenu().unwrap();
+        let session_label =
+            native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
+                "5 小时额度"
+            } else {
+                "5-hour quota"
+            });
+        let session_flags = if show_session_window {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            usage_menu,
+            session_flags,
+            IDM_SHOW_SESSION_WINDOW as usize,
+            PCWSTR::from_raw(session_label.as_ptr()),
+        );
+        let weekly_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
+            "每周额度"
+        } else {
+            "Weekly quota"
+        });
+        let weekly_flags = if show_weekly_window {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            usage_menu,
+            weekly_flags,
+            IDM_SHOW_WEEKLY_WINDOW as usize,
+            PCWSTR::from_raw(weekly_label.as_ptr()),
+        );
+        let usage_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
+            "显示用量"
+        } else {
+            "Usage display"
+        });
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            usage_menu.0 as usize,
+            PCWSTR::from_raw(usage_label.as_ptr()),
+        );
+
+        // Low-quota alert threshold submenu. Zero means opt-out.
+        let alert_menu = CreatePopupMenu().unwrap();
+        let alert_items = [
+            (
+                IDM_ALERT_OFF,
+                0u8,
+                if language == LanguageId::SimplifiedChinese {
+                    "关闭"
+                } else {
+                    "Off"
+                },
+            ),
+            (
+                IDM_ALERT_10,
+                10u8,
+                if language == LanguageId::SimplifiedChinese {
+                    "剩余 10%"
+                } else {
+                    "10% remaining"
+                },
+            ),
+            (
+                IDM_ALERT_20,
+                20u8,
+                if language == LanguageId::SimplifiedChinese {
+                    "剩余 20%"
+                } else {
+                    "20% remaining"
+                },
+            ),
+            (
+                IDM_ALERT_30,
+                30u8,
+                if language == LanguageId::SimplifiedChinese {
+                    "剩余 30%"
+                } else {
+                    "30% remaining"
+                },
+            ),
+        ];
+        for (id, threshold, label) in alert_items {
+            let label = native_interop::wide_str(label);
+            let flags = if alert_threshold_percent == threshold {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                alert_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label.as_ptr()),
+            );
+        }
+        let alert_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
+            "额度提醒"
+        } else {
+            "Quota alerts"
+        });
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            alert_menu.0 as usize,
+            PCWSTR::from_raw(alert_label.as_ptr()),
         );
 
         // Settings submenu
@@ -3190,6 +3693,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
         show_claude_code,
         show_codex,
         show_antigravity,
+        show_session_window,
+        show_weekly_window,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -3212,6 +3717,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                s.show_session_window,
+                s.show_weekly_window,
             ),
             None => return,
         }
@@ -3276,6 +3783,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_claude_code,
             show_codex,
             show_antigravity,
+            show_session_window,
+            show_weekly_window,
             &codex_accent,
             &antigravity_accent,
         );
@@ -3541,6 +4050,9 @@ mod tests {
         assert_eq!(settings.language.as_deref(), Some("zh-CN"));
         assert!(settings.show_codex);
         assert!(!settings.show_claude_code);
+        assert!(settings.show_session_window);
+        assert!(settings.show_weekly_window);
+        assert_eq!(settings.alert_threshold_percent, 0);
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -3597,5 +4109,87 @@ mod tests {
             poll_error_display_label(poller::PollError::RequestFailed, LanguageId::English),
             "ERR"
         );
+    }
+
+    #[test]
+    fn normalizes_usage_display_and_alert_settings() {
+        let settings = normalize_settings(SettingsFile {
+            show_session_window: false,
+            show_weekly_window: false,
+            alert_threshold_percent: 17,
+            notified_quota_windows: vec!["codex:weekly:1".into(), "codex:weekly:1".into()],
+            ..SettingsFile::default()
+        });
+
+        assert!(settings.show_session_window);
+        assert!(!settings.show_weekly_window);
+        assert_eq!(settings.alert_threshold_percent, 0);
+        assert_eq!(settings.notified_quota_windows.len(), 1);
+    }
+
+    #[test]
+    fn formats_precise_reset_time_as_utc() {
+        assert_eq!(
+            format_precise_reset_time(Some(UNIX_EPOCH)).as_deref(),
+            Some("1970-01-01 00:00 UTC")
+        );
+        assert_eq!(format_precise_reset_time(None), None);
+    }
+
+    #[test]
+    fn low_quota_alert_is_deduplicated_until_reset_window_changes() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+        let first_reset = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let first = crate::models::UsageSection {
+            percentage: 85.0,
+            resets_at: Some(first_reset),
+        };
+
+        append_quota_alert(
+            &mut alerts,
+            &mut notified,
+            20,
+            LanguageId::SimplifiedChinese,
+            tray_icon::TrayIconKind::Codex,
+            "codex",
+            "Codex",
+            "session",
+            "5小时",
+            &first,
+        );
+        append_quota_alert(
+            &mut alerts,
+            &mut notified,
+            20,
+            LanguageId::SimplifiedChinese,
+            tray_icon::TrayIconKind::Codex,
+            "codex",
+            "Codex",
+            "session",
+            "5小时",
+            &first,
+        );
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("仅剩 15%"));
+
+        let next = crate::models::UsageSection {
+            percentage: 90.0,
+            resets_at: Some(first_reset + Duration::from_secs(18_000)),
+        };
+        append_quota_alert(
+            &mut alerts,
+            &mut notified,
+            20,
+            LanguageId::SimplifiedChinese,
+            tray_icon::TrayIconKind::Codex,
+            "codex",
+            "Codex",
+            "session",
+            "5小时",
+            &next,
+        );
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(notified.len(), 1);
     }
 }

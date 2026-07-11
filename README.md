@@ -19,10 +19,12 @@ It sits in your taskbar and shows how much of your Codex usage window remains wi
 - Optional Claude Code usage alongside Codex
 - Optional Antigravity model usage bars for Google's 5-hour and weekly Gemini quota windows
 - A live countdown until each limit resets
+- Optional low-quota alerts at 10%, 20%, or 30% remaining, deduplicated per reset window
+- Independent display controls for the 5-hour and weekly rows
 - A small native widget that lives directly in the Windows taskbar
 - System tray icon badges showing your enabled model usage percentage
 - Left-click the tray icon to toggle the taskbar widget on or off
-- Right-click options for refresh, displayed models, update frequency, language, startup, widget visibility, and updates
+- Right-click options for refresh, displayed models, usage rows, quota alerts, update frequency, language, startup, widget visibility, and updates
 - Multi-monitor taskbar placement, so the widget can live on the taskbar for the screen you prefer
 
 ## Who This Is For
@@ -84,7 +86,7 @@ Once running, it will appear in your taskbar and as one or more tray icons in th
 
 - Drag the left divider to move the taskbar widget
 - On multi-monitor setups, drag the widget onto another Windows taskbar to move it to that screen
-- Right-click the taskbar widget or tray icon for refresh, displayed models, update frequency, Start with Windows, reset position, language, updates, and exit
+- Right-click the taskbar widget or tray icon for refresh, displayed models, usage rows, quota alerts, update frequency, Start with Windows, reset position, language, updates, and exit
 - Left-click the tray icon to toggle the taskbar widget on or off
 - Enable `Start with Windows` from the right-click menu if you want it to launch automatically when you sign in
 
@@ -106,7 +108,13 @@ If multiple providers are enabled, the app shows one tray icon per provider. If 
 
 The Claude Code tray icon uses the same warm usage colors as the Claude bar. The Codex tray icon uses a black and white badge style. The Antigravity tray icon uses a blue badge style.
 
-Hovering over a tray icon shows the usage values for that model.
+Hovering over a tray icon shows the usage values and exact UTC reset time for that model. If the 5-hour row is hidden, the tray badge switches to the weekly percentage.
+
+### Usage Display And Alerts
+
+Use the right-click **Usage display** menu to show both quota rows or only one. The app always keeps at least one row visible.
+
+Use **Quota alerts** to choose a remaining-quota threshold of 10%, 20%, or 30%. Alerts are off by default. Each provider and quota window is notified only once until its reset time changes, including across app restarts.
 
 ## Diagnostics
 
@@ -168,6 +176,8 @@ What the app stores locally:
 - Polling frequency
 - Language preference
 - Last update check time
+- Visible quota rows and low-quota alert threshold
+- Quota-window notification keys used to prevent duplicate alerts
 - Displayed model preferences
 
 What it does **not** do:
