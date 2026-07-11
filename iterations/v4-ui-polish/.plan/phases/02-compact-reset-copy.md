@@ -1,6 +1,6 @@
 # Phase 02 — 紧凑重置文案
 
-**Status**: `in progress`
+**Status**: `completed`
 **目标**: 将常驻信息压缩为短标签、剩余百分比和具体重置时刻或日期。
 **前置**: Phase 01
 
@@ -18,7 +18,7 @@
 - [x] 更新简体中文短标签、连续进度条与布局宽度（`src/localization/simplified_chinese.rs:35-36`; `src/window.rs:3926`）
 - [x] 更新托盘提示并增加边界测试（本地精确时间 `src/window.rs:475-486`; 格式测试 `src/poller.rs:1713-1748`, `src/window.rs:4129-4143`）
 - [x] 实际安装截图验收（v1.8.0 PID 64268；DPI 192 下窗口 566×92px，无截断；`target/v4-compact-reset-verification.png`）
-- [~] 构建、提交、推送并发布修订版本
+- [x] 构建、提交、推送并发布修订版本（实现 commit `fa6165f`；版本 `1.8.0`）
 
 ## Notes
 
