@@ -22,6 +22,7 @@
 
 ## Notes
 
-- v1.7.0 release build SHA256: `1BEAEE8A2F98D3785EBBF42BD351467D688606D3104C7D1422273AA8B4583F4A`，大小 924672 字节。
+- v1.7.0 本地验收 build SHA256: `1BEAEE8A2F98D3785EBBF42BD351467D688606D3104C7D1422273AA8B4583F4A`；GitHub Actions 正式 Release SHA256: `79BA613672244703E3F08FB4AF98E6AA4F40F6AD7A91B26B1FC25AA56830BA7D`，大小均为 924672 字节。
 - 稳定安装路径实际运行 PID 18476；通过 Win32 `WM_COMMAND` 切换为 weekly-only 后设置持久化为 `show_session_window=false`，再恢复双行；诊断日志确认 `version=1.7.0`。
 - 最终验证：`cargo fmt -- --check`、`cargo test`（20 passed）、`cargo clippy --all-targets`（退出成功，9 条既有风格警告）、`cargo build --release`、`git diff --check` 均通过。
+- `v1.7.0` Release 工作流成功，线上包含 EXE、SHA256、安装和卸载脚本；正式安装器升级后设置文件哈希不变，发布版 PID 15096 正常运行：`https://github.com/upstream-ray/codex-usage-monitor/releases/tag/v1.7.0`。
