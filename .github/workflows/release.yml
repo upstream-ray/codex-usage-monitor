@@ -9,8 +9,7 @@ permissions:
   contents: write
 
 env:
-  RELEASE_ASSET_NAME: claude-code-usage-monitor.exe
-  WINGET_PACKAGE_ID: CodeZeno.ClaudeCodeUsageMonitor
+  RELEASE_ASSET_NAME: codex-usage.exe
 
 jobs:
   build:
@@ -28,50 +27,5 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/claude-code-usage-monitor.exe
+          files: target/release/codex-usage.exe
           generate_release_notes: true
-
-  winget:
-    needs: build
-    runs-on: windows-latest
-    env:
-      WINGETCREATE_GITHUB_TOKEN: ${{ secrets.WINGETCREATE_GITHUB_TOKEN }}
-    steps:
-      - name: Prepare release metadata
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}"
-          $version = $tag.TrimStart('v')
-          $packageUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/${{ env.RELEASE_ASSET_NAME }}"
-
-          "PACKAGE_VERSION=$version" >> $env:GITHUB_ENV
-          "PACKAGE_URL=$packageUrl" >> $env:GITHUB_ENV
-
-      - name: Skip when winget token is not configured
-        if: env.WINGETCREATE_GITHUB_TOKEN == ''
-        shell: pwsh
-        run: |
-          Write-Warning "Skipping WinGet submission because WINGETCREATE_GITHUB_TOKEN is not configured."
-
-      - name: Install .NET 6 runtime
-        if: env.WINGETCREATE_GITHUB_TOKEN != ''
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "6.0.x"
-
-      - name: Download wingetcreate
-        if: env.WINGETCREATE_GITHUB_TOKEN != ''
-        shell: pwsh
-        run: |
-          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
-
-      - name: Submit WinGet manifest update
-        if: env.WINGETCREATE_GITHUB_TOKEN != ''
-        shell: pwsh
-        run: |
-          .\wingetcreate.exe update `
-            --submit `
-            --token $env:WINGETCREATE_GITHUB_TOKEN `
-            --urls $env:PACKAGE_URL `
-            --version $env:PACKAGE_VERSION `
-            $env:WINGET_PACKAGE_ID

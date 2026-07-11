@@ -1521,8 +1521,16 @@ fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-/// Format a usage section as "X% · Yh" style text
-pub fn format_line(section: &UsageSection, strings: Strings) -> String {
+/// Format a usage section for the compact taskbar display.
+pub fn format_line(
+    section: &UsageSection,
+    strings: Strings,
+    show_remaining_in_chinese: bool,
+) -> String {
+    if show_remaining_in_chinese {
+        return format_simplified_chinese_line(section, strings);
+    }
+
     let pct = format!("{:.0}%", section.percentage);
     let cd = format_countdown(section.resets_at, strings);
     if cd.is_empty() {
@@ -1530,6 +1538,26 @@ pub fn format_line(section: &UsageSection, strings: Strings) -> String {
     } else {
         format!("{pct} \u{00b7} {cd}")
     }
+}
+
+fn format_simplified_chinese_line(section: &UsageSection, strings: Strings) -> String {
+    let remaining = remaining_percentage(section.percentage);
+    let cd = format_countdown(section.resets_at, strings);
+    format_simplified_chinese_values(remaining, &cd, strings.now)
+}
+
+fn format_simplified_chinese_values(remaining: f64, countdown: &str, now_label: &str) -> String {
+    if countdown.is_empty() {
+        format!("剩余{remaining:.0}%")
+    } else if countdown == now_label {
+        format!("剩余{remaining:.0}% 现在重置")
+    } else {
+        format!("剩余{remaining:.0}% {countdown}后重置")
+    }
+}
+
+pub fn remaining_percentage(used_percentage: f64) -> f64 {
+    (100.0 - used_percentage).clamp(0.0, 100.0)
 }
 
 fn format_countdown(resets_at: Option<SystemTime>, strings: Strings) -> String {
@@ -1612,6 +1640,37 @@ mod tests {
             },
             weekly: UsageSection::default(),
         }
+    }
+
+    #[test]
+    fn remaining_percentage_is_clamped() {
+        assert_eq!(remaining_percentage(30.0), 70.0);
+        assert_eq!(remaining_percentage(-5.0), 100.0);
+        assert_eq!(remaining_percentage(120.0), 0.0);
+    }
+
+    #[test]
+    fn simplified_chinese_line_labels_remaining_usage() {
+        let section = UsageSection {
+            percentage: 30.0,
+            resets_at: None,
+        };
+        assert_eq!(
+            format_line(
+                &section,
+                crate::localization::LanguageId::SimplifiedChinese.strings(),
+                true,
+            ),
+            "剩余70%"
+        );
+        assert_eq!(
+            format_simplified_chinese_values(70.0, "2小时", "现在"),
+            "剩余70% 2小时后重置"
+        );
+        assert_eq!(
+            format_simplified_chinese_values(95.0, "6天", "现在"),
+            "剩余95% 6天后重置"
+        );
     }
 
     #[test]

@@ -1,19 +1,20 @@
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-# Claude Code Usage Monitor
+# Codex Usage
 
 ![Screenshot](.github/animation.gif)
 
-A lightweight Windows taskbar widget for people already using Claude Code, with optional Codex and Google Antigravity usage display.
+A lightweight native Windows taskbar widget for monitoring Codex usage, with optional Claude Code and Google Antigravity usage display.
 
-It sits in your taskbar and shows how much of your Claude Code, Codex, and/or Antigravity usage window you have left, without needing to open the terminal or the provider site.
+It sits in your taskbar and shows how much of your Codex usage window remains without opening the Codex app or account usage page.
 
 ## What You Get
 
-- A **5h** bar for your current 5-hour Claude usage window
-- A **7d** bar for your current 7-day window
-- Optional Codex usage bars alongside Claude Code
+- A **5h** bar for your current Codex usage window
+- A **7d** bar for your current weekly window
+- Simplified Chinese display with explicit remaining usage and reset countdowns
+- Optional Claude Code usage alongside Codex
 - Optional Antigravity model usage bars for Google's 5-hour and weekly Gemini quota windows
 - A live countdown until each limit resets
 - A small native widget that lives directly in the Windows taskbar
@@ -24,9 +25,9 @@ It sits in your taskbar and shows how much of your Claude Code, Codex, and/or An
 
 ## Who This Is For
 
-This app is for Windows users who already have **Claude Code (CLI or App) installed and signed in**.
+This app is for Windows users who already have **Codex CLI or the Codex app installed and signed in**.
 
-Codex support is optional. To show Codex usage, install and sign in to the Codex CLI, then enable Codex from the right-click **Models** menu.
+Codex is enabled by default. The app reads the same local credentials used by Codex.
 
 Antigravity support is optional too. To show Antigravity usage, install and sign in to Google Antigravity, then enable the **Antigravity** model from the right-click **Models** menu.
 
@@ -35,28 +36,28 @@ It works best if you want a simple "how close am I to the limit?" display that i
 ## Requirements
 
 - Windows 10 or Windows 11
-- Claude Code (CLI or App) installed and authenticated
-- Optional: Codex CLI installed and authenticated, if you want Codex usage
+- Codex CLI or Codex app installed and authenticated
+- Optional: Claude Code installed and authenticated
 - Optional: Google Antigravity installed and authenticated, if you want Antigravity usage
 
 If you use Claude Code through WSL, that is supported too. The monitor can read your Claude Code credentials from Windows or from your WSL environment.
 
 ## Install
 
-Install the latest version from WinGet:
+Build the personalized release executable:
 
 ```powershell
-winget install CodeZeno.ClaudeCodeUsageMonitor
+cargo build --release
 ```
 
-If you prefer not to use WinGet, you can still download the latest `claude-code-usage-monitor.exe` from the [Releases](https://github.com/CodeZeno/Claude-Code-Usage-Monitor/releases) page and run it directly.
+The executable is created at `target\release\codex-usage.exe`.
 
 ## Use
 
-After installing with WinGet, run:
+Run:
 
 ```powershell
-claude-code-usage-monitor
+codex-usage
 ```
 
 Once running, it will appear in your taskbar and as one or more tray icons in the notification area.
@@ -71,8 +72,8 @@ Once running, it will appear in your taskbar and as one or more tray icons in th
 
 Use the right-click **Models** menu to choose what the widget displays:
 
-- **Claude Code** is enabled by default
-- **Codex** can be enabled alongside Claude Code or shown by itself
+- **Codex** is enabled by default
+- **Claude Code** can be enabled alongside Codex or shown by itself
 - **Antigravity** can be enabled alongside the other providers or shown by itself as its own model column
 
 When multiple models are shown, each model has its own usage bar and matching usage text color. Antigravity prefers Google's Gemini quota summary when available and falls back to model quota data when needed.
@@ -92,24 +93,24 @@ Hovering over a tray icon shows the usage values for that model.
 If you need to troubleshoot startup or visibility issues, run:
 
 ```powershell
-claude-code-usage-monitor --diagnose
+codex-usage --diagnose
 ```
 
 This writes a log file to:
 
 ```text
-%TEMP%\claude-code-usage-monitor.log
+%TEMP%\codex-usage.log
 ```
 
 Settings are saved to:
 
 ```text
-%APPDATA%\ClaudeCodeUsageMonitor\settings.json
+%APPDATA%\CodexUsage\settings.json
 ```
 
 ## Account Support
 
-This app works with the same account types that Claude Code itself supports.
+Codex usage is read from the account authenticated in the local Codex installation. Optional Claude Code monitoring works with the account types supported by Claude Code.
 
 As of **March 19, 2026**, Anthropic's Claude Code setup documentation says:
 
@@ -178,5 +179,7 @@ If the newer usage endpoint is unavailable, it can fall back to reading the rate
 ## Open Source
 
 This project is licensed under MIT.
+
+Codex Usage is a personalized derivative of Code Zeno's Claude Code Usage Monitor. The original copyright notice and MIT license are preserved in [LICENSE](LICENSE).
 
 If you want to inspect the behavior or audit the code, everything is in this repository.

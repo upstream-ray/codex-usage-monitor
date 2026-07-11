@@ -3,7 +3,7 @@ use super::Strings;
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Update via WinGet";
 
 pub(super) const STRINGS: Strings = Strings {
-    window_title: "Claude Code Usage Monitor",
+    window_title: "Codex Usage",
     refresh: "Refresh",
     update_frequency: "Update Frequency",
     one_minute: "1 Minute",

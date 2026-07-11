@@ -128,6 +128,7 @@ const IDM_LANG_KOREAN: u16 = 47;
 const IDM_LANG_TRADITIONAL_CHINESE: u16 = 48;
 const IDM_LANG_RUSSIAN: u16 = 49;
 const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 50;
+const IDM_LANG_SIMPLIFIED_CHINESE: u16 = 51;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
@@ -173,10 +174,10 @@ const RELAUNCH_THROTTLE_SECS: u64 = 10;
 const RELAUNCH_BACKOFF_SECS: u64 = 30;
 /// Environment flag set on a relaunched child so it waits for the previous
 /// instance's single-instance mutex instead of exiting immediately.
-const ENV_RELAUNCH: &str = "CCUM_RELAUNCH";
+const ENV_RELAUNCH: &str = "CODEX_USAGE_RELAUNCH";
 /// Unix timestamp (seconds) of the relaunch that spawned this process, passed to
 /// the child so it can detect a relaunch storm.
-const ENV_LAST_RELAUNCH_UNIX: &str = "CCUM_LAST_RELAUNCH_UNIX";
+const ENV_LAST_RELAUNCH_UNIX: &str = "CODEX_USAGE_LAST_RELAUNCH_UNIX";
 
 /// Relaunch the widget as a fresh process after explorer.exe has restarted.
 ///
@@ -289,11 +290,20 @@ fn lock_state() -> MutexGuard<'static, Option<AppState>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn settings_path() -> PathBuf {
+const SETTINGS_DIR: &str = "CodexUsage";
+const LEGACY_SETTINGS_DIR: &str = "ClaudeCodeUsageMonitor";
+
+fn appdata_path(directory: &str) -> PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(appdata)
-        .join("ClaudeCodeUsageMonitor")
-        .join("settings.json")
+    PathBuf::from(appdata).join(directory).join("settings.json")
+}
+
+fn settings_path() -> PathBuf {
+    appdata_path(SETTINGS_DIR)
+}
+
+fn legacy_settings_path() -> PathBuf {
+    appdata_path(LEGACY_SETTINGS_DIR)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -327,8 +337,8 @@ impl Default for SettingsFile {
             language: None,
             last_update_check_unix: None,
             widget_visible: true,
-            show_claude_code: true,
-            show_codex: false,
+            show_claude_code: false,
+            show_codex: true,
             show_antigravity: false,
         }
     }
@@ -343,11 +353,11 @@ fn default_widget_visible() -> bool {
 }
 
 fn default_show_claude_code() -> bool {
-    true
+    false
 }
 
 fn default_show_codex() -> bool {
-    false
+    true
 }
 
 fn default_show_antigravity() -> bool {
@@ -355,13 +365,41 @@ fn default_show_antigravity() -> bool {
 }
 
 fn load_settings() -> SettingsFile {
-    let content = match std::fs::read_to_string(settings_path()) {
-        Ok(c) => c,
-        Err(_) => return SettingsFile::default(),
-    };
-    let mut settings: SettingsFile = serde_json::from_str(&content).unwrap_or_default();
+    let current_path = settings_path();
+    let legacy_path = legacy_settings_path();
+    let (settings, migrated) = load_settings_from_paths(&current_path, &legacy_path)
+        .unwrap_or_else(|| (SettingsFile::default(), false));
+    let settings = normalize_settings(settings);
+    if migrated {
+        save_settings(&settings);
+        diagnose::log(format!(
+            "migrated settings from {} to {}",
+            legacy_path.display(),
+            current_path.display()
+        ));
+    }
+    settings
+}
+
+fn load_settings_from_paths(
+    current_path: &std::path::Path,
+    legacy_path: &std::path::Path,
+) -> Option<(SettingsFile, bool)> {
+    if let Ok(content) = std::fs::read_to_string(current_path) {
+        return serde_json::from_str(&content)
+            .ok()
+            .map(|settings| (settings, false));
+    }
+
+    let content = std::fs::read_to_string(legacy_path).ok()?;
+    serde_json::from_str(&content)
+        .ok()
+        .map(|settings| (settings, true))
+}
+
+fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
     if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
-        settings.show_claude_code = true;
+        settings.show_codex = true;
     }
     settings
 }
@@ -400,14 +438,17 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
     match state.as_ref() {
         Some(s) if s.last_poll_ok => {
             let mut icons = Vec::new();
+            let strings = s.language.strings();
             if s.show_claude_code {
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Claude,
-                    percent: Some(s.session_percent),
+                    percent: Some(usage_percent_for_display(s.language, s.session_percent)),
                     tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().claude_code_model,
+                        "{} {}: {} | {}: {}",
+                        strings.claude_code_model,
+                        strings.session_window,
                         s.session_text,
+                        strings.weekly_window,
                         s.weekly_text
                     ),
                 });
@@ -415,11 +456,16 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
             if s.show_codex {
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Codex,
-                    percent: Some(s.codex_session_percent),
+                    percent: Some(usage_percent_for_display(
+                        s.language,
+                        s.codex_session_percent,
+                    )),
                     tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().codex_model,
+                        "{} {}: {} | {}: {}",
+                        strings.codex_model,
+                        strings.session_window,
                         s.codex_session_text,
+                        strings.weekly_window,
                         s.codex_weekly_text
                     ),
                 });
@@ -427,11 +473,16 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
             if s.show_antigravity {
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: Some(s.antigravity_session_percent),
+                    percent: Some(usage_percent_for_display(
+                        s.language,
+                        s.antigravity_session_percent,
+                    )),
                     tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().antigravity_model,
+                        "{} {}: {} | {}: {}",
+                        strings.antigravity_model,
+                        strings.session_window,
                         s.antigravity_session_text,
+                        strings.weekly_window,
                         s.antigravity_weekly_text
                     ),
                 });
@@ -640,33 +691,35 @@ fn refresh_usage_texts(state: &mut AppState) {
     }
 
     let strings = state.language.strings();
+    let show_remaining = state.language == LanguageId::SimplifiedChinese;
     let Some(data) = state.data.as_ref() else {
         return;
     };
 
     if let Some(claude_code) = data.claude_code.as_ref() {
-        state.session_text = poller::format_line(&claude_code.session, strings);
-        state.weekly_text = poller::format_line(&claude_code.weekly, strings);
+        state.session_text = poller::format_line(&claude_code.session, strings, show_remaining);
+        state.weekly_text = poller::format_line(&claude_code.weekly, strings, show_remaining);
     } else if state.show_claude_code {
         state.session_text = "!".to_string();
         state.weekly_text = "!".to_string();
     }
 
     if let Some(codex) = data.codex.as_ref() {
-        state.codex_session_text = poller::format_line(&codex.session, strings);
-        state.codex_weekly_text = poller::format_line(&codex.weekly, strings);
+        state.codex_session_text = poller::format_line(&codex.session, strings, show_remaining);
+        state.codex_weekly_text = poller::format_line(&codex.weekly, strings, show_remaining);
     } else if state.show_codex {
         state.codex_session_text = "!".to_string();
         state.codex_weekly_text = "!".to_string();
     }
 
     if let Some(antigravity) = data.antigravity.as_ref() {
-        state.antigravity_session_text = poller::format_line(&antigravity.session, strings);
+        state.antigravity_session_text =
+            poller::format_line(&antigravity.session, strings, show_remaining);
         state.antigravity_weekly_text =
             if antigravity.weekly.resets_at.is_none() && antigravity.weekly.percentage == 0.0 {
                 "--".to_string()
             } else {
-                poller::format_line(&antigravity.weekly, strings)
+                poller::format_line(&antigravity.weekly, strings, show_remaining)
             };
     } else if state.show_antigravity {
         state.antigravity_session_text = "!".to_string();
@@ -930,13 +983,32 @@ fn begin_winget_update(hwnd: HWND) {
 }
 
 const STARTUP_REGISTRY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const STARTUP_REGISTRY_KEY: &str = "ClaudeCodeUsageMonitor";
+const STARTUP_REGISTRY_KEY: &str = "CodexUsage";
+const LEGACY_STARTUP_REGISTRY_KEY: &str = "ClaudeCodeUsageMonitor";
 
 /// Returns true only if the startup registry value points to this executable.
 fn is_startup_enabled() -> bool {
+    let Some(reg_value) = read_startup_value(STARTUP_REGISTRY_KEY) else {
+        return false;
+    };
+    let Some(current_exe) = current_exe_path_string() else {
+        return false;
+    };
+    reg_value.eq_ignore_ascii_case(&current_exe)
+}
+
+fn current_exe_path_string() -> Option<String> {
+    unsafe {
+        let mut exe_buf = [0u16; 260];
+        let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
+        (len > 0).then(|| String::from_utf16_lossy(&exe_buf[..len]))
+    }
+}
+
+fn read_startup_value(key: &str) -> Option<String> {
     unsafe {
         let path = native_interop::wide_str(STARTUP_REGISTRY_PATH);
-        let key_name = native_interop::wide_str(STARTUP_REGISTRY_KEY);
+        let key_name = native_interop::wide_str(key);
 
         let mut hkey = HKEY::default();
         let result = RegOpenKeyExW(
@@ -947,7 +1019,7 @@ fn is_startup_enabled() -> bool {
             &mut hkey,
         );
         if result.is_err() {
-            return false;
+            return None;
         }
 
         // Query the size of the value
@@ -962,7 +1034,7 @@ fn is_startup_enabled() -> bool {
         );
         if result.is_err() || data_size == 0 {
             let _ = RegCloseKey(hkey);
-            return false;
+            return None;
         }
 
         // Read the value
@@ -977,27 +1049,59 @@ fn is_startup_enabled() -> bool {
         );
         let _ = RegCloseKey(hkey);
         if result.is_err() {
-            return false;
+            return None;
         }
 
         // Convert the registry value (UTF-16) to a string
         let wide_slice =
             std::slice::from_raw_parts(buf.as_ptr() as *const u16, data_size as usize / 2);
-        let reg_value = String::from_utf16_lossy(wide_slice)
-            .trim_end_matches('\0')
-            .to_string();
-
-        // Get the current executable path
-        let mut exe_buf = [0u16; 260];
-        let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
-        if len == 0 {
-            return false;
-        }
-        let current_exe = String::from_utf16_lossy(&exe_buf[..len]);
-
-        // Case-insensitive comparison (Windows paths are case-insensitive)
-        reg_value.eq_ignore_ascii_case(&current_exe)
+        Some(
+            String::from_utf16_lossy(wide_slice)
+                .trim_end_matches('\0')
+                .to_string(),
+        )
     }
+}
+
+fn delete_startup_value(key: &str) {
+    unsafe {
+        let path = native_interop::wide_str(STARTUP_REGISTRY_PATH);
+        let key_name = native_interop::wide_str(key);
+        let mut hkey = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR::from_raw(path.as_ptr()),
+            0,
+            KEY_SET_VALUE,
+            &mut hkey,
+        )
+        .is_ok()
+        {
+            let _ = RegDeleteValueW(hkey, PCWSTR::from_raw(key_name.as_ptr()));
+            let _ = RegCloseKey(hkey);
+        }
+    }
+}
+
+fn migrate_legacy_startup_entry() {
+    let legacy_exists = read_startup_value(LEGACY_STARTUP_REGISTRY_KEY).is_some();
+    let current_exists = read_startup_value(STARTUP_REGISTRY_KEY).is_some();
+    if !legacy_exists {
+        return;
+    }
+
+    if should_write_migrated_startup(legacy_exists, current_exists) {
+        set_startup_enabled(true);
+    }
+
+    if read_startup_value(STARTUP_REGISTRY_KEY).is_some() {
+        delete_startup_value(LEGACY_STARTUP_REGISTRY_KEY);
+        diagnose::log("migrated legacy startup registry entry to CodexUsage");
+    }
+}
+
+fn should_write_migrated_startup(legacy_exists: bool, current_exists: bool) -> bool {
+    legacy_exists && !current_exists
 }
 
 fn set_startup_enabled(enable: bool) {
@@ -1037,6 +1141,8 @@ fn set_startup_enabled(enable: bool) {
             }
         } else {
             let _ = RegDeleteValueW(hkey, PCWSTR::from_raw(key_name.as_ptr()));
+            let legacy_key_name = native_interop::wide_str(LEGACY_STARTUP_REGISTRY_KEY);
+            let _ = RegDeleteValueW(hkey, PCWSTR::from_raw(legacy_key_name.as_ptr()));
         }
 
         let _ = RegCloseKey(hkey);
@@ -1056,6 +1162,8 @@ const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
 const TEXT_WIDTH: i32 = 62;
+const SIMPLIFIED_CHINESE_LABEL_WIDTH: i32 = 35;
+const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 142;
 const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
@@ -1091,15 +1199,35 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
     }
 }
 
-fn total_widget_width_for(active_models: i32) -> i32 {
+fn usage_layout_widths(language: LanguageId) -> (i32, i32) {
+    if language == LanguageId::SimplifiedChinese {
+        (
+            SIMPLIFIED_CHINESE_LABEL_WIDTH,
+            SIMPLIFIED_CHINESE_TEXT_WIDTH,
+        )
+    } else {
+        (LABEL_WIDTH, TEXT_WIDTH)
+    }
+}
+
+fn usage_percent_for_display(language: LanguageId, used_percentage: f64) -> f64 {
+    if language == LanguageId::SimplifiedChinese {
+        poller::remaining_percentage(used_percentage)
+    } else {
+        used_percentage.clamp(0.0, 100.0)
+    }
+}
+
+fn total_widget_width_for(active_models: i32, language: LanguageId) -> i32 {
     let bar_segments = row_bar_segment_count(active_models);
+    let (label_width, text_width) = usage_layout_widths(language);
     let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
         + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH);
+        + sc(text_width);
 
     sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
-        + sc(LABEL_WIDTH)
+        + sc(label_width)
         + sc(LABEL_RIGHT_MARGIN)
         + model_width * active_models
         + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
@@ -1107,22 +1235,30 @@ fn total_widget_width_for(active_models: i32) -> i32 {
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(active_model_count(
-        state.show_claude_code,
-        state.show_codex,
-        state.show_antigravity,
-    ))
+    total_widget_width_for(
+        active_model_count(
+            state.show_claude_code,
+            state.show_codex,
+            state.show_antigravity,
+        ),
+        state.language,
+    )
 }
 
 fn total_widget_width() -> i32 {
-    let active_models = {
+    let (active_models, language) = {
         let state = lock_state();
         state
             .as_ref()
-            .map(|s| active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity))
-            .unwrap_or(1)
+            .map(|s| {
+                (
+                    active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
+                    s.language,
+                )
+            })
+            .unwrap_or((1, LanguageId::English))
     };
-    total_widget_width_for(active_models)
+    total_widget_width_for(active_models, language)
 }
 
 fn claude_accent_color() -> Color {
@@ -1177,7 +1313,7 @@ pub fn run() {
     // Exception: when relaunched after an explorer restart (ENV_RELAUNCH set),
     // wait for the previous instance to release the mutex, then take over.
     let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
-    let mutex_name = native_interop::wide_str("Global\\ClaudeCodeUsageMonitor");
+    let mutex_name = native_interop::wide_str("Global\\CodexUsage");
     let _mutex = unsafe {
         let handle = CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr()));
         match handle {
@@ -1209,7 +1345,9 @@ pub fn run() {
         }
     };
 
-    let class_name = native_interop::wide_str("ClaudeCodeUsageMonitor");
+    migrate_legacy_startup_entry();
+
+    let class_name = native_interop::wide_str("CodexUsage");
 
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap();
@@ -1252,7 +1390,7 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count),
+            total_widget_width_for(initial_model_count, language),
             sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
@@ -1419,6 +1557,7 @@ fn render_layered() {
         hwnd_val,
         is_dark,
         embedded,
+        language,
         strings,
         session_pct,
         session_text,
@@ -1442,6 +1581,7 @@ fn render_layered() {
                 s.hwnd,
                 s.is_dark,
                 s.embedded,
+                s.language,
                 s.language.strings(),
                 s.session_percent,
                 s.session_text.clone(),
@@ -1537,6 +1677,7 @@ fn render_layered() {
             &text_color,
             &accent,
             &track,
+            language,
             strings,
             session_pct,
             &session_text,
@@ -1613,6 +1754,7 @@ fn paint_content(
     text_color: &Color,
     accent: &Color,
     track: &Color,
+    language: LanguageId,
     strings: Strings,
     session_pct: f64,
     session_text: &str,
@@ -1633,6 +1775,14 @@ fn paint_content(
     antigravity_accent: &Color,
 ) {
     unsafe {
+        let session_pct = usage_percent_for_display(language, session_pct);
+        let weekly_pct = usage_percent_for_display(language, weekly_pct);
+        let codex_session_pct = usage_percent_for_display(language, codex_session_pct);
+        let codex_weekly_pct = usage_percent_for_display(language, codex_weekly_pct);
+        let antigravity_session_pct = usage_percent_for_display(language, antigravity_session_pct);
+        let antigravity_weekly_pct = usage_percent_for_display(language, antigravity_weekly_pct);
+        let (label_width, text_width) = usage_layout_widths(language);
+
         let client_rect = RECT {
             left: 0,
             top: 0,
@@ -1727,6 +1877,8 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            label_width,
+            text_width,
         );
         draw_row(
             hdc,
@@ -1748,6 +1900,8 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            label_width,
+            text_width,
         );
 
         SelectObject(hdc, old_font);
@@ -2641,6 +2795,7 @@ unsafe extern "system" fn wnd_proc(
                 | IDM_LANG_GERMAN
                 | IDM_LANG_JAPANESE
                 | IDM_LANG_KOREAN
+                | IDM_LANG_SIMPLIFIED_CHINESE
                 | IDM_LANG_TRADITIONAL_CHINESE
                 | IDM_LANG_RUSSIAN
                 | IDM_LANG_PORTUGUESE_BRAZIL => {
@@ -2653,6 +2808,7 @@ unsafe extern "system" fn wnd_proc(
                         IDM_LANG_GERMAN => Some(LanguageId::German),
                         IDM_LANG_JAPANESE => Some(LanguageId::Japanese),
                         IDM_LANG_KOREAN => Some(LanguageId::Korean),
+                        IDM_LANG_SIMPLIFIED_CHINESE => Some(LanguageId::SimplifiedChinese),
                         IDM_LANG_TRADITIONAL_CHINESE => Some(LanguageId::TraditionalChinese),
                         IDM_LANG_RUSSIAN => Some(LanguageId::Russian),
                         IDM_LANG_PORTUGUESE_BRAZIL => Some(LanguageId::PortugueseBrazil),
@@ -2882,6 +3038,7 @@ fn show_context_menu(hwnd: HWND) {
                 LanguageId::German => IDM_LANG_GERMAN,
                 LanguageId::Japanese => IDM_LANG_JAPANESE,
                 LanguageId::Korean => IDM_LANG_KOREAN,
+                LanguageId::SimplifiedChinese => IDM_LANG_SIMPLIFIED_CHINESE,
                 LanguageId::TraditionalChinese => IDM_LANG_TRADITIONAL_CHINESE,
                 LanguageId::Russian => IDM_LANG_RUSSIAN,
                 LanguageId::PortugueseBrazil => IDM_LANG_PORTUGUESE_BRAZIL,
@@ -2971,6 +3128,7 @@ fn show_context_menu(hwnd: HWND) {
 fn paint(hdc: HDC, hwnd: HWND) {
     let (
         is_dark,
+        language,
         strings,
         session_pct,
         session_text,
@@ -2992,6 +3150,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         match state.as_ref() {
             Some(s) => (
                 s.is_dark,
+                s.language,
                 s.language.strings(),
                 s.session_percent,
                 s.session_text.clone(),
@@ -3055,6 +3214,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &text_color,
             &accent,
             &track,
+            language,
             strings,
             session_pct,
             &session_text,
@@ -3103,6 +3263,8 @@ fn draw_row(
     codex_accent: &Color,
     antigravity_accent: &Color,
     track: &Color,
+    label_width: i32,
+    text_width: i32,
 ) {
     let seg_h = sc(SEGMENT_H);
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
@@ -3130,7 +3292,7 @@ fn draw_row(
         let mut label_rect = RECT {
             left: x,
             top: y,
-            right: x + sc(LABEL_WIDTH),
+            right: x + sc(label_width),
             bottom: y + seg_h,
         };
         let _ = DrawTextW(
@@ -3140,7 +3302,7 @@ fn draw_row(
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
 
-        let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+        let mut model_x = x + sc(label_width) + sc(LABEL_RIGHT_MARGIN);
         if show_claude_code {
             draw_usage_bar(
                 hdc,
@@ -3152,8 +3314,9 @@ fn draw_row(
                 claude_accent,
                 track,
                 &claude_value_color,
+                text_width,
             );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
+            model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_codex {
             draw_usage_bar(
@@ -3166,8 +3329,9 @@ fn draw_row(
                 codex_accent,
                 track,
                 &codex_value_color,
+                text_width,
             );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
+            model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_antigravity {
             draw_usage_bar(
@@ -3180,15 +3344,16 @@ fn draw_row(
                 antigravity_accent,
                 track,
                 &antigravity_value_color,
+                text_width,
             );
         }
     }
 }
 
-fn model_usage_width(segment_count: i32) -> i32 {
+fn model_usage_width(segment_count: i32, text_width: i32) -> i32 {
     (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
         + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH)
+        + sc(text_width)
 }
 
 fn draw_usage_bar(
@@ -3201,6 +3366,7 @@ fn draw_usage_bar(
     accent: &Color,
     track: &Color,
     text_color: &Color,
+    text_width: i32,
 ) {
     let seg_w = sc(SEGMENT_W);
     let seg_h = sc(SEGMENT_H);
@@ -3261,7 +3427,7 @@ fn draw_usage_bar(
         let mut text_rect = RECT {
             left: text_x,
             top: y,
-            right: text_x + sc(TEXT_WIDTH),
+            right: text_x + sc(text_width),
             bottom: y + seg_h,
         };
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -3288,5 +3454,77 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
         let _ = FillRgn(hdc, rgn, brush);
         let _ = DeleteObject(rgn);
         let _ = DeleteObject(brush);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_settings_json(language: &str) -> String {
+        format!(
+            r#"{{
+  "tray_offset": 321,
+  "taskbar_index": 1,
+  "poll_interval_ms": 60000,
+  "language": "{language}",
+  "widget_visible": true,
+  "show_claude_code": false,
+  "show_codex": true,
+  "show_antigravity": false
+}}"#
+        )
+    }
+
+    #[test]
+    fn loads_legacy_settings_when_new_path_is_missing() {
+        let base = std::env::temp_dir().join(format!(
+            "codex-usage-settings-test-{}-{}",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        let current = base.join("CodexUsage").join("settings.json");
+        let legacy = base.join("ClaudeCodeUsageMonitor").join("settings.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, test_settings_json("zh-CN")).unwrap();
+
+        let (settings, migrated) = load_settings_from_paths(&current, &legacy).unwrap();
+
+        assert!(migrated);
+        assert_eq!(settings.tray_offset, 321);
+        assert_eq!(settings.poll_interval_ms, 60_000);
+        assert_eq!(settings.language.as_deref(), Some("zh-CN"));
+        assert!(settings.show_codex);
+        assert!(!settings.show_claude_code);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn new_settings_take_precedence_over_legacy_settings() {
+        let base = std::env::temp_dir().join(format!(
+            "codex-usage-settings-precedence-test-{}-{}",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        let current = base.join("CodexUsage").join("settings.json");
+        let legacy = base.join("ClaudeCodeUsageMonitor").join("settings.json");
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&current, test_settings_json("en")).unwrap();
+        std::fs::write(&legacy, test_settings_json("zh-CN")).unwrap();
+
+        let (settings, migrated) = load_settings_from_paths(&current, &legacy).unwrap();
+
+        assert!(!migrated);
+        assert_eq!(settings.language.as_deref(), Some("en"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn startup_migration_only_writes_when_legacy_exists_without_current_entry() {
+        assert!(should_write_migrated_startup(true, false));
+        assert!(!should_write_migrated_startup(false, false));
+        assert!(!should_write_migrated_startup(true, true));
+        assert!(!should_write_migrated_startup(false, true));
     }
 }
