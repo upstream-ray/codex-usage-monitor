@@ -15,7 +15,17 @@ fn main() {
     let diagnose_enabled = args.iter().any(|arg| arg == "--diagnose");
     if diagnose_enabled {
         match diagnose::init() {
-            Ok(path) => diagnose::log(format!("startup args={args:?} log_path={}", path.display())),
+            Ok(path) => {
+                diagnose::log(format!("startup args={args:?} log_path={}", path.display()));
+                diagnose::log(format!(
+                    "version={} install_channel={:?} executable={}",
+                    env!("CARGO_PKG_VERSION"),
+                    updater::current_install_channel(),
+                    std::env::current_exe()
+                        .map(|value| value.display().to_string())
+                        .unwrap_or_else(|error| format!("unavailable:{error}"))
+                ));
+            }
             Err(error) => {
                 // Logging may not be available yet, but keep startup behavior unchanged.
                 let _ = error;

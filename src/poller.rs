@@ -31,7 +31,24 @@ pub enum PollError {
     AuthRequired,
     NoCredentials,
     TokenExpired,
+    NetworkUnavailable,
+    RateLimited,
+    ServerError,
     RequestFailed,
+}
+
+impl PollError {
+    pub fn category(self) -> &'static str {
+        match self {
+            Self::AuthRequired => "auth_required",
+            Self::NoCredentials => "no_credentials",
+            Self::TokenExpired => "token_expired",
+            Self::NetworkUnavailable => "network_unavailable",
+            Self::RateLimited => "rate_limited",
+            Self::ServerError => "server_error",
+            Self::RequestFailed => "invalid_response",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -563,6 +580,22 @@ fn build_agent() -> Result<ureq::Agent, PollError> {
         .build())
 }
 
+fn classify_http_status(status: u16) -> PollError {
+    match status {
+        401 | 403 => PollError::AuthRequired,
+        429 => PollError::RateLimited,
+        500..=599 => PollError::ServerError,
+        _ => PollError::RequestFailed,
+    }
+}
+
+fn classify_ureq_error(error: &ureq::Error) -> PollError {
+    match error {
+        ureq::Error::Status(status, _) => classify_http_status(*status),
+        ureq::Error::Transport(_) => PollError::NetworkUnavailable,
+    }
+}
+
 pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSnapshot {
     if mode == CredentialWatchMode::Antigravity {
         return vec![antigravity_credential_watch_signature()];
@@ -724,6 +757,7 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
 
 fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
     let agent = build_agent()?;
+    let mut last_error = PollError::RequestFailed;
 
     for model in MODEL_FALLBACK_CHAIN {
         let body = serde_json::json!({
@@ -746,8 +780,14 @@ fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
                 ));
                 return Err(PollError::AuthRequired);
             }
-            Err(ureq::Error::Status(_code, resp)) => resp,
-            Err(_) => continue,
+            Err(ureq::Error::Status(code, resp)) => {
+                last_error = classify_http_status(code);
+                resp
+            }
+            Err(error) => {
+                last_error = classify_ureq_error(&error);
+                continue;
+            }
         };
 
         let h5 = response.header("anthropic-ratelimit-unified-5h-utilization");
@@ -759,7 +799,7 @@ fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
         }
     }
 
-    Err(PollError::RequestFailed)
+    Err(last_error)
 }
 
 fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
@@ -813,15 +853,10 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
 
     let resp = match request.call() {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-            diagnose::log(format!(
-                "Codex usage endpoint returned auth error status {code}; refresh required"
-            ));
-            return Err(PollError::AuthRequired);
-        }
         Err(error) => {
+            let classified = classify_ureq_error(&error);
             diagnose::log_error("Codex usage endpoint request failed", error);
-            return Err(PollError::RequestFailed);
+            return Err(classified);
         }
     };
 
@@ -928,15 +963,10 @@ fn fetch_antigravity_project(base_url: &str, token: &str) -> Result<Option<Strin
         .send_json(&body)
     {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-            diagnose::log(format!(
-                "Antigravity loadCodeAssist returned auth error status {code}"
-            ));
-            return Err(PollError::AuthRequired);
-        }
         Err(error) => {
+            let classified = classify_ureq_error(&error);
             diagnose::log_error("Antigravity loadCodeAssist request failed", error);
-            return Err(PollError::RequestFailed);
+            return Err(classified);
         }
     };
 
@@ -970,15 +1000,10 @@ fn fetch_antigravity_model_quota(
         .send_json(&body)
     {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-            diagnose::log(format!(
-                "Antigravity fetchAvailableModels returned auth error status {code}"
-            ));
-            return Err(PollError::AuthRequired);
-        }
         Err(error) => {
+            let classified = classify_ureq_error(&error);
             diagnose::log_error("Antigravity fetchAvailableModels request failed", error);
-            return Err(PollError::RequestFailed);
+            return Err(classified);
         }
     };
 
@@ -1019,12 +1044,10 @@ fn fetch_antigravity_quota_summary(
         .send_json(&body)
     {
         Ok(resp) => resp,
-        Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-            return Err(PollError::AuthRequired);
-        }
         Err(error) => {
+            let classified = classify_ureq_error(&error);
             diagnose::log_error("Antigravity retrieveUserQuotaSummary request failed", error);
-            return Err(PollError::RequestFailed);
+            return Err(classified);
         }
     };
 
@@ -1647,6 +1670,20 @@ mod tests {
         assert_eq!(remaining_percentage(30.0), 70.0);
         assert_eq!(remaining_percentage(-5.0), 100.0);
         assert_eq!(remaining_percentage(120.0), 0.0);
+    }
+
+    #[test]
+    fn classifies_http_failures_for_user_visible_recovery() {
+        assert_eq!(classify_http_status(401), PollError::AuthRequired);
+        assert_eq!(classify_http_status(403), PollError::AuthRequired);
+        assert_eq!(classify_http_status(429), PollError::RateLimited);
+        assert_eq!(classify_http_status(500), PollError::ServerError);
+        assert_eq!(classify_http_status(503), PollError::ServerError);
+        assert_eq!(classify_http_status(404), PollError::RequestFailed);
+        assert_eq!(
+            PollError::NetworkUnavailable.category(),
+            "network_unavailable"
+        );
     }
 
     #[test]

@@ -122,6 +122,8 @@ This writes a log file to:
 %TEMP%\codex-usage.log
 ```
 
+The log records the application version, install channel, executable path, polling failure category, and retry timing. It does not log access tokens or credential contents. See [Troubleshooting](docs/troubleshooting.md) for the taskbar error labels and recovery steps.
+
 Settings are saved to:
 
 ```text

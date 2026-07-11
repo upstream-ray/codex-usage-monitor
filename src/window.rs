@@ -1909,6 +1909,42 @@ fn paint_content(
     }
 }
 
+fn poll_error_display_label(error: poller::PollError, language: LanguageId) -> &'static str {
+    match error {
+        poller::PollError::AuthRequired
+        | poller::PollError::NoCredentials
+        | poller::PollError::TokenExpired => "!",
+        poller::PollError::NetworkUnavailable => {
+            if language == LanguageId::SimplifiedChinese {
+                "网络"
+            } else {
+                "NET"
+            }
+        }
+        poller::PollError::RateLimited => {
+            if language == LanguageId::SimplifiedChinese {
+                "限流"
+            } else {
+                "429"
+            }
+        }
+        poller::PollError::ServerError => {
+            if language == LanguageId::SimplifiedChinese {
+                "服务"
+            } else {
+                "5XX"
+            }
+        }
+        poller::PollError::RequestFailed => {
+            if language == LanguageId::SimplifiedChinese {
+                "错误"
+            } else {
+                "ERR"
+            }
+        }
+    }
+}
+
 fn do_poll(send_hwnd: SendHwnd) {
     let hwnd = send_hwnd.to_hwnd();
     let (show_claude_code, show_codex, show_antigravity) = {
@@ -1991,7 +2027,10 @@ fn do_poll(send_hwnd: SendHwnd) {
                     poller::CredentialWatchMode::AllSources,
                     poller::credential_watch_snapshot(poller::CredentialWatchMode::AllSources),
                 )),
-                poller::PollError::RequestFailed => None,
+                poller::PollError::NetworkUnavailable
+                | poller::PollError::RateLimited
+                | poller::PollError::ServerError
+                | poller::PollError::RequestFailed => None,
             };
             // Distinguish auth-required errors from transient errors.
             let notify_auth_error = {
@@ -2024,22 +2063,28 @@ fn do_poll(send_hwnd: SendHwnd) {
                             }
                         }
                         _ => {
-                            // Transient network / credential-missing errors: exponential backoff.
+                            // Transient network, rate-limit, server, or response errors: exponential backoff.
                             s.force_notify_auth_error = false;
                             s.auth_error_paused_polling = false;
                             s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
                             s.auth_watch_snapshot.clear();
-                            s.session_text = "...".to_string();
-                            s.weekly_text = "...".to_string();
-                            s.codex_session_text = "...".to_string();
-                            s.codex_weekly_text = "...".to_string();
-                            s.antigravity_session_text = "...".to_string();
-                            s.antigravity_weekly_text = "...".to_string();
+                            let label = poll_error_display_label(e, s.language).to_string();
+                            s.session_text = label.clone();
+                            s.weekly_text = label.clone();
+                            s.codex_session_text = label.clone();
+                            s.codex_weekly_text = label.clone();
+                            s.antigravity_session_text = label.clone();
+                            s.antigravity_weekly_text = label;
                             s.retry_count = s.retry_count.saturating_add(1);
                             let backoff = RETRY_BASE_MS.saturating_mul(
                                 1u32.checked_shl(s.retry_count - 1).unwrap_or(u32::MAX),
                             );
                             let retry_ms = backoff.min(s.poll_interval_ms);
+                            diagnose::log(format!(
+                                "usage poll failed category={} retry={} retry_ms={retry_ms}",
+                                e.category(),
+                                s.retry_count
+                            ));
                             unsafe {
                                 let _ = KillTimer(hwnd, TIMER_RESET_POLL);
                                 SetTimer(hwnd, TIMER_POLL, retry_ms, None);
@@ -3526,5 +3571,31 @@ mod tests {
         assert!(!should_write_migrated_startup(false, false));
         assert!(!should_write_migrated_startup(true, true));
         assert!(!should_write_migrated_startup(false, true));
+    }
+
+    #[test]
+    fn displays_distinct_transient_error_categories() {
+        assert_eq!(
+            poll_error_display_label(
+                poller::PollError::NetworkUnavailable,
+                LanguageId::SimplifiedChinese,
+            ),
+            "网络"
+        );
+        assert_eq!(
+            poll_error_display_label(
+                poller::PollError::RateLimited,
+                LanguageId::SimplifiedChinese,
+            ),
+            "限流"
+        );
+        assert_eq!(
+            poll_error_display_label(poller::PollError::ServerError, LanguageId::English),
+            "5XX"
+        );
+        assert_eq!(
+            poll_error_display_label(poller::PollError::RequestFailed, LanguageId::English),
+            "ERR"
+        );
     }
 }

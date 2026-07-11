@@ -1,11 +1,12 @@
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
@@ -14,6 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 const RELEASE_ASSET_NAME: &str = "codex-usage.exe";
+const CHECKSUM_ASSET_NAME: &str = "codex-usage.exe.sha256";
 const HELPER_EXE_NAME: &str = "updater-helper.exe";
 const DOWNLOAD_EXE_NAME: &str = "update-download.exe";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -31,6 +33,7 @@ pub enum InstallChannel {
 pub struct ReleaseDescriptor {
     pub latest_version: String,
     asset_url: String,
+    expected_sha256: String,
 }
 
 #[derive(Debug)]
@@ -129,7 +132,12 @@ pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
         let _ = std::fs::remove_file(&partial_download_path);
     }
 
-    download_release_asset(&release.asset_url, &partial_download_path, &download_path)?;
+    download_release_asset(
+        &release.asset_url,
+        &release.expected_sha256,
+        &partial_download_path,
+        &download_path,
+    )?;
     std::fs::copy(&current_exe, &helper_path)
         .map_err(|e| format!("Unable to prepare updater helper: {e}"))?;
 
@@ -160,9 +168,15 @@ fn apply_update(target: PathBuf, source: PathBuf, pid: u32) -> Result<(), String
         ));
     }
 
-    let _ = wait_for_process_exit(pid, Duration::from_secs(30));
-    replace_target_binary(&target, &source)?;
-    relaunch_target(&target)?;
+    wait_for_process_exit(pid, Duration::from_secs(30))?;
+    let backup = replace_target_binary(&target, &source)?;
+    if let Err(error) = relaunch_target(&target) {
+        rollback_target_binary(&target, backup.as_deref())?;
+        return Err(error);
+    }
+    if let Some(backup) = backup {
+        let _ = std::fs::remove_file(backup);
+    }
     let _ = std::fs::remove_file(&source);
 
     Ok(())
@@ -195,11 +209,40 @@ fn fetch_latest_release() -> Result<Option<ReleaseDescriptor>, String> {
         .iter()
         .find(|asset| asset.name.eq_ignore_ascii_case(RELEASE_ASSET_NAME))
         .ok_or_else(|| format!("Release asset {RELEASE_ASSET_NAME} was not found."))?;
+    let checksum_asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name.eq_ignore_ascii_case(CHECKSUM_ASSET_NAME))
+        .ok_or_else(|| format!("Release asset {CHECKSUM_ASSET_NAME} was not found."))?;
+    let expected_sha256 = fetch_release_checksum(&agent, &checksum_asset.browser_download_url)?;
 
     Ok(Some(ReleaseDescriptor {
         latest_version,
         asset_url: asset.browser_download_url.clone(),
+        expected_sha256,
     }))
+}
+
+fn fetch_release_checksum(agent: &ureq::Agent, url: &str) -> Result<String, String> {
+    let response = agent
+        .get(url)
+        .set("User-Agent", user_agent())
+        .call()
+        .map_err(|e| format!("Unable to download the release checksum: {e}"))?;
+    let content = response
+        .into_string()
+        .map_err(|e| format!("Unable to read the release checksum: {e}"))?;
+    parse_release_checksum(&content)
+}
+
+fn parse_release_checksum(content: &str) -> Result<String, String> {
+    content
+        .split_whitespace()
+        .find(|value| value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .map(|value| value.to_ascii_uppercase())
+        .ok_or_else(|| {
+            "The release checksum file does not contain a valid SHA256 value.".to_string()
+        })
 }
 
 fn build_agent() -> Result<ureq::Agent, String> {
@@ -211,7 +254,12 @@ fn build_agent() -> Result<ureq::Agent, String> {
         .build())
 }
 
-fn download_release_asset(url: &str, partial_path: &Path, final_path: &Path) -> Result<(), String> {
+fn download_release_asset(
+    url: &str,
+    expected_sha256: &str,
+    partial_path: &Path,
+    final_path: &Path,
+) -> Result<(), String> {
     let agent = build_agent()?;
     let response = agent
         .get(url)
@@ -222,11 +270,30 @@ fn download_release_asset(url: &str, partial_path: &Path, final_path: &Path) -> 
     let mut reader = response.into_reader();
     let mut file = File::create(partial_path)
         .map_err(|e| format!("Unable to create temporary download file: {e}"))?;
-
-    io::copy(&mut reader, &mut file)
-        .map_err(|e| format!("Unable to write the downloaded update: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|e| format!("Unable to read the downloaded update: {e}"))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        file.write_all(&buffer[..count])
+            .map_err(|e| format!("Unable to write the downloaded update: {e}"))?;
+    }
     file.flush()
         .map_err(|e| format!("Unable to finalize the downloaded update: {e}"))?;
+
+    let actual_sha256 = format!("{:X}", hasher.finalize());
+    if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
+        drop(file);
+        let _ = std::fs::remove_file(partial_path);
+        return Err(format!(
+            "Downloaded update SHA256 mismatch. Expected {expected_sha256}, got {actual_sha256}."
+        ));
+    }
 
     std::fs::rename(partial_path, final_path)
         .map_err(|e| format!("Unable to finalize the downloaded update file: {e}"))?;
@@ -234,7 +301,7 @@ fn download_release_asset(url: &str, partial_path: &Path, final_path: &Path) -> 
     Ok(())
 }
 
-fn replace_target_binary(target: &Path, source: &Path) -> Result<(), String> {
+fn replace_target_binary(target: &Path, source: &Path) -> Result<Option<PathBuf>, String> {
     let backup_path = backup_path_for(target);
     let mut last_error = None;
 
@@ -253,14 +320,18 @@ fn replace_target_binary(target: &Path, source: &Path) -> Result<(), String> {
 
         match std::fs::copy(source, target) {
             Ok(_) => {
-                let _ = std::fs::remove_file(&backup_path);
-                return Ok(());
+                return Ok(renamed_existing.then(|| backup_path.clone()));
             }
             Err(error) => {
                 last_error = Some(error);
                 let _ = std::fs::remove_file(target);
                 if renamed_existing {
-                    let _ = std::fs::rename(&backup_path, target);
+                    std::fs::rename(&backup_path, target).map_err(|restore_error| {
+                        format!(
+                            "Unable to restore {} after a failed update: {restore_error}",
+                            target.display()
+                        )
+                    })?;
                 }
             }
         }
@@ -280,13 +351,26 @@ fn replace_target_binary(target: &Path, source: &Path) -> Result<(), String> {
     ))
 }
 
+fn rollback_target_binary(target: &Path, backup: Option<&Path>) -> Result<(), String> {
+    let _ = std::fs::remove_file(target);
+    if let Some(backup) = backup {
+        std::fs::rename(backup, target).map_err(|error| {
+            format!(
+                "Unable to restore {} after the updated app failed to start: {error}",
+                target.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn relaunch_target(target: &Path) -> Result<(), String> {
     let mut command = Command::new(target);
     if let Some(parent) = target.parent() {
         command.current_dir(parent);
     }
 
-    command
+    let mut child = command
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -297,6 +381,21 @@ fn relaunch_target(target: &Path) -> Result<(), String> {
                 "The update was installed, but the app could not be restarted automatically: {e}"
             )
         })?;
+
+    std::thread::sleep(Duration::from_secs(2));
+    match child.try_wait() {
+        Ok(None) => {}
+        Ok(Some(status)) => {
+            return Err(format!(
+                "The updated app exited immediately with status {status}."
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "Unable to confirm that the updated app stayed running: {error}"
+            ));
+        }
+    }
 
     Ok(())
 }
@@ -493,4 +592,71 @@ fn show_error_message(title: &str, message: &str) {
 
 fn wide_str(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_directory(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "codex-usage-updater-{name}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn parses_release_checksum_with_filename() {
+        let hash = "75761c6dff9c833d0a6b7a09992ce53bd417cf4a5234c065e06b1968171e2222";
+        assert_eq!(
+            parse_release_checksum(&format!("{hash}  codex-usage.exe\n")).unwrap(),
+            hash.to_ascii_uppercase()
+        );
+        assert!(parse_release_checksum("not-a-checksum").is_err());
+    }
+
+    #[test]
+    fn replacement_keeps_backup_until_relaunch_is_committed() {
+        let directory = test_directory("rollback");
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("codex-usage.exe");
+        let source = directory.join("download.exe");
+        std::fs::write(&target, b"old-version").unwrap();
+        std::fs::write(&source, b"new-version").unwrap();
+
+        let backup = replace_target_binary(&target, &source)
+            .unwrap()
+            .expect("existing target should have a backup");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-version");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old-version");
+
+        rollback_target_binary(&target, Some(&backup)).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"old-version");
+        assert!(!backup.exists());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn failed_relaunch_restores_previous_target() {
+        let directory = test_directory("failed-relaunch");
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("codex-usage.exe");
+        let source = directory.join("download.exe");
+        std::fs::write(&target, b"known-good-version").unwrap();
+        std::fs::write(&source, b"not-a-windows-executable").unwrap();
+
+        let error = apply_update(target.clone(), source, 0).unwrap_err();
+
+        assert!(error.contains("restarted") || error.contains("start"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"known-good-version");
+        assert!(!backup_path_for(&target).exists());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
 }
