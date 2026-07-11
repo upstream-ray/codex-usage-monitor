@@ -17,8 +17,8 @@
 - [x] 配置独立远程且保留上游远程用于同步 (`origin=git@github.com:upstream-ray/codex-usage-monitor.git`; `upstream=https://github.com/CodeZeno/Claude-Code-Usage-Monitor.git`)
 - [x] 更新仓库元数据、README、更新器与发布工作流 (`Cargo.toml`: repository/homepage 指向新仓库、version `1.5.0`; `README.md`: Release 下载与上游归属；`src/updater.rs`: 从 Cargo repository 派生 API 地址；`.github/workflows/release.yml`: `codex-usage.exe`)
 - [x] 验证 MIT 许可、原作者归属和派生说明 (`LICENSE`: 原文保留 Copyright 2025 Craig Constable；`README.md`: 上游链接、感谢、非关联声明；`cargo test`: 12 passed)
-- [ ] 推送基线分支并验证线上仓库内容
-- [ ] 创建并验证首个受控 GitHub Release
+- [x] 推送基线分支并验证线上仓库内容 (`git push -u origin HEAD:main`; GitHub default branch `main`; public repo MIT license detected)
+- [~] 创建并验证首个受控 GitHub Release
 
 ## Notes
 
