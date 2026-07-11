@@ -68,6 +68,7 @@ struct AppState {
     antigravity_session_text: String,
     antigravity_weekly_percent: f64,
     antigravity_weekly_text: String,
+    claude_code_available: bool,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
@@ -391,21 +392,42 @@ fn default_show_usage_window() -> bool {
     true
 }
 
-fn load_settings() -> SettingsFile {
+fn load_settings(claude_code_available: bool) -> SettingsFile {
     let current_path = settings_path();
     let legacy_path = legacy_settings_path();
     let (settings, migrated) = load_settings_from_paths(&current_path, &legacy_path)
         .unwrap_or_else(|| (SettingsFile::default(), false));
     let settings = normalize_settings(settings);
-    if migrated {
+    let (settings, claude_auto_disabled) =
+        apply_claude_code_availability(settings, claude_code_available);
+    if migrated || claude_auto_disabled {
         save_settings(&settings);
-        diagnose::log(format!(
-            "migrated settings from {} to {}",
-            legacy_path.display(),
-            current_path.display()
-        ));
+        if migrated {
+            diagnose::log(format!(
+                "migrated settings from {} to {}",
+                legacy_path.display(),
+                current_path.display()
+            ));
+        }
+        if claude_auto_disabled {
+            diagnose::log(
+                "disabled Claude Code monitoring because no CLI credentials are available",
+            );
+        }
     }
     settings
+}
+
+fn apply_claude_code_availability(
+    mut settings: SettingsFile,
+    claude_code_available: bool,
+) -> (SettingsFile, bool) {
+    let disabled = settings.show_claude_code && !claude_code_available;
+    if disabled {
+        settings.show_claude_code = false;
+        settings = normalize_settings(settings);
+    }
+    (settings, disabled)
 }
 
 fn load_settings_from_paths(
@@ -484,35 +506,35 @@ fn format_local_system_time(local: SYSTEMTIME) -> String {
     )
 }
 
-fn usage_tooltip(
-    model: &str,
-    usage: &crate::models::UsageData,
+fn service_tooltip(
+    service: &str,
     session_text: &str,
     weekly_text: &str,
-    strings: Strings,
     show_session_window: bool,
     show_weekly_window: bool,
 ) -> String {
     let mut parts = Vec::new();
     if show_session_window {
-        let exact = format_precise_reset_time(usage.session.resets_at)
-            .map(|value| format!(" ({value})"))
-            .unwrap_or_default();
-        parts.push(format!(
-            "{}: {}{}",
-            strings.session_window, session_text, exact
-        ));
+        parts.push(format!("5h {session_text}"));
     }
     if show_weekly_window {
-        let exact = format_precise_reset_time(usage.weekly.resets_at)
-            .map(|value| format!(" ({value})"))
-            .unwrap_or_default();
-        parts.push(format!(
-            "{}: {}{}",
-            strings.weekly_window, weekly_text, exact
-        ));
+        parts.push(format!("7d {weekly_text}"));
     }
-    format!("{model} | {}", parts.join(" | "))
+    format!("{service}: {}", parts.join(" | "))
+}
+
+fn claude_code_menu_label(
+    strings: Strings,
+    language: LanguageId,
+    claude_code_available: bool,
+) -> String {
+    if claude_code_available {
+        strings.claude_code_model.to_string()
+    } else if language == LanguageId::SimplifiedChinese {
+        "Claude Code（需登录 CLI）".to_string()
+    } else {
+        "Claude Code (CLI login required)".to_string()
+    }
 }
 
 struct QuotaAlert {
@@ -667,136 +689,65 @@ fn append_quota_alert(
     });
 }
 
-fn tray_primary_percent(state: &AppState, session_percent: f64, weekly_percent: f64) -> f64 {
-    if state.show_session_window {
-        session_percent
-    } else {
-        weekly_percent
-    }
-}
-
-fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
+fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
     let state = lock_state();
     match state.as_ref() {
         Some(s) if s.last_poll_ok => {
-            let mut icons = Vec::new();
+            let mut services = Vec::new();
             let strings = s.language.strings();
             if s.show_claude_code {
-                let tooltip = s
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.claude_code.as_ref())
-                    .map(|usage| {
-                        usage_tooltip(
-                            strings.claude_code_model,
-                            usage,
-                            &s.session_text,
-                            &s.weekly_text,
-                            strings,
-                            s.show_session_window,
-                            s.show_weekly_window,
-                        )
-                    })
-                    .unwrap_or_else(|| strings.window_title.to_string());
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Claude,
-                    percent: Some(usage_percent_for_display(
-                        s.language,
-                        tray_primary_percent(s, s.session_percent, s.weekly_percent),
-                    )),
-                    tooltip,
-                });
+                services.push(service_tooltip(
+                    strings.claude_code_model,
+                    &s.session_text,
+                    &s.weekly_text,
+                    s.show_session_window,
+                    s.show_weekly_window,
+                ));
             }
             if s.show_codex {
-                let tooltip = s
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.codex.as_ref())
-                    .map(|usage| {
-                        usage_tooltip(
-                            strings.codex_model,
-                            usage,
-                            &s.codex_session_text,
-                            &s.codex_weekly_text,
-                            strings,
-                            s.show_session_window,
-                            s.show_weekly_window,
-                        )
-                    })
-                    .unwrap_or_else(|| strings.codex_window_title.to_string());
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Codex,
-                    percent: Some(usage_percent_for_display(
-                        s.language,
-                        tray_primary_percent(s, s.codex_session_percent, s.codex_weekly_percent),
-                    )),
-                    tooltip,
-                });
+                services.push(service_tooltip(
+                    strings.codex_model,
+                    &s.codex_session_text,
+                    &s.codex_weekly_text,
+                    s.show_session_window,
+                    s.show_weekly_window,
+                ));
             }
             if s.show_antigravity {
-                let tooltip = s
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.antigravity.as_ref())
-                    .map(|usage| {
-                        usage_tooltip(
-                            strings.antigravity_model,
-                            usage,
-                            &s.antigravity_session_text,
-                            &s.antigravity_weekly_text,
-                            strings,
-                            s.show_session_window,
-                            s.show_weekly_window,
-                        )
-                    })
-                    .unwrap_or_else(|| strings.antigravity_window_title.to_string());
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: Some(usage_percent_for_display(
-                        s.language,
-                        tray_primary_percent(
-                            s,
-                            s.antigravity_session_percent,
-                            s.antigravity_weekly_percent,
-                        ),
-                    )),
-                    tooltip,
-                });
+                services.push(service_tooltip(
+                    strings.antigravity_model,
+                    &s.antigravity_session_text,
+                    &s.antigravity_weekly_text,
+                    s.show_session_window,
+                    s.show_weekly_window,
+                ));
             }
-            icons
+            Some(tray_icon::TrayIconData {
+                tooltip: if services.is_empty() {
+                    strings.window_title.to_string()
+                } else {
+                    services.join("\n")
+                },
+            })
         }
         Some(s) => {
-            let mut icons = Vec::new();
-            if s.show_claude_code {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Claude,
-                    percent: None,
-                    tooltip: s.language.strings().window_title.to_string(),
-                });
-            }
-            if s.show_codex {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Codex,
-                    percent: None,
-                    tooltip: s.language.strings().codex_window_title.to_string(),
-                });
-            }
-            if s.show_antigravity {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: None,
-                    tooltip: s.language.strings().antigravity_window_title.to_string(),
-                });
-            }
-            icons
+            let strings = s.language.strings();
+            let tooltip = match (s.show_claude_code, s.show_codex, s.show_antigravity) {
+                (false, true, false) => strings.codex_window_title,
+                (false, false, true) => strings.antigravity_window_title,
+                _ => strings.window_title,
+            };
+            Some(tray_icon::TrayIconData {
+                tooltip: tooltip.to_string(),
+            })
         }
-        None => Vec::new(),
+        None => None,
     }
 }
 
 fn sync_tray_icons(hwnd: HWND) {
-    let icons = tray_icon_data_from_state();
-    tray_icon::sync(hwnd, &icons);
+    let icon = tray_icon_data_from_state();
+    tray_icon::sync(hwnd, icon.as_ref());
 }
 
 fn toggle_widget_visibility(hwnd: HWND) {
@@ -1675,7 +1626,8 @@ pub fn run() {
             diagnose::log("RegisterClassExW returned 0");
         }
 
-        let settings = load_settings();
+        let claude_code_available = poller::claude_code_credentials_available();
+        let settings = load_settings(claude_code_available);
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
@@ -1749,6 +1701,7 @@ pub fn run() {
                 antigravity_session_text: "--".to_string(),
                 antigravity_weekly_percent: 0.0,
                 antigravity_weekly_text: "--".to_string(),
+                claude_code_available,
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
@@ -3193,7 +3146,11 @@ unsafe extern "system" fn wnd_proc(
                         if let Some(s) = state.as_mut() {
                             match id {
                                 IDM_MODEL_CLAUDE_CODE => {
-                                    if s.show_codex || s.show_antigravity || !s.show_claude_code {
+                                    if s.claude_code_available
+                                        && (s.show_codex
+                                            || s.show_antigravity
+                                            || !s.show_claude_code)
+                                    {
                                         s.show_claude_code = !s.show_claude_code;
                                     }
                                 }
@@ -3308,6 +3265,7 @@ fn show_context_menu(hwnd: HWND) {
             update_status,
             widget_visible,
             show_claude_code,
+            claude_code_available,
             show_codex,
             show_antigravity,
             show_session_window,
@@ -3325,6 +3283,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.update_status.clone(),
                     s.widget_visible,
                     s.show_claude_code,
+                    s.claude_code_available,
                     s.show_codex,
                     s.show_antigravity,
                     s.show_session_window,
@@ -3340,6 +3299,7 @@ fn show_context_menu(hwnd: HWND) {
                     UpdateStatus::Idle,
                     true,
                     true,
+                    false,
                     false,
                     false,
                     true,
@@ -3392,8 +3352,11 @@ fn show_context_menu(hwnd: HWND) {
 
         // Models submenu
         let models_menu = CreatePopupMenu().unwrap();
-        let claude_model = native_interop::wide_str(strings.claude_code_model);
-        let claude_flags = if show_claude_code {
+        let claude_label = claude_code_menu_label(strings, language, claude_code_available);
+        let claude_model = native_interop::wide_str(&claude_label);
+        let claude_flags = if !claude_code_available {
+            MF_GRAYED
+        } else if show_claude_code {
             MF_CHECKED
         } else {
             MENU_ITEM_FLAGS(0)
@@ -4014,6 +3977,40 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn service_tooltip_combines_visible_quota_rows() {
+        assert_eq!(
+            service_tooltip(
+                "Codex",
+                "剩余13% 19:04重置",
+                "剩余86% 07/18重置",
+                true,
+                true
+            ),
+            "Codex: 5h 剩余13% 19:04重置 | 7d 剩余86% 07/18重置"
+        );
+        assert_eq!(
+            service_tooltip("Claude Code", "13%", "86%", false, true),
+            "Claude Code: 7d 86%"
+        );
+    }
+
+    #[test]
+    fn unavailable_claude_cli_has_an_explicit_menu_label() {
+        assert_eq!(
+            claude_code_menu_label(
+                LanguageId::SimplifiedChinese.strings(),
+                LanguageId::SimplifiedChinese,
+                false,
+            ),
+            "Claude Code（需登录 CLI）"
+        );
+        assert_eq!(
+            claude_code_menu_label(LanguageId::English.strings(), LanguageId::English, true),
+            "Claude Code"
+        );
+    }
+
     fn test_settings_json(language: &str) -> String {
         format!(
             r#"{{
@@ -4124,6 +4121,22 @@ mod tests {
         assert!(!settings.show_weekly_window);
         assert_eq!(settings.alert_threshold_percent, 0);
         assert_eq!(settings.notified_quota_windows.len(), 1);
+    }
+
+    #[test]
+    fn unavailable_claude_cli_is_disabled_without_disabling_codex() {
+        let settings = SettingsFile {
+            show_claude_code: true,
+            show_codex: false,
+            show_antigravity: false,
+            ..SettingsFile::default()
+        };
+
+        let (settings, changed) = apply_claude_code_availability(settings, false);
+
+        assert!(changed);
+        assert!(!settings.show_claude_code);
+        assert!(settings.show_codex);
     }
 
     #[test]

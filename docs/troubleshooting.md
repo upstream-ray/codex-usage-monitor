@@ -6,7 +6,7 @@ Codex Usage keeps authentication failures separate from transient service failur
 
 | Simplified Chinese | Other languages | Meaning | Recommended action |
 |---|---|---|---|
-| `!` | `!` | Credentials are missing or expired | Sign in with the relevant CLI/app, then refresh Codex Usage |
+| `!` | `!` | Enabled service credentials are missing or expired | Sign in with the relevant CLI/app, then refresh Codex Usage. Claude Desktop login does not count as Claude Code CLI login. |
 | `网络` | `NET` | Network or TLS connection failed | Check connectivity, VPN, proxy, and firewall settings |
 | `限流` | `429` | Provider rate limit | Wait for the provider retry window; Codex Usage retries with backoff |
 | `服务` | `5XX` | Provider service failure | Wait and retry; check provider status if it persists |
