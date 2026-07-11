@@ -1,6 +1,6 @@
 # Phase 04 — 安装、升级与卸载
 
-**Status**: `in progress`
+**Status**: `completed`
 **目标**: 让普通 Windows 用户能够可靠安装、升级和卸载 Codex Usage。
 **前置**: Phase 03
 
@@ -18,7 +18,7 @@
 - [x] 将安装产物和 SHA256 接入 Release workflow (`.github/workflows/release.yml`: EXE、SHA256、install.ps1、uninstall.ps1)
 - [x] 验证旧版升级、全新安装、卸载与回滚 (1.5.0→1.6.0；设置 SHA256 保持 `5ED392E3FCBEBFBE34CB57F8253034076762E1DF3A32CCEE2F5294E2A20DC001`；故障注入退出 1 并回滚到 1.5.0；最终 PID 34756 运行 1.6.0)
 - [x] 配置并验证 WinGet 发布路径 (`packaging/winget/1.6.0`; `winget validate --manifest packaging\winget\1.6.0 --disable-interactivity`: success, no warnings)
-- [~] 提交并推送安装升级版本
+- [x] 提交并推送安装升级版本 (commit `bff3f9b`; tag `v1.6.0`; manifest commit `1f5de27`; all pushed to `origin/main`)
 
 ## Notes
 
