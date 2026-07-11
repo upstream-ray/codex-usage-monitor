@@ -24,9 +24,9 @@ It sits in your taskbar and shows how much of your Codex usage window remains wi
 - Optional low-quota alerts at 10%, 20%, or 30% remaining, deduplicated per reset window
 - Independent display controls for the 5-hour and weekly rows
 - A small native widget that lives directly in the Windows taskbar
-- System tray icon badges showing your enabled model usage percentage
+- One system tray icon that matches the desktop app icon
 - Left-click the tray icon to toggle the taskbar widget on or off
-- Right-click options for refresh, displayed models, usage rows, quota alerts, update frequency, language, startup, widget visibility, and updates
+- Right-click options for refresh, monitored services, usage rows, quota alerts, update frequency, language, startup, widget visibility, and updates
 - Multi-monitor taskbar placement, so the widget can live on the taskbar for the screen you prefer
 
 ## Who This Is For
@@ -35,7 +35,7 @@ This app is for Windows users who already have **Codex CLI or the Codex app inst
 
 Codex is enabled by default. The app reads the same local credentials used by Codex.
 
-Antigravity support is optional too. To show Antigravity usage, install and sign in to Google Antigravity, then enable the **Antigravity** model from the right-click **Models** menu.
+Antigravity support is optional too. To show Antigravity usage, install and sign in to Google Antigravity, then enable the **Antigravity** service from the right-click **Monitored services** menu.
 
 It works best if you want a simple "how close am I to the limit?" display that is always visible.
 
@@ -84,33 +84,29 @@ Run:
 codex-usage
 ```
 
-Once running, it will appear in your taskbar and as one or more tray icons in the notification area.
+Once running, it will appear in your taskbar and as one tray icon in the notification area.
 
 - Drag the left divider to move the taskbar widget
 - On multi-monitor setups, drag the widget onto another Windows taskbar to move it to that screen
-- Right-click the taskbar widget or tray icon for refresh, displayed models, usage rows, quota alerts, update frequency, Start with Windows, reset position, language, updates, and exit
+- Right-click the taskbar widget or tray icon for refresh, monitored services, usage rows, quota alerts, update frequency, Start with Windows, reset position, language, updates, and exit
 - Left-click the tray icon to toggle the taskbar widget on or off
 - Enable `Start with Windows` from the right-click menu if you want it to launch automatically when you sign in
 
-### Models
+### Monitored Services
 
-Use the right-click **Models** menu to choose what the widget displays:
+Use the right-click **Monitored services** menu to choose which independent services the widget displays. The services are not mutually exclusive, so you can monitor more than one account at the same time:
 
 - **Codex** is enabled by default
-- **Claude Code** can be enabled alongside Codex or shown by itself
-- **Antigravity** can be enabled alongside the other providers or shown by itself as its own model column
+- **Claude Code** can be enabled alongside Codex or shown by itself when Claude Code CLI is installed and authenticated
+- **Antigravity** can be enabled alongside the other providers or shown by itself as its own service column
 
-When multiple models are shown, each model has its own usage bar and matching usage text color. Antigravity prefers Google's Gemini quota summary when available and falls back to model quota data when needed.
+When multiple services are shown, each service has its own usage bar and matching usage text color. Antigravity prefers Google's Gemini quota summary when available and falls back to model quota data when needed.
 
 ### System Tray Icon
 
-The tray icon shows your current 5-hour usage as a percentage badge.
+The app always shows one tray icon using the same embedded icon as the executable and desktop shortcut, regardless of how many services are enabled.
 
-If multiple providers are enabled, the app shows one tray icon per provider. If only one model is enabled, it shows one tray icon.
-
-The Claude Code tray icon uses the same warm usage colors as the Claude bar. The Codex tray icon uses a black and white badge style. The Antigravity tray icon uses a blue badge style.
-
-Hovering over a tray icon shows the usage values and exact local reset time for that model. If the 5-hour row is hidden, the tray badge switches to the weekly percentage.
+Hovering over the tray icon shows a compact summary for all enabled services. Left-clicking it toggles the taskbar widget; right-clicking it opens the settings menu.
 
 ### Usage Display And Alerts
 

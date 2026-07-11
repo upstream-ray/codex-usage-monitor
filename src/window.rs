@@ -484,35 +484,21 @@ fn format_local_system_time(local: SYSTEMTIME) -> String {
     )
 }
 
-fn usage_tooltip(
-    model: &str,
-    usage: &crate::models::UsageData,
+fn service_tooltip(
+    service: &str,
     session_text: &str,
     weekly_text: &str,
-    strings: Strings,
     show_session_window: bool,
     show_weekly_window: bool,
 ) -> String {
     let mut parts = Vec::new();
     if show_session_window {
-        let exact = format_precise_reset_time(usage.session.resets_at)
-            .map(|value| format!(" ({value})"))
-            .unwrap_or_default();
-        parts.push(format!(
-            "{}: {}{}",
-            strings.session_window, session_text, exact
-        ));
+        parts.push(format!("5h {session_text}"));
     }
     if show_weekly_window {
-        let exact = format_precise_reset_time(usage.weekly.resets_at)
-            .map(|value| format!(" ({value})"))
-            .unwrap_or_default();
-        parts.push(format!(
-            "{}: {}{}",
-            strings.weekly_window, weekly_text, exact
-        ));
+        parts.push(format!("7d {weekly_text}"));
     }
-    format!("{model} | {}", parts.join(" | "))
+    format!("{service}: {}", parts.join(" | "))
 }
 
 struct QuotaAlert {
@@ -667,136 +653,65 @@ fn append_quota_alert(
     });
 }
 
-fn tray_primary_percent(state: &AppState, session_percent: f64, weekly_percent: f64) -> f64 {
-    if state.show_session_window {
-        session_percent
-    } else {
-        weekly_percent
-    }
-}
-
-fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
+fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
     let state = lock_state();
     match state.as_ref() {
         Some(s) if s.last_poll_ok => {
-            let mut icons = Vec::new();
+            let mut services = Vec::new();
             let strings = s.language.strings();
             if s.show_claude_code {
-                let tooltip = s
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.claude_code.as_ref())
-                    .map(|usage| {
-                        usage_tooltip(
-                            strings.claude_code_model,
-                            usage,
-                            &s.session_text,
-                            &s.weekly_text,
-                            strings,
-                            s.show_session_window,
-                            s.show_weekly_window,
-                        )
-                    })
-                    .unwrap_or_else(|| strings.window_title.to_string());
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Claude,
-                    percent: Some(usage_percent_for_display(
-                        s.language,
-                        tray_primary_percent(s, s.session_percent, s.weekly_percent),
-                    )),
-                    tooltip,
-                });
+                services.push(service_tooltip(
+                    strings.claude_code_model,
+                    &s.session_text,
+                    &s.weekly_text,
+                    s.show_session_window,
+                    s.show_weekly_window,
+                ));
             }
             if s.show_codex {
-                let tooltip = s
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.codex.as_ref())
-                    .map(|usage| {
-                        usage_tooltip(
-                            strings.codex_model,
-                            usage,
-                            &s.codex_session_text,
-                            &s.codex_weekly_text,
-                            strings,
-                            s.show_session_window,
-                            s.show_weekly_window,
-                        )
-                    })
-                    .unwrap_or_else(|| strings.codex_window_title.to_string());
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Codex,
-                    percent: Some(usage_percent_for_display(
-                        s.language,
-                        tray_primary_percent(s, s.codex_session_percent, s.codex_weekly_percent),
-                    )),
-                    tooltip,
-                });
+                services.push(service_tooltip(
+                    strings.codex_model,
+                    &s.codex_session_text,
+                    &s.codex_weekly_text,
+                    s.show_session_window,
+                    s.show_weekly_window,
+                ));
             }
             if s.show_antigravity {
-                let tooltip = s
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.antigravity.as_ref())
-                    .map(|usage| {
-                        usage_tooltip(
-                            strings.antigravity_model,
-                            usage,
-                            &s.antigravity_session_text,
-                            &s.antigravity_weekly_text,
-                            strings,
-                            s.show_session_window,
-                            s.show_weekly_window,
-                        )
-                    })
-                    .unwrap_or_else(|| strings.antigravity_window_title.to_string());
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: Some(usage_percent_for_display(
-                        s.language,
-                        tray_primary_percent(
-                            s,
-                            s.antigravity_session_percent,
-                            s.antigravity_weekly_percent,
-                        ),
-                    )),
-                    tooltip,
-                });
+                services.push(service_tooltip(
+                    strings.antigravity_model,
+                    &s.antigravity_session_text,
+                    &s.antigravity_weekly_text,
+                    s.show_session_window,
+                    s.show_weekly_window,
+                ));
             }
-            icons
+            Some(tray_icon::TrayIconData {
+                tooltip: if services.is_empty() {
+                    strings.window_title.to_string()
+                } else {
+                    services.join("\n")
+                },
+            })
         }
         Some(s) => {
-            let mut icons = Vec::new();
-            if s.show_claude_code {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Claude,
-                    percent: None,
-                    tooltip: s.language.strings().window_title.to_string(),
-                });
-            }
-            if s.show_codex {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Codex,
-                    percent: None,
-                    tooltip: s.language.strings().codex_window_title.to_string(),
-                });
-            }
-            if s.show_antigravity {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: None,
-                    tooltip: s.language.strings().antigravity_window_title.to_string(),
-                });
-            }
-            icons
+            let strings = s.language.strings();
+            let tooltip = match (s.show_claude_code, s.show_codex, s.show_antigravity) {
+                (false, true, false) => strings.codex_window_title,
+                (false, false, true) => strings.antigravity_window_title,
+                _ => strings.window_title,
+            };
+            Some(tray_icon::TrayIconData {
+                tooltip: tooltip.to_string(),
+            })
         }
-        None => Vec::new(),
+        None => None,
     }
 }
 
 fn sync_tray_icons(hwnd: HWND) {
-    let icons = tray_icon_data_from_state();
-    tray_icon::sync(hwnd, &icons);
+    let icon = tray_icon_data_from_state();
+    tray_icon::sync(hwnd, icon.as_ref());
 }
 
 fn toggle_widget_visibility(hwnd: HWND) {
@@ -4013,6 +3928,24 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_tooltip_combines_visible_quota_rows() {
+        assert_eq!(
+            service_tooltip(
+                "Codex",
+                "剩余13% 19:04重置",
+                "剩余86% 07/18重置",
+                true,
+                true
+            ),
+            "Codex: 5h 剩余13% 19:04重置 | 7d 剩余86% 07/18重置"
+        );
+        assert_eq!(
+            service_tooltip("Claude Code", "13%", "86%", false, true),
+            "Claude Code: 7d 86%"
+        );
+    }
 
     fn test_settings_json(language: &str) -> String {
         format!(

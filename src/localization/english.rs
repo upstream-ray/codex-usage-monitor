@@ -10,7 +10,7 @@ pub(super) const STRINGS: Strings = Strings {
     five_minutes: "5 Minutes",
     fifteen_minutes: "15 Minutes",
     one_hour: "1 Hour",
-    models: "Models",
+    models: "Monitored services",
     claude_code_model: "Claude Code",
     codex_model: "Codex",
     antigravity_model: "Antigravity",
