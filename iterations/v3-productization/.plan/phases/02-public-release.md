@@ -1,6 +1,6 @@
 # Phase 02 — 公开仓库与独立发布渠道
 
-**Status**: `in progress`
+**Status**: `completed`
 **目标**: 在用户 GitHub 账户下建立公开的 `codex-usage-monitor` 仓库，并让源码、Release 和更新检查指向该仓库。
 **前置**: Phase 01
 
@@ -18,8 +18,9 @@
 - [x] 更新仓库元数据、README、更新器与发布工作流 (`Cargo.toml`: repository/homepage 指向新仓库、version `1.5.0`; `README.md`: Release 下载与上游归属；`src/updater.rs`: 从 Cargo repository 派生 API 地址；`.github/workflows/release.yml`: `codex-usage.exe`)
 - [x] 验证 MIT 许可、原作者归属和派生说明 (`LICENSE`: 原文保留 Copyright 2025 Craig Constable；`README.md`: 上游链接、感谢、非关联声明；`cargo test`: 12 passed)
 - [x] 推送基线分支并验证线上仓库内容 (`git push -u origin HEAD:main`; GitHub default branch `main`; public repo MIT license detected)
-- [~] 创建并验证首个受控 GitHub Release
+- [x] 创建并验证首个受控 GitHub Release (tag `v1.5.0`; Actions run `29140416506` success; release `https://github.com/upstream-ray/codex-usage-monitor/releases/tag/v1.5.0`; asset `codex-usage.exe`, 854528 bytes, SHA256 `9DDD0365398EF4A5629579614A4D697C49284707EE05873AFC5BADC7AFD9163C`)
 
 ## Notes
 
 - 首个派生版本使用 `1.5.0`，延续上游 `1.4.8` 之后的版本顺序，避免已安装 `1.4.8` 用户被语义降级。
+- GitHub Actions 成功；`actions/checkout@v4` 与 `softprops/action-gh-release@v2` 出现 Node.js 20 弃用提示，但 runner 已强制使用 Node.js 24，不影响本次 Release。
