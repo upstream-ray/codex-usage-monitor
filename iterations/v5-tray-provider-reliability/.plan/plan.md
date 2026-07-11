@@ -27,7 +27,7 @@
 | # | 阶段 slug | 一句话目标 | 状态 |
 |---|---|---|---|
 | 01 | single-tray-identity | 使用单个应用图标并澄清“监控服务”概念 | completed |
-| 02 | claude-cli-availability | 仅在 Claude Code CLI 凭据真实可用时提供监控并给出明确状态 | not started |
+| 02 | claude-cli-availability | 仅在 Claude Code CLI 凭据真实可用时提供监控并给出明确状态 | completed |
 
 ## 关键决策
 
@@ -38,4 +38,4 @@
 
 ## Open Questions
 
-- [ ] Phase 02 中不可用的 Claude Code 应隐藏、禁用还是保留并显示说明——在 Phase 02 开始前确认
+- [x] Phase 02 中不可用的 Claude Code 保留为禁用菜单项并标注“需登录 CLI”；旧设置自动关闭 Claude Code——用户于 2026-07-11 确认

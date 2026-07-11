@@ -210,6 +210,12 @@ pub fn poll(
     )
 }
 
+/// Whether Claude Code CLI credentials are available from a supported source.
+/// Claude Desktop authentication is intentionally not treated as CLI access.
+pub fn claude_code_credentials_available() -> bool {
+    read_first_credentials().is_some()
+}
+
 fn poll_with(
     show_claude_code: bool,
     show_codex: bool,
@@ -637,10 +643,19 @@ fn all_known_credential_sources() -> Vec<CredentialSource> {
 }
 
 fn windows_credential_source() -> Option<CredentialSource> {
-    let home = dirs::home_dir()?;
-    Some(CredentialSource::Windows(
-        home.join(".claude").join(".credentials.json"),
-    ))
+    Some(CredentialSource::Windows(windows_credentials_path_from(
+        std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
+        dirs::home_dir(),
+    )?))
+}
+
+fn windows_credentials_path_from(
+    config_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let config_dir = config_dir.filter(|path| !path.as_os_str().is_empty());
+    let directory = config_dir.or_else(|| home.map(|path| path.join(".claude")))?;
+    Some(directory.join(".credentials.json"))
 }
 
 fn credential_watch_signature(source: &CredentialSource) -> Option<String> {
@@ -1678,6 +1693,21 @@ pub fn app_is_past_reset(data: &AppUsageData) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_credentials_path_honors_custom_config_directory() {
+        assert_eq!(
+            windows_credentials_path_from(
+                Some(PathBuf::from(r"D:\claude-config")),
+                Some(PathBuf::from(r"C:\Users\Ray")),
+            ),
+            Some(PathBuf::from(r"D:\claude-config\.credentials.json"))
+        );
+        assert_eq!(
+            windows_credentials_path_from(None, Some(PathBuf::from(r"C:\Users\Ray"))),
+            Some(PathBuf::from(r"C:\Users\Ray\.claude\.credentials.json"))
+        );
+    }
 
     fn usage_with_session_percent(percentage: f64) -> UsageData {
         UsageData {

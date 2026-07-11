@@ -68,6 +68,7 @@ struct AppState {
     antigravity_session_text: String,
     antigravity_weekly_percent: f64,
     antigravity_weekly_text: String,
+    claude_code_available: bool,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
@@ -391,21 +392,42 @@ fn default_show_usage_window() -> bool {
     true
 }
 
-fn load_settings() -> SettingsFile {
+fn load_settings(claude_code_available: bool) -> SettingsFile {
     let current_path = settings_path();
     let legacy_path = legacy_settings_path();
     let (settings, migrated) = load_settings_from_paths(&current_path, &legacy_path)
         .unwrap_or_else(|| (SettingsFile::default(), false));
     let settings = normalize_settings(settings);
-    if migrated {
+    let (settings, claude_auto_disabled) =
+        apply_claude_code_availability(settings, claude_code_available);
+    if migrated || claude_auto_disabled {
         save_settings(&settings);
-        diagnose::log(format!(
-            "migrated settings from {} to {}",
-            legacy_path.display(),
-            current_path.display()
-        ));
+        if migrated {
+            diagnose::log(format!(
+                "migrated settings from {} to {}",
+                legacy_path.display(),
+                current_path.display()
+            ));
+        }
+        if claude_auto_disabled {
+            diagnose::log(
+                "disabled Claude Code monitoring because no CLI credentials are available",
+            );
+        }
     }
     settings
+}
+
+fn apply_claude_code_availability(
+    mut settings: SettingsFile,
+    claude_code_available: bool,
+) -> (SettingsFile, bool) {
+    let disabled = settings.show_claude_code && !claude_code_available;
+    if disabled {
+        settings.show_claude_code = false;
+        settings = normalize_settings(settings);
+    }
+    (settings, disabled)
 }
 
 fn load_settings_from_paths(
@@ -499,6 +521,20 @@ fn service_tooltip(
         parts.push(format!("7d {weekly_text}"));
     }
     format!("{service}: {}", parts.join(" | "))
+}
+
+fn claude_code_menu_label(
+    strings: Strings,
+    language: LanguageId,
+    claude_code_available: bool,
+) -> String {
+    if claude_code_available {
+        strings.claude_code_model.to_string()
+    } else if language == LanguageId::SimplifiedChinese {
+        "Claude Code（需登录 CLI）".to_string()
+    } else {
+        "Claude Code (CLI login required)".to_string()
+    }
 }
 
 struct QuotaAlert {
@@ -1590,7 +1626,8 @@ pub fn run() {
             diagnose::log("RegisterClassExW returned 0");
         }
 
-        let settings = load_settings();
+        let claude_code_available = poller::claude_code_credentials_available();
+        let settings = load_settings(claude_code_available);
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
@@ -1664,6 +1701,7 @@ pub fn run() {
                 antigravity_session_text: "--".to_string(),
                 antigravity_weekly_percent: 0.0,
                 antigravity_weekly_text: "--".to_string(),
+                claude_code_available,
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
@@ -3108,7 +3146,11 @@ unsafe extern "system" fn wnd_proc(
                         if let Some(s) = state.as_mut() {
                             match id {
                                 IDM_MODEL_CLAUDE_CODE => {
-                                    if s.show_codex || s.show_antigravity || !s.show_claude_code {
+                                    if s.claude_code_available
+                                        && (s.show_codex
+                                            || s.show_antigravity
+                                            || !s.show_claude_code)
+                                    {
                                         s.show_claude_code = !s.show_claude_code;
                                     }
                                 }
@@ -3223,6 +3265,7 @@ fn show_context_menu(hwnd: HWND) {
             update_status,
             widget_visible,
             show_claude_code,
+            claude_code_available,
             show_codex,
             show_antigravity,
             show_session_window,
@@ -3240,6 +3283,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.update_status.clone(),
                     s.widget_visible,
                     s.show_claude_code,
+                    s.claude_code_available,
                     s.show_codex,
                     s.show_antigravity,
                     s.show_session_window,
@@ -3255,6 +3299,7 @@ fn show_context_menu(hwnd: HWND) {
                     UpdateStatus::Idle,
                     true,
                     true,
+                    false,
                     false,
                     false,
                     true,
@@ -3307,8 +3352,11 @@ fn show_context_menu(hwnd: HWND) {
 
         // Models submenu
         let models_menu = CreatePopupMenu().unwrap();
-        let claude_model = native_interop::wide_str(strings.claude_code_model);
-        let claude_flags = if show_claude_code {
+        let claude_label = claude_code_menu_label(strings, language, claude_code_available);
+        let claude_model = native_interop::wide_str(&claude_label);
+        let claude_flags = if !claude_code_available {
+            MF_GRAYED
+        } else if show_claude_code {
             MF_CHECKED
         } else {
             MENU_ITEM_FLAGS(0)
@@ -3947,6 +3995,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unavailable_claude_cli_has_an_explicit_menu_label() {
+        assert_eq!(
+            claude_code_menu_label(
+                LanguageId::SimplifiedChinese.strings(),
+                LanguageId::SimplifiedChinese,
+                false,
+            ),
+            "Claude Code（需登录 CLI）"
+        );
+        assert_eq!(
+            claude_code_menu_label(LanguageId::English.strings(), LanguageId::English, true),
+            "Claude Code"
+        );
+    }
+
     fn test_settings_json(language: &str) -> String {
         format!(
             r#"{{
@@ -4057,6 +4121,22 @@ mod tests {
         assert!(!settings.show_weekly_window);
         assert_eq!(settings.alert_threshold_percent, 0);
         assert_eq!(settings.notified_quota_windows.len(), 1);
+    }
+
+    #[test]
+    fn unavailable_claude_cli_is_disabled_without_disabling_codex() {
+        let settings = SettingsFile {
+            show_claude_code: true,
+            show_codex: false,
+            show_antigravity: false,
+            ..SettingsFile::default()
+        };
+
+        let (settings, changed) = apply_claude_code_availability(settings, false);
+
+        assert!(changed);
+        assert!(!settings.show_claude_code);
+        assert!(settings.show_codex);
     }
 
     #[test]

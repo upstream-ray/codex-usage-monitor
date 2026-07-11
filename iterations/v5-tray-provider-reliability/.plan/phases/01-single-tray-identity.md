@@ -26,3 +26,4 @@
 - 自测：`cargo fmt --check`、`cargo test`、`cargo clippy --all-targets`、`cargo build --release`、`git diff --check` 均成功；Clippy 保持 9 条既有风格警告，无新增警告。
 - 用户验收：2026-07-11 确认第一阶段通过。
 - 建议提交信息：`feat: unify the system tray identity`。
+- Commit：`8633086`。
