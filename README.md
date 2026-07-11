@@ -108,13 +108,15 @@ If multiple providers are enabled, the app shows one tray icon per provider. If 
 
 The Claude Code tray icon uses the same warm usage colors as the Claude bar. The Codex tray icon uses a black and white badge style. The Antigravity tray icon uses a blue badge style.
 
-Hovering over a tray icon shows the usage values and exact UTC reset time for that model. If the 5-hour row is hidden, the tray badge switches to the weekly percentage.
+Hovering over a tray icon shows the usage values and exact local reset time for that model. If the 5-hour row is hidden, the tray badge switches to the weekly percentage.
 
 ### Usage Display And Alerts
 
 Use the right-click **Usage display** menu to show both quota rows or only one. The app always keeps at least one row visible.
 
 Use **Quota alerts** to choose a remaining-quota threshold of 10%, 20%, or 30%. Alerts are off by default. Each provider and quota window is notified only once until its reset time changes, including across app restarts.
+
+In Simplified Chinese, the compact taskbar rows use `5h` / `7d`, one continuous progress bar, remaining percentage, and a concrete local reset value such as `18:30重置` or `07/17重置`.
 
 ## Diagnostics
 

@@ -12,6 +12,7 @@ use std::os::windows::process::CommandExt;
 use crate::diagnose;
 use crate::localization::Strings;
 use crate::models::{AppUsageData, UsageData, UsageSection};
+use crate::native_interop;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -35,6 +36,12 @@ pub enum PollError {
     RateLimited,
     ServerError,
     RequestFailed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsageWindowKind {
+    Session,
+    Weekly,
 }
 
 impl PollError {
@@ -1549,9 +1556,10 @@ pub fn format_line(
     section: &UsageSection,
     strings: Strings,
     show_remaining_in_chinese: bool,
+    window: UsageWindowKind,
 ) -> String {
     if show_remaining_in_chinese {
-        return format_simplified_chinese_line(section, strings);
+        return format_simplified_chinese_line(section, window);
     }
 
     let pct = format!("{:.0}%", section.percentage);
@@ -1563,19 +1571,35 @@ pub fn format_line(
     }
 }
 
-fn format_simplified_chinese_line(section: &UsageSection, strings: Strings) -> String {
+fn format_simplified_chinese_line(section: &UsageSection, window: UsageWindowKind) -> String {
     let remaining = remaining_percentage(section.percentage);
-    let cd = format_countdown(section.resets_at, strings);
-    format_simplified_chinese_values(remaining, &cd, strings.now)
+    let reset = section
+        .resets_at
+        .and_then(native_interop::system_time_to_local);
+    format_simplified_chinese_values(remaining, reset, window)
 }
 
-fn format_simplified_chinese_values(remaining: f64, countdown: &str, now_label: &str) -> String {
-    if countdown.is_empty() {
-        format!("剩余{remaining:.0}%")
-    } else if countdown == now_label {
-        format!("剩余{remaining:.0}% 现在重置")
-    } else {
-        format!("剩余{remaining:.0}% {countdown}后重置")
+fn format_simplified_chinese_values(
+    remaining: f64,
+    reset: Option<windows::Win32::Foundation::SYSTEMTIME>,
+    window: UsageWindowKind,
+) -> String {
+    let Some(reset) = reset else {
+        return format!("剩余{remaining:.0}%");
+    };
+    match window {
+        UsageWindowKind::Session => {
+            format!(
+                "剩余{remaining:.0}%  {:02}:{:02}重置",
+                reset.wHour, reset.wMinute
+            )
+        }
+        UsageWindowKind::Weekly => {
+            format!(
+                "剩余{remaining:.0}%  {:02}/{:02}重置",
+                reset.wMonth, reset.wDay
+            )
+        }
     }
 }
 
@@ -1688,25 +1712,34 @@ mod tests {
 
     #[test]
     fn simplified_chinese_line_labels_remaining_usage() {
+        let strings = crate::localization::LanguageId::SimplifiedChinese.strings();
+        assert_eq!(strings.session_window, "5h");
+        assert_eq!(strings.weekly_window, "7d");
         let section = UsageSection {
             percentage: 30.0,
             resets_at: None,
         };
         assert_eq!(
-            format_line(
-                &section,
-                crate::localization::LanguageId::SimplifiedChinese.strings(),
-                true,
-            ),
+            format_line(&section, strings, true, UsageWindowKind::Session),
             "剩余70%"
         );
+        let session_reset = windows::Win32::Foundation::SYSTEMTIME {
+            wHour: 18,
+            wMinute: 30,
+            ..Default::default()
+        };
         assert_eq!(
-            format_simplified_chinese_values(70.0, "2小时", "现在"),
-            "剩余70% 2小时后重置"
+            format_simplified_chinese_values(82.0, Some(session_reset), UsageWindowKind::Session,),
+            "剩余82%  18:30重置"
         );
+        let weekly_reset = windows::Win32::Foundation::SYSTEMTIME {
+            wMonth: 7,
+            wDay: 17,
+            ..Default::default()
+        };
         assert_eq!(
-            format_simplified_chinese_values(95.0, "6天", "现在"),
-            "剩余95% 6天后重置"
+            format_simplified_chinese_values(97.0, Some(weekly_reset), UsageWindowKind::Weekly,),
+            "剩余97%  07/17重置"
         );
     }
 

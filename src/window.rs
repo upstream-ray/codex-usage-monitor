@@ -473,30 +473,15 @@ fn save_state_settings() {
 }
 
 fn format_precise_reset_time(resets_at: Option<SystemTime>) -> Option<String> {
-    let seconds = resets_at?.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
-    let days = seconds.div_euclid(86_400);
-    let seconds_of_day = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_date_from_days(days);
-    let hour = seconds_of_day / 3_600;
-    let minute = (seconds_of_day % 3_600) / 60;
-    Some(format!(
-        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC"
-    ))
+    let local = native_interop::system_time_to_local(resets_at?)?;
+    Some(format_local_system_time(local))
 }
 
-fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
-    let z = days_since_epoch + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    year += (month <= 2) as i64;
-    (year, month, day)
+fn format_local_system_time(local: SYSTEMTIME) -> String {
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute
+    )
 }
 
 fn usage_tooltip(
@@ -988,29 +973,58 @@ fn refresh_usage_texts(state: &mut AppState) {
     };
 
     if let Some(claude_code) = data.claude_code.as_ref() {
-        state.session_text = poller::format_line(&claude_code.session, strings, show_remaining);
-        state.weekly_text = poller::format_line(&claude_code.weekly, strings, show_remaining);
+        state.session_text = poller::format_line(
+            &claude_code.session,
+            strings,
+            show_remaining,
+            poller::UsageWindowKind::Session,
+        );
+        state.weekly_text = poller::format_line(
+            &claude_code.weekly,
+            strings,
+            show_remaining,
+            poller::UsageWindowKind::Weekly,
+        );
     } else if state.show_claude_code {
         state.session_text = "!".to_string();
         state.weekly_text = "!".to_string();
     }
 
     if let Some(codex) = data.codex.as_ref() {
-        state.codex_session_text = poller::format_line(&codex.session, strings, show_remaining);
-        state.codex_weekly_text = poller::format_line(&codex.weekly, strings, show_remaining);
+        state.codex_session_text = poller::format_line(
+            &codex.session,
+            strings,
+            show_remaining,
+            poller::UsageWindowKind::Session,
+        );
+        state.codex_weekly_text = poller::format_line(
+            &codex.weekly,
+            strings,
+            show_remaining,
+            poller::UsageWindowKind::Weekly,
+        );
     } else if state.show_codex {
         state.codex_session_text = "!".to_string();
         state.codex_weekly_text = "!".to_string();
     }
 
     if let Some(antigravity) = data.antigravity.as_ref() {
-        state.antigravity_session_text =
-            poller::format_line(&antigravity.session, strings, show_remaining);
+        state.antigravity_session_text = poller::format_line(
+            &antigravity.session,
+            strings,
+            show_remaining,
+            poller::UsageWindowKind::Session,
+        );
         state.antigravity_weekly_text =
             if antigravity.weekly.resets_at.is_none() && antigravity.weekly.percentage == 0.0 {
                 "--".to_string()
             } else {
-                poller::format_line(&antigravity.weekly, strings, show_remaining)
+                poller::format_line(
+                    &antigravity.weekly,
+                    strings,
+                    show_remaining,
+                    poller::UsageWindowKind::Weekly,
+                )
             };
     } else if state.show_antigravity {
         state.antigravity_session_text = "!".to_string();
@@ -1445,7 +1459,6 @@ const SEGMENT_W: i32 = 10;
 const SEGMENT_H: i32 = 13;
 const SEGMENT_GAP: i32 = 1;
 const SEGMENT_COUNT: i32 = 10;
-const CORNER_RADIUS: i32 = 2;
 
 const LEFT_DIVIDER_W: i32 = 3;
 const DIVIDER_RIGHT_MARGIN: i32 = 10;
@@ -1453,8 +1466,8 @@ const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
 const TEXT_WIDTH: i32 = 62;
-const SIMPLIFIED_CHINESE_LABEL_WIDTH: i32 = 35;
-const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 142;
+const SIMPLIFIED_CHINESE_LABEL_WIDTH: i32 = 20;
+const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 126;
 const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
@@ -3925,58 +3938,44 @@ fn draw_usage_bar(
     let seg_w = sc(SEGMENT_W);
     let seg_h = sc(SEGMENT_H);
     let seg_gap = sc(SEGMENT_GAP);
-    let corner_r = sc(CORNER_RADIUS);
+    let bar_width = segment_count * (seg_w + seg_gap) - seg_gap;
+    let corner_r = seg_h / 2;
 
     unsafe {
         let percent_clamped = percent.clamp(0.0, 100.0);
-        let segment_percent = 100.0 / segment_count as f64;
+        let bar_rect = RECT {
+            left: bar_x,
+            top: y,
+            right: bar_x + bar_width,
+            bottom: y + seg_h,
+        };
+        draw_rounded_rect(hdc, &bar_rect, track, corner_r);
 
-        for i in 0..segment_count {
-            let seg_x = bar_x + i * (seg_w + seg_gap);
-            let seg_start = (i as f64) * segment_percent;
-            let seg_end = seg_start + segment_percent;
-
-            let seg_rect = RECT {
-                left: seg_x,
+        let fill_width = (bar_width as f64 * percent_clamped / 100.0).round() as i32;
+        if fill_width > 0 {
+            let fill_rect = RECT {
+                left: bar_x,
                 top: y,
-                right: seg_x + seg_w,
+                right: bar_x + fill_width,
                 bottom: y + seg_h,
             };
-
-            if percent_clamped >= seg_end {
-                draw_rounded_rect(hdc, &seg_rect, accent, corner_r);
-            } else if percent_clamped <= seg_start {
-                draw_rounded_rect(hdc, &seg_rect, track, corner_r);
-            } else {
-                draw_rounded_rect(hdc, &seg_rect, track, corner_r);
-                let fraction = (percent_clamped - seg_start) / segment_percent;
-                let fill_width = (seg_w as f64 * fraction) as i32;
-                if fill_width > 0 {
-                    let fill_rect = RECT {
-                        left: seg_x,
-                        top: y,
-                        right: seg_x + fill_width,
-                        bottom: y + seg_h,
-                    };
-                    let rgn = CreateRoundRectRgn(
-                        seg_rect.left,
-                        seg_rect.top,
-                        seg_rect.right + 1,
-                        seg_rect.bottom + 1,
-                        corner_r * 2,
-                        corner_r * 2,
-                    );
-                    let _ = SelectClipRgn(hdc, rgn);
-                    let brush = CreateSolidBrush(COLORREF(accent.to_colorref()));
-                    FillRect(hdc, &fill_rect, brush);
-                    let _ = DeleteObject(brush);
-                    let _ = SelectClipRgn(hdc, HRGN::default());
-                    let _ = DeleteObject(rgn);
-                }
-            }
+            let rgn = CreateRoundRectRgn(
+                bar_rect.left,
+                bar_rect.top,
+                bar_rect.right + 1,
+                bar_rect.bottom + 1,
+                corner_r * 2,
+                corner_r * 2,
+            );
+            let _ = SelectClipRgn(hdc, rgn);
+            let brush = CreateSolidBrush(COLORREF(accent.to_colorref()));
+            FillRect(hdc, &fill_rect, brush);
+            let _ = DeleteObject(brush);
+            let _ = SelectClipRgn(hdc, HRGN::default());
+            let _ = DeleteObject(rgn);
         }
 
-        let text_x = bar_x + segment_count * (seg_w + seg_gap) - seg_gap + sc(BAR_RIGHT_MARGIN);
+        let text_x = bar_x + bar_width + sc(BAR_RIGHT_MARGIN);
         let mut text_wide: Vec<u16> = text.encode_utf16().collect();
         let mut text_rect = RECT {
             left: text_x,
@@ -4128,11 +4127,16 @@ mod tests {
     }
 
     #[test]
-    fn formats_precise_reset_time_as_utc() {
-        assert_eq!(
-            format_precise_reset_time(Some(UNIX_EPOCH)).as_deref(),
-            Some("1970-01-01 00:00 UTC")
-        );
+    fn formats_precise_local_reset_time() {
+        let local = SYSTEMTIME {
+            wYear: 2026,
+            wMonth: 7,
+            wDay: 17,
+            wHour: 18,
+            wMinute: 30,
+            ..Default::default()
+        };
+        assert_eq!(format_local_system_time(local), "2026-07-17 18:30");
         assert_eq!(format_precise_reset_time(None), None);
     }
 

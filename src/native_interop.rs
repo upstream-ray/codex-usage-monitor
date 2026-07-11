@@ -1,5 +1,8 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{BOOL, FILETIME, HWND, LPARAM, RECT, SYSTEMTIME};
+use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -23,6 +26,26 @@ pub const TIMER_UPDATE_CHECK: usize = 4;
 pub const WM_APP: u32 = 0x8000;
 pub const WM_APP_USAGE_UPDATED: u32 = WM_APP + 1;
 pub const WM_APP_TRAY: u32 = WM_APP + 3;
+
+const WINDOWS_TO_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
+
+pub fn system_time_to_local(value: SystemTime) -> Option<SYSTEMTIME> {
+    let unix_seconds = value.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let file_ticks = unix_seconds
+        .checked_add(WINDOWS_TO_UNIX_EPOCH_SECONDS)?
+        .checked_mul(10_000_000)?;
+    let file_time = FILETIME {
+        dwLowDateTime: file_ticks as u32,
+        dwHighDateTime: (file_ticks >> 32) as u32,
+    };
+    let mut utc = SYSTEMTIME::default();
+    let mut local = SYSTEMTIME::default();
+    unsafe {
+        FileTimeToSystemTime(&file_time, &mut utc).ok()?;
+        SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).ok()?;
+    }
+    Some(local)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct TaskbarWindow {
