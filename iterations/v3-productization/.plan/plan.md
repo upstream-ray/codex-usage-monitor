@@ -31,7 +31,7 @@
 | 03 | product-visuals | 建立新的产品图标和一致视觉身份 | completed |
 | 04 | install-upgrade | 提供可靠的安装、升级与卸载体验 | completed |
 | 05 | reliability | 强化错误处理、更新安全和长期运行稳定性 | completed |
-| 06 | usage-features | 增加额度提醒和更灵活的用量显示能力 | not started |
+| 06 | usage-features | 增加额度提醒和更灵活的用量显示能力 | completed |
 
 ## 关键决策
 
