@@ -8,10 +8,11 @@ ICON_DIR = ROOT / "src" / "icons"
 GITHUB_DIR = ROOT / ".github"
 VERIFY_PATH = ROOT / "target" / "codex-usage-icon-verification.png"
 
-NAVY = "#0B1220"
-CYAN = "#38BDF8"
+NAVY_TOP = (20, 38, 64, 255)
+NAVY_BOTTOM = (7, 15, 28, 255)
+CYAN = "#36C5F0"
+WHITE = "#F8FAFC"
 LIME = "#A3E635"
-PALE = "#E2E8F0"
 
 
 def render_icon(size: int) -> Image.Image:
@@ -23,17 +24,28 @@ def render_icon(size: int) -> Image.Image:
     def px(value: float) -> int:
         return round(value * canvas / 256)
 
-    draw.rounded_rectangle((0, 0, canvas - 1, canvas - 1), radius=px(56), fill=NAVY)
-    arc_box = (px(42), px(42), px(214), px(214))
-    draw.arc(arc_box, 45, 315, fill=CYAN, width=px(26))
-    draw.arc(arc_box, 318, 350, fill=LIME, width=px(26))
+    # A restrained vertical gradient keeps the large icon dimensional while
+    # preserving a solid silhouette when Windows scales it down to 16 px.
+    gradient = Image.new("RGBA", (canvas, canvas))
+    pixels = gradient.load()
+    for y in range(canvas):
+        t = y / max(1, canvas - 1)
+        color = tuple(round(a + (b - a) * t) for a, b in zip(NAVY_TOP, NAVY_BOTTOM))
+        for x in range(canvas):
+            pixels[x, y] = color
+    mask = Image.new("L", (canvas, canvas), 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, canvas - 1, canvas - 1), radius=px(58), fill=255
+    )
+    image.alpha_composite(Image.composite(gradient, Image.new("RGBA", gradient.size), mask))
+    draw = ImageDraw.Draw(image)
 
-    bar_width = px(18)
-    for y, end, color in ((100, 162, PALE), (128, 144, CYAN), (156, 126, LIME)):
-        draw.line((px(100), px(y), px(end), px(y)), fill=color, width=bar_width)
-        radius = bar_width // 2
-        for x in (px(100), px(end)):
-            draw.ellipse((x - radius, px(y) - radius, x + radius, px(y) + radius), fill=color)
+    # The open C-shaped ring is readable at every ICO size and represents a
+    # quota window without looking like a calculator or a battery widget.
+    arc_box = (px(45), px(45), px(211), px(211))
+    draw.arc(arc_box, 42, 318, fill=WHITE, width=px(28))
+    draw.arc(arc_box, 42, 128, fill=CYAN, width=px(28))
+    draw.ellipse((px(190), px(112), px(220), px(142)), fill=LIME)
 
     return image.resize((size, size), Image.Resampling.LANCZOS)
 

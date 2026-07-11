@@ -47,61 +47,15 @@ impl TrayIconKind {
     }
 }
 
-fn lerp_channel(start: u8, end: u8, t: f64) -> u8 {
-    (start as f64 + (end as f64 - start as f64) * t.clamp(0.0, 1.0)).round() as u8
-}
-
-fn lerp_color(start: Color, end: Color, t: f64) -> Color {
-    Color::new(
-        lerp_channel(start.r, end.r, t),
-        lerp_channel(start.g, end.g, t),
-        lerp_channel(start.b, end.b, t),
-    )
-}
-
-fn interpolated_fill(percent: f64) -> Color {
-    if percent <= 50.0 {
-        return Color::from_hex("#D97757");
-    }
-
-    let stops = [
-        (50.0, Color::from_hex("#D97757")),
-        (70.0, Color::from_hex("#D08540")),
-        (85.0, Color::from_hex("#CC8C20")),
-        (95.0, Color::from_hex("#C45020")),
-        (100.0, Color::from_hex("#B82020")),
-    ];
-
-    for pair in stops.windows(2) {
-        let (start_pct, start_color) = pair[0];
-        let (end_pct, end_color) = pair[1];
-        if percent <= end_pct {
-            let span = (end_pct - start_pct).max(f64::EPSILON);
-            let t = (percent - start_pct) / span;
-            return lerp_color(start_color, end_color, t);
-        }
-    }
-
-    stops[stops.len() - 1].1
-}
-
-fn codex_fill(percent: f64) -> Color {
-    if percent >= 90.0 {
-        Color::from_hex("#FFFFFF")
-    } else {
-        Color::from_hex("#111111")
+fn provider_accent(kind: TrayIconKind) -> Color {
+    match kind {
+        TrayIconKind::Claude => Color::from_hex("#E98562"),
+        TrayIconKind::Codex => Color::from_hex("#36C5F0"),
+        TrayIconKind::Antigravity => Color::from_hex("#5B8DEF"),
     }
 }
 
-fn antigravity_fill(percent: f64) -> Color {
-    if percent >= 90.0 {
-        Color::from_hex("#FFFFFF")
-    } else {
-        Color::from_hex("#4285F4")
-    }
-}
-
-/// Create a rounded-rectangle tray icon badge showing the usage percentage.
+/// Create a circular progress-ring tray icon showing the usage percentage.
 /// For Codex, `percent` = None uses the embedded app icon as the loading state.
 /// For Claude and Antigravity, `percent` = None uses a provider placeholder badge.
 pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
@@ -113,33 +67,10 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
     }
 
     let size = 64_i32;
-    let margin = 0_i32;
-    let radius = 2_i32;
-    let outline = if matches!(kind, TrayIconKind::Codex | TrayIconKind::Antigravity) {
-        3_i32
-    } else {
-        0_i32
-    };
-
-    let fill = match kind {
-        TrayIconKind::Claude => interpolated_fill(percent.unwrap_or(0.0)),
-        TrayIconKind::Codex => codex_fill(percent.unwrap_or(0.0)),
-        TrayIconKind::Antigravity => antigravity_fill(percent.unwrap_or(0.0)),
-    };
-    let text_col = match kind {
-        TrayIconKind::Claude => Color::from_hex("#FFFFFF"),
-        TrayIconKind::Codex if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#111111"),
-        TrayIconKind::Codex => Color::from_hex("#FFFFFF"),
-        TrayIconKind::Antigravity if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#1967D2"),
-        TrayIconKind::Antigravity => Color::from_hex("#FFFFFF"),
-    };
-    let outline_col = match kind {
-        TrayIconKind::Claude => fill,
-        TrayIconKind::Codex if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#111111"),
-        TrayIconKind::Codex => Color::from_hex("#FFFFFF"),
-        TrayIconKind::Antigravity if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#1967D2"),
-        TrayIconKind::Antigravity => Color::from_hex("#FFFFFF"),
-    };
+    let accent = provider_accent(kind);
+    let background = Color::from_hex("#0B1220");
+    let track = Color::from_hex("#334155");
+    let text_col = Color::from_hex("#F8FAFC");
 
     let display_text = match percent {
         Some(p) => format!("{}", p.round().clamp(0.0, 999.0) as u32),
@@ -191,41 +122,35 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
             *px = 0;
         }
 
-        // Draw rounded rectangle badge
-        let null_pen = GetStockObject(NULL_PEN);
-        let old_pen = SelectObject(mem_dc, null_pen);
-
-        if outline > 0 {
-            let br_outline = CreateSolidBrush(COLORREF(outline_col.to_colorref()));
-            let old_brush = SelectObject(mem_dc, br_outline);
-            let _ = RoundRect(
-                mem_dc,
-                margin,
-                margin,
-                size - margin + 1,
-                size - margin + 1,
-                (radius + 1) * 2,
-                (radius + 1) * 2,
-            );
-            SelectObject(mem_dc, old_brush);
-            let _ = DeleteObject(br_outline);
+        // Paint a dark circular badge with a provider-coloured progress ring.
+        // Rendering at 64 px gives Windows enough detail for clean 16/20 px scaling.
+        let progress = percent.unwrap_or(100.0).clamp(0.0, 100.0) / 100.0;
+        let center = (size as f64 - 1.0) / 2.0;
+        for y in 0..size {
+            for x in 0..size {
+                let dx = x as f64 - center;
+                let dy = y as f64 - center;
+                let distance = (dx * dx + dy * dy).sqrt();
+                let color = if distance <= 31.0 {
+                    if (24.0..=30.0).contains(&distance) {
+                        let mut angle = dx.atan2(-dy);
+                        if angle < 0.0 {
+                            angle += std::f64::consts::TAU;
+                        }
+                        if angle <= progress * std::f64::consts::TAU {
+                            accent
+                        } else {
+                            track
+                        }
+                    } else {
+                        background
+                    }
+                } else {
+                    continue;
+                };
+                pixel_data[(y * size + x) as usize] = 0xFF00_0000 | color.to_colorref();
+            }
         }
-
-        let br_fill = CreateSolidBrush(COLORREF(fill.to_colorref()));
-        let old_brush = SelectObject(mem_dc, br_fill);
-        let _ = RoundRect(
-            mem_dc,
-            margin + outline,
-            margin + outline,
-            size - margin - outline + 1,
-            size - margin - outline + 1,
-            (radius - 1) * 2,
-            (radius - 1) * 2,
-        );
-
-        SelectObject(mem_dc, old_brush);
-        SelectObject(mem_dc, old_pen);
-        let _ = DeleteObject(br_fill);
 
         // Draw centered percentage text
         let font_name = native_interop::wide_str("Arial Bold");
@@ -250,10 +175,10 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
         let _ = SetTextColor(mem_dc, COLORREF(text_col.to_colorref()));
 
         let mut text_rect = RECT {
-            left: margin,
-            top: margin,
-            right: size - margin,
-            bottom: size - margin,
+            left: 0,
+            top: 0,
+            right: size,
+            bottom: size,
         };
         let mut text_wide: Vec<u16> = display_text.encode_utf16().collect();
         let _ = DrawTextW(

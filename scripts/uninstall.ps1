@@ -11,6 +11,7 @@ $InstallDirectory = Join-Path $env:LOCALAPPDATA 'Programs\CodexUsage'
 $ExpectedInstallDirectory = [IO.Path]::GetFullPath($InstallDirectory).TrimEnd('\')
 $TargetPath = Join-Path $ExpectedInstallDirectory 'codex-usage.exe'
 $ShortcutPath = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Codex Usage.lnk'
+$DesktopShortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Codex Usage.lnk'
 $UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexUsage'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $SettingsDirectory = Join-Path $env:APPDATA 'CodexUsage'
@@ -30,6 +31,7 @@ if (Test-Path -LiteralPath $RunKey) {
 }
 
 Remove-Item -LiteralPath $ShortcutPath -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $DesktopShortcutPath -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $UninstallKey -Recurse -Force -ErrorAction SilentlyContinue
 
 if ($RemoveSettings) {

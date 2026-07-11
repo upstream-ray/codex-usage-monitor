@@ -16,6 +16,7 @@ $InstallDirectory = Join-Path $env:LOCALAPPDATA 'Programs\CodexUsage'
 $TargetPath = Join-Path $InstallDirectory 'codex-usage.exe'
 $InstalledUninstaller = Join-Path $InstallDirectory 'uninstall.ps1'
 $ShortcutPath = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Codex Usage.lnk'
+$DesktopShortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Codex Usage.lnk'
 $UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexUsage'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $TempDirectory = Join-Path ([IO.Path]::GetTempPath()) ('codex-usage-install-' + [Guid]::NewGuid().ToString('N'))
@@ -152,15 +153,24 @@ try {
             Set-ItemProperty -Path $RunKey -Name 'CodexUsage' -Value $TargetPath
         }
 
-        $ShortcutDirectory = Split-Path -Parent $ShortcutPath
-        New-Item -ItemType Directory -Force -Path $ShortcutDirectory | Out-Null
         $Shell = New-Object -ComObject WScript.Shell
-        $Shortcut = $Shell.CreateShortcut($ShortcutPath)
-        $Shortcut.TargetPath = $TargetPath
-        $Shortcut.WorkingDirectory = $InstallDirectory
-        $Shortcut.IconLocation = "$TargetPath,0"
-        $Shortcut.Description = 'Codex Usage'
-        $Shortcut.Save()
+        foreach ($LinkPath in @($ShortcutPath, $DesktopShortcutPath)) {
+            $ShortcutDirectory = Split-Path -Parent $LinkPath
+            New-Item -ItemType Directory -Force -Path $ShortcutDirectory | Out-Null
+            $Shortcut = $Shell.CreateShortcut($LinkPath)
+            $Shortcut.TargetPath = $TargetPath
+            $Shortcut.WorkingDirectory = $InstallDirectory
+            $Shortcut.IconLocation = "$TargetPath,0"
+            $Shortcut.Description = 'Codex Usage'
+            $Shortcut.Save()
+        }
+
+        # Ask Explorer to refresh shortcut icons after an in-place EXE upgrade.
+        # This avoids a stale cached icon while preserving the standard arrow overlay.
+        $IconRefreshTool = Join-Path $env:SystemRoot 'System32\ie4uinit.exe'
+        if (Test-Path -LiteralPath $IconRefreshTool -PathType Leaf) {
+            Start-Process -FilePath $IconRefreshTool -ArgumentList '-show' -WindowStyle Hidden -Wait
+        }
     }
     catch {
         if ($HadPreviousVersion -and (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
