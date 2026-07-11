@@ -15,6 +15,7 @@
 - 在单个托盘提示中汇总已启用服务的信息
 - 将简体中文“显示模型”改为“监控服务”，同步中英文说明
 - 后续识别 Claude Code CLI 的真实可用状态，避免把 Claude Desktop 登录误认为 Claude Code 可监控
+- 将已验收实现正式发布为 `v1.9.0`，校验线上资产并完成本机升级
 
 **不做：**
 
@@ -28,6 +29,7 @@
 |---|---|---|---|
 | 01 | single-tray-identity | 使用单个应用图标并澄清“监控服务”概念 | completed |
 | 02 | claude-cli-availability | 仅在 Claude Code CLI 凭据真实可用时提供监控并给出明确状态 | completed |
+| 03 | v1.9.0-release | 将已验收功能作为正式版本发布并完成交付清理 | in progress |
 
 ## 关键决策
 
@@ -35,6 +37,7 @@
 - **2026-07-11**：Codex、Claude Code、Antigravity 是可并列监控的服务，不使用互斥单选。
 - **2026-07-11**：Claude Desktop 与 Claude Code CLI 登录相互独立；不尝试读取 Claude Desktop 凭据。
 - **2026-07-11**：按用户确认先完成并验收 Phase 01，再实施 Phase 02。
+- **2026-07-11**：托盘身份与认证边界属于用户可见行为升级，使用次版本号 `v1.9.0` 发布。
 
 ## Open Questions
 
