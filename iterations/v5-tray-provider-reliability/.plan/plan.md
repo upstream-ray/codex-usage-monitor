@@ -29,7 +29,7 @@
 |---|---|---|---|
 | 01 | single-tray-identity | 使用单个应用图标并澄清“监控服务”概念 | completed |
 | 02 | claude-cli-availability | 仅在 Claude Code CLI 凭据真实可用时提供监控并给出明确状态 | completed |
-| 03 | v1.9.0-release | 将已验收功能作为正式版本发布并完成交付清理 | in progress |
+| 03 | v1.9.0-release | 将已验收功能作为正式版本发布并完成交付清理 | completed |
 
 ## 关键决策
 
