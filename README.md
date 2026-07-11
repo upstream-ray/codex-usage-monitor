@@ -46,13 +46,31 @@ If you use Claude Code through WSL, that is supported too. The monitor can read 
 
 ## Install
 
-Download `codex-usage.exe` from the [latest release](https://github.com/upstream-ray/codex-usage-monitor/releases/latest), or build it locally:
+For a per-user installation, download `install.ps1` from the [latest release](https://github.com/upstream-ray/codex-usage-monitor/releases/latest), then run:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+The installer verifies the release SHA256 and installs to `%LOCALAPPDATA%\Programs\CodexUsage` without administrator access. It adds a Start menu shortcut and an entry in Windows Installed Apps.
+
+For portable use, download `codex-usage.exe` from the same release and run it from any user-writable directory. You can also build it locally:
 
 ```powershell
 cargo build --release
 ```
 
 Local builds create the executable at `target\release\codex-usage.exe`.
+
+## Uninstall
+
+Uninstall **Codex Usage** from Windows Settings > Apps > Installed apps, or run:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\CodexUsage\uninstall.ps1"
+```
+
+Uninstalling preserves `%APPDATA%\CodexUsage\settings.json`. Add `-RemoveSettings` to delete settings explicitly. See [Installation model](docs/installation.md) for upgrade, portable, startup, and WinGet behavior.
 
 ## Use
 

@@ -24,8 +24,23 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+      - name: Prepare release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/codex-usage.exe dist/codex-usage.exe
+          Copy-Item scripts/install.ps1 dist/install.ps1
+          Copy-Item scripts/uninstall.ps1 dist/uninstall.ps1
+
+          $hash = (Get-FileHash -Algorithm SHA256 dist/codex-usage.exe).Hash.ToLowerInvariant()
+          "$hash  codex-usage.exe" | Set-Content -Encoding ascii dist/codex-usage.exe.sha256
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/codex-usage.exe
+          files: |
+            dist/codex-usage.exe
+            dist/codex-usage.exe.sha256
+            dist/install.ps1
+            dist/uninstall.ps1
           generate_release_notes: true
