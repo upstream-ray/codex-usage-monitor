@@ -17,7 +17,7 @@
 - [x] 重绘动态系统托盘图标（`src/tray_icon.rs:50-151`；圆形进度环、深色底和提供商强调色）
 - [x] 增加桌面快捷方式安装与卸载逻辑（`scripts/install.ps1:19,157-173`; `scripts/uninstall.ps1:14,34`）
 - [x] 增加快捷方式脚本验证并执行实际安装验收（桌面与开始菜单均指向 `%LOCALAPPDATA%\Programs\CodexUsage\codex-usage.exe,0`；已清理两个指向工作区 build 的旧快捷方式）
-- [x] 构建、截图并提交 Phase 01（`cargo test`: 20 passed；`cargo build --release`；`target/v4-desktop-shortcut.png`）
+- [x] 构建、截图并提交 Phase 01（`cargo test`: 20 passed；`cargo build --release`；`target/v4-desktop-shortcut.png`；commit `1129e30`）
 
 ## Notes
 
