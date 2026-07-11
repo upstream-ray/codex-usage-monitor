@@ -1,10 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
-  <rect x="1" y="1" width="30" height="30" rx="4" stroke="#D97757" stroke-width="2"></rect>
-  <rect x="3" y="4" width="8" height="11" rx="2" fill="#D97757"></rect>
-  <rect x="12" y="4" width="8" height="11" rx="2" fill="#D97757"></rect>
-  <rect x="21" y="4" width="8" height="11" rx="2" fill="#F3D6CC"></rect>
-  <path d="M 23 4 L 25 4 L 25 15 L 23 15 C 21.895 15 21 14.18 21 13.167 L 21 5.833 C 21 4.82 21.895 4 23 4 Z" fill="#D97757"></path>
-  <rect x="3" y="17" width="8" height="11" rx="2" fill="#D97757"></rect>
-  <rect x="12" y="17" width="8" height="11" rx="2" fill="#D97757"></rect>
-  <rect x="21" y="17" width="8" height="11" rx="2" fill="#F3D6CC"></rect>
+  <rect width="32" height="32" rx="7" fill="#0B1220"/>
+  <path d="M23.5 8.2A10.8 10.8 0 1 0 23.5 23.8" stroke="#38BDF8" stroke-width="3.5" stroke-linecap="round"/>
+  <path d="M23.5 8.2A10.8 10.8 0 0 1 26.5 13.5" stroke="#A3E635" stroke-width="3.5" stroke-linecap="round"/>
+  <path d="M12.8 12.2h8.4M12.8 16h6M12.8 19.8h3.6" stroke="#E2E8F0" stroke-width="2.4" stroke-linecap="round"/>
 </svg>

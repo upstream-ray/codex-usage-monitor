@@ -102,10 +102,10 @@ fn antigravity_fill(percent: f64) -> Color {
 }
 
 /// Create a rounded-rectangle tray icon badge showing the usage percentage.
-/// For Claude, `percent` = None uses the embedded app icon as the loading state.
-/// For Codex and Antigravity, `percent` = None uses a provider placeholder badge.
+/// For Codex, `percent` = None uses the embedded app icon as the loading state.
+/// For Claude and Antigravity, `percent` = None uses a provider placeholder badge.
 pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
-    if matches!(kind, TrayIconKind::Claude) && percent.is_none() {
+    if matches!(kind, TrayIconKind::Codex) && percent.is_none() {
         let app_icon = load_embedded_app_icon();
         if !app_icon.is_invalid() {
             return app_icon;
@@ -144,8 +144,8 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
     let display_text = match percent {
         Some(p) => format!("{}", p.round().clamp(0.0, 999.0) as u32),
         None => match kind {
-            TrayIconKind::Claude => String::new(),
-            TrayIconKind::Codex => "C".to_string(),
+            TrayIconKind::Claude => "C".to_string(),
+            TrayIconKind::Codex => String::new(),
             TrayIconKind::Antigravity => "A".to_string(),
         },
     };

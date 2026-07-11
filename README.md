@@ -3,6 +3,8 @@
 
 # Codex Usage
 
+<img src=".github/codex-usage-icon.png" alt="Codex Usage icon" width="96" height="96">
+
 ![Screenshot](.github/animation.gif)
 
 A lightweight native Windows taskbar widget for monitoring Codex usage, with optional Claude Code and Google Antigravity usage display.

@@ -28,7 +28,7 @@
 |---|---|---|---|
 | 01 | baseline-review | 审查、验证并提交当前定制基线 | completed |
 | 02 | public-release | 建立合规的公开仓库与独立发布渠道 | completed |
-| 03 | product-visuals | 建立新的产品图标和一致视觉身份 | not started |
+| 03 | product-visuals | 建立新的产品图标和一致视觉身份 | in progress |
 | 04 | install-upgrade | 提供可靠的安装、升级与卸载体验 | not started |
 | 05 | reliability | 强化错误处理、更新安全和长期运行稳定性 | not started |
 | 06 | usage-features | 增加额度提醒和更灵活的用量显示能力 | not started |
@@ -45,4 +45,4 @@
 
 - [x] GitHub 账户或组织归属、仓库最终 URL — `https://github.com/upstream-ray/codex-usage-monitor`
 - [ ] 正式 WinGet 包首次提交时机 — 预期在 phase 04 根据安装包与 Release 稳定性决定
-- [ ] 新图标最终方案 — 预期在 phase 03 由候选图标实际渲染后确认
+- [x] 新图标最终方案 — 采用 A“C 形额度环 + 三条剩余量刻度”，青蓝/青柠/深海军蓝配色
