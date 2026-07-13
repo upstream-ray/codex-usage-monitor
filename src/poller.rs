@@ -105,7 +105,10 @@ struct CodexRateLimitDetails {
 struct CodexRateLimitWindow {
     used_percent: f64,
     reset_at: i64,
+    limit_window_seconds: Option<u64>,
 }
+
+const CODEX_SESSION_WINDOW_MAX_SECONDS: u64 = 24 * 60 * 60;
 
 #[derive(Deserialize)]
 struct AntigravityAuthFile {
@@ -896,16 +899,56 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
 fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> {
     let details = *response.rate_limit.flatten()?;
     let mut data = UsageData::default();
+    let mut has_session = false;
+    let mut has_weekly = false;
 
-    if let Some(window) = details.primary_window.flatten() {
-        data.session = codex_section_from_window(&window);
+    let primary = details.primary_window.flatten();
+    let secondary = details.secondary_window.flatten();
+
+    for window in [primary.as_deref(), secondary.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        match codex_window_kind(window) {
+            Some(UsageWindowKind::Session) if !has_session => {
+                data.session = codex_section_from_window(window);
+                has_session = true;
+            }
+            Some(UsageWindowKind::Weekly) if !has_weekly => {
+                data.weekly = codex_section_from_window(window);
+                has_weekly = true;
+            }
+            _ => {}
+        }
     }
 
-    if let Some(window) = details.secondary_window.flatten() {
-        data.weekly = codex_section_from_window(&window);
+    // Older responses did not include a window duration. Preserve their
+    // positional meaning while avoiding overwriting a duration-classified
+    // window from the newer response shape.
+    if let Some(window) = primary
+        .as_deref()
+        .filter(|window| window.limit_window_seconds.is_none() && !has_session)
+    {
+        data.session = codex_section_from_window(window);
+    }
+    if let Some(window) = secondary
+        .as_deref()
+        .filter(|window| window.limit_window_seconds.is_none() && !has_weekly)
+    {
+        data.weekly = codex_section_from_window(window);
     }
 
     Some(data)
+}
+
+fn codex_window_kind(window: &CodexRateLimitWindow) -> Option<UsageWindowKind> {
+    window.limit_window_seconds.map(|seconds| {
+        if seconds <= CODEX_SESSION_WINDOW_MAX_SECONDS {
+            UsageWindowKind::Session
+        } else {
+            UsageWindowKind::Weekly
+        }
+    })
 }
 
 fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
@@ -1724,6 +1767,54 @@ mod tests {
         assert_eq!(remaining_percentage(30.0), 70.0);
         assert_eq!(remaining_percentage(-5.0), 100.0);
         assert_eq!(remaining_percentage(120.0), 0.0);
+    }
+
+    #[test]
+    fn codex_weekly_only_window_is_not_misreported_as_session_usage() {
+        let response: CodexUsageResponse = serde_json::from_str(
+            r#"{
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 21,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 1784500338
+                    },
+                    "secondary_window": null
+                }
+            }"#,
+        )
+        .expect("weekly-only response should deserialize");
+
+        let usage = codex_usage_from_response(response).expect("rate limit should be available");
+
+        assert_eq!(usage.session.percentage, 0.0);
+        assert!(usage.session.resets_at.is_none());
+        assert_eq!(usage.weekly.percentage, 21.0);
+        assert!(usage.weekly.resets_at.is_some());
+    }
+
+    #[test]
+    fn codex_legacy_windows_keep_positional_mapping_without_durations() {
+        let response: CodexUsageResponse = serde_json::from_str(
+            r#"{
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 18,
+                        "reset_at": 1784500338
+                    },
+                    "secondary_window": {
+                        "used_percent": 33,
+                        "reset_at": 1785000000
+                    }
+                }
+            }"#,
+        )
+        .expect("legacy response should deserialize");
+
+        let usage = codex_usage_from_response(response).expect("rate limit should be available");
+
+        assert_eq!(usage.session.percentage, 18.0);
+        assert_eq!(usage.weekly.percentage, 33.0);
     }
 
     #[test]
