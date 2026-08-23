@@ -11,13 +11,13 @@
 
 A lightweight native Windows taskbar widget for monitoring Codex usage, with optional Claude Code and Google Antigravity usage display.
 
-It sits in your taskbar and shows how much of your Codex usage window remains without opening the Codex app or account usage page.
+It sits in your taskbar and shows either used or remaining Codex quota without opening the Codex app or account usage page.
 
 ## What You Get
 
 - A **5h** bar for your current Codex usage window
 - A **7d** bar for your current weekly window
-- Simplified Chinese display with explicit remaining usage and reset countdowns
+- Switchable **Used** or **Remaining** percentages and progress bars
 - Optional Claude Code usage alongside Codex
 - Optional Antigravity model usage bars for Google's 5-hour and weekly Gemini quota windows
 - A live countdown until each limit resets
@@ -26,7 +26,7 @@ It sits in your taskbar and shows how much of your Codex usage window remains wi
 - A small native widget that lives directly in the Windows taskbar
 - One system tray icon that matches the desktop app icon
 - Left-click the tray icon to toggle the taskbar widget on or off
-- Right-click options for refresh, monitored services, usage rows, quota alerts, update frequency, language, startup, widget visibility, and updates
+- Right-click options for refresh, monitored services, quota display, usage rows, quota alerts, update frequency, language, startup, widget visibility, and updates
 - Multi-monitor taskbar placement, so the widget can live on the taskbar for the screen you prefer
 
 ## Who This Is For
@@ -88,7 +88,7 @@ Once running, it will appear in your taskbar and as one tray icon in the notific
 
 - Drag the left divider to move the taskbar widget
 - On multi-monitor setups, drag the widget onto another Windows taskbar to move it to that screen
-- Right-click the taskbar widget or tray icon for refresh, monitored services, usage rows, quota alerts, update frequency, Start with Windows, reset position, language, updates, and exit
+- Right-click the taskbar widget or tray icon for refresh, monitored services, quota display, usage rows, quota alerts, update frequency, Start with Windows, reset position, language, updates, and exit
 - Left-click the tray icon to toggle the taskbar widget on or off
 - Enable `Start with Windows` from the right-click menu if you want it to launch automatically when you sign in
 
@@ -114,9 +114,11 @@ Hovering over the tray icon shows a compact summary for all enabled services. Le
 
 Use the right-click **Usage display** menu to show both quota rows or only one. The app always keeps at least one row visible.
 
+Use **Quota display** to choose whether percentages and progress bars represent quota **Used** or **Remaining**. **Used** is the default, and the preference is saved across restarts.
+
 Use **Quota alerts** to choose a remaining-quota threshold of 10%, 20%, or 30%. Alerts are off by default. Each provider and quota window is notified only once until its reset time changes, including across app restarts.
 
-In Simplified Chinese, the compact taskbar rows use `5h` / `7d`, one continuous progress bar, remaining percentage, and a concrete local reset value such as `18:30重置` or `07/17重置`.
+In Simplified Chinese, the compact taskbar rows use localized used/remaining labels and a concrete local reset value such as `18:30重置` or `07/17重置`.
 
 ## Diagnostics
 
@@ -179,7 +181,7 @@ What the app stores locally:
 - Polling frequency
 - Language preference
 - Last update check time
-- Visible quota rows and low-quota alert threshold
+- Quota display mode, visible quota rows, and low-quota alert threshold
 - Quota-window notification keys used to prevent duplicate alerts
 - Displayed model preferences
 
