@@ -1612,15 +1612,17 @@ fn is_leap(y: u64) -> bool {
 /// Format a usage section for the compact taskbar display.
 pub fn format_line(
     section: &UsageSection,
+    display_percentage: f64,
     strings: Strings,
-    show_remaining_in_chinese: bool,
+    percentage_label: Option<&str>,
     window: UsageWindowKind,
 ) -> String {
-    if show_remaining_in_chinese {
-        return format_simplified_chinese_line(section, window);
+    let display_percentage = display_percentage.clamp(0.0, 100.0);
+    if let Some(label) = percentage_label {
+        return format_simplified_chinese_line(section, display_percentage, label, window);
     }
 
-    let pct = format!("{:.0}%", section.percentage);
+    let pct = format!("{display_percentage:.0}%");
     let cd = format_countdown(section.resets_at, strings);
     if cd.is_empty() {
         pct
@@ -1629,32 +1631,37 @@ pub fn format_line(
     }
 }
 
-fn format_simplified_chinese_line(section: &UsageSection, window: UsageWindowKind) -> String {
-    let remaining = remaining_percentage(section.percentage);
+fn format_simplified_chinese_line(
+    section: &UsageSection,
+    display_percentage: f64,
+    percentage_label: &str,
+    window: UsageWindowKind,
+) -> String {
     let reset = section
         .resets_at
         .and_then(native_interop::system_time_to_local);
-    format_simplified_chinese_values(remaining, reset, window)
+    format_simplified_chinese_values(display_percentage, percentage_label, reset, window)
 }
 
 fn format_simplified_chinese_values(
-    remaining: f64,
+    display_percentage: f64,
+    percentage_label: &str,
     reset: Option<windows::Win32::Foundation::SYSTEMTIME>,
     window: UsageWindowKind,
 ) -> String {
     let Some(reset) = reset else {
-        return format!("剩余{remaining:.0}%");
+        return format!("{percentage_label}{display_percentage:.0}%");
     };
     match window {
         UsageWindowKind::Session => {
             format!(
-                "剩余{remaining:.0}%  {:02}:{:02}重置",
+                "{percentage_label}{display_percentage:.0}%  {:02}:{:02}重置",
                 reset.wHour, reset.wMinute
             )
         }
         UsageWindowKind::Weekly => {
             format!(
-                "剩余{remaining:.0}%  {:02}/{:02}重置",
+                "{percentage_label}{display_percentage:.0}%  {:02}/{:02}重置",
                 reset.wMonth, reset.wDay
             )
         }
@@ -1770,6 +1777,25 @@ mod tests {
     }
 
     #[test]
+    fn format_line_uses_the_presentation_percentage() {
+        let section = UsageSection {
+            percentage: 43.0,
+            resets_at: None,
+        };
+        assert_eq!(
+            format_line(
+                &section,
+                57.0,
+                crate::localization::LanguageId::English.strings(),
+                None,
+                UsageWindowKind::Session,
+            ),
+            "57%"
+        );
+        assert_eq!(section.percentage, 43.0);
+    }
+
+    #[test]
     fn codex_weekly_only_window_is_not_misreported_as_session_usage() {
         let response: CodexUsageResponse = serde_json::from_str(
             r#"{
@@ -1841,7 +1867,13 @@ mod tests {
             resets_at: None,
         };
         assert_eq!(
-            format_line(&section, strings, true, UsageWindowKind::Session),
+            format_line(
+                &section,
+                remaining_percentage(section.percentage),
+                strings,
+                Some("剩余"),
+                UsageWindowKind::Session,
+            ),
             "剩余70%"
         );
         let session_reset = windows::Win32::Foundation::SYSTEMTIME {
@@ -1850,7 +1882,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            format_simplified_chinese_values(82.0, Some(session_reset), UsageWindowKind::Session,),
+            format_simplified_chinese_values(
+                82.0,
+                "剩余",
+                Some(session_reset),
+                UsageWindowKind::Session,
+            ),
             "剩余82%  18:30重置"
         );
         let weekly_reset = windows::Win32::Foundation::SYSTEMTIME {
@@ -1859,8 +1896,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            format_simplified_chinese_values(97.0, Some(weekly_reset), UsageWindowKind::Weekly,),
+            format_simplified_chinese_values(
+                97.0,
+                "剩余",
+                Some(weekly_reset),
+                UsageWindowKind::Weekly,
+            ),
             "剩余97%  07/17重置"
+        );
+        assert_eq!(
+            format_simplified_chinese_values(
+                30.0,
+                "已用",
+                Some(session_reset),
+                UsageWindowKind::Session,
+            ),
+            "已用30%  18:30重置"
         );
     }
 

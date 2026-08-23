@@ -74,6 +74,7 @@ struct AppState {
     show_antigravity: bool,
     show_session_window: bool,
     show_weekly_window: bool,
+    quota_display_mode: QuotaDisplayMode,
     alert_threshold_percent: u8,
     notified_quota_windows: BTreeSet<String>,
 
@@ -144,6 +145,8 @@ const IDM_ALERT_OFF: u16 = 80;
 const IDM_ALERT_10: u16 = 81;
 const IDM_ALERT_20: u16 = 82;
 const IDM_ALERT_30: u16 = 83;
+const IDM_QUOTA_DISPLAY_USED: u16 = 90;
+const IDM_QUOTA_DISPLAY_REMAINING: u16 = 91;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
@@ -318,6 +321,14 @@ fn legacy_settings_path() -> PathBuf {
     appdata_path(LEGACY_SETTINGS_DIR)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum QuotaDisplayMode {
+    #[default]
+    Used,
+    Remaining,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct SettingsFile {
     #[serde(default)]
@@ -343,6 +354,8 @@ struct SettingsFile {
     #[serde(default = "default_show_usage_window")]
     show_weekly_window: bool,
     #[serde(default)]
+    quota_display_mode: QuotaDisplayMode,
+    #[serde(default)]
     alert_threshold_percent: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     notified_quota_windows: Vec<String>,
@@ -362,6 +375,7 @@ impl Default for SettingsFile {
             show_antigravity: false,
             show_session_window: true,
             show_weekly_window: true,
+            quota_display_mode: QuotaDisplayMode::Used,
             alert_threshold_percent: 0,
             notified_quota_windows: Vec::new(),
         }
@@ -488,6 +502,7 @@ fn save_state_settings() {
             show_antigravity: s.show_antigravity,
             show_session_window: s.show_session_window,
             show_weekly_window: s.show_weekly_window,
+            quota_display_mode: s.quota_display_mode,
             alert_threshold_percent: s.alert_threshold_percent,
             notified_quota_windows: s.notified_quota_windows.iter().cloned().collect(),
         });
@@ -918,7 +933,14 @@ fn refresh_usage_texts(state: &mut AppState) {
     }
 
     let strings = state.language.strings();
-    let show_remaining = state.language == LanguageId::SimplifiedChinese;
+    let chinese_percentage_label = if state.language == LanguageId::SimplifiedChinese {
+        Some(match state.quota_display_mode {
+            QuotaDisplayMode::Used => strings.quota_used,
+            QuotaDisplayMode::Remaining => strings.quota_remaining,
+        })
+    } else {
+        None
+    };
     let Some(data) = state.data.as_ref() else {
         return;
     };
@@ -926,14 +948,16 @@ fn refresh_usage_texts(state: &mut AppState) {
     if let Some(claude_code) = data.claude_code.as_ref() {
         state.session_text = poller::format_line(
             &claude_code.session,
+            usage_percent_for_display(state.quota_display_mode, claude_code.session.percentage),
             strings,
-            show_remaining,
+            chinese_percentage_label,
             poller::UsageWindowKind::Session,
         );
         state.weekly_text = poller::format_line(
             &claude_code.weekly,
+            usage_percent_for_display(state.quota_display_mode, claude_code.weekly.percentage),
             strings,
-            show_remaining,
+            chinese_percentage_label,
             poller::UsageWindowKind::Weekly,
         );
     } else if state.show_claude_code {
@@ -944,14 +968,16 @@ fn refresh_usage_texts(state: &mut AppState) {
     if let Some(codex) = data.codex.as_ref() {
         state.codex_session_text = poller::format_line(
             &codex.session,
+            usage_percent_for_display(state.quota_display_mode, codex.session.percentage),
             strings,
-            show_remaining,
+            chinese_percentage_label,
             poller::UsageWindowKind::Session,
         );
         state.codex_weekly_text = poller::format_line(
             &codex.weekly,
+            usage_percent_for_display(state.quota_display_mode, codex.weekly.percentage),
             strings,
-            show_remaining,
+            chinese_percentage_label,
             poller::UsageWindowKind::Weekly,
         );
     } else if state.show_codex {
@@ -962,21 +988,24 @@ fn refresh_usage_texts(state: &mut AppState) {
     if let Some(antigravity) = data.antigravity.as_ref() {
         state.antigravity_session_text = poller::format_line(
             &antigravity.session,
+            usage_percent_for_display(state.quota_display_mode, antigravity.session.percentage),
             strings,
-            show_remaining,
+            chinese_percentage_label,
             poller::UsageWindowKind::Session,
         );
-        state.antigravity_weekly_text =
-            if antigravity.weekly.resets_at.is_none() && antigravity.weekly.percentage == 0.0 {
-                "--".to_string()
-            } else {
-                poller::format_line(
-                    &antigravity.weekly,
-                    strings,
-                    show_remaining,
-                    poller::UsageWindowKind::Weekly,
-                )
-            };
+        state.antigravity_weekly_text = if antigravity.weekly.resets_at.is_none()
+            && antigravity.weekly.percentage == 0.0
+        {
+            "--".to_string()
+        } else {
+            poller::format_line(
+                &antigravity.weekly,
+                usage_percent_for_display(state.quota_display_mode, antigravity.weekly.percentage),
+                strings,
+                chinese_percentage_label,
+                poller::UsageWindowKind::Weekly,
+            )
+        };
     } else if state.show_antigravity {
         state.antigravity_session_text = "!".to_string();
         state.antigravity_weekly_text = "!".to_string();
@@ -1465,11 +1494,10 @@ fn usage_layout_widths(language: LanguageId) -> (i32, i32) {
     }
 }
 
-fn usage_percent_for_display(language: LanguageId, used_percentage: f64) -> f64 {
-    if language == LanguageId::SimplifiedChinese {
-        poller::remaining_percentage(used_percentage)
-    } else {
-        used_percentage.clamp(0.0, 100.0)
+fn usage_percent_for_display(quota_display_mode: QuotaDisplayMode, used_percentage: f64) -> f64 {
+    match quota_display_mode {
+        QuotaDisplayMode::Used => used_percentage.clamp(0.0, 100.0),
+        QuotaDisplayMode::Remaining => poller::remaining_percentage(used_percentage),
     }
 }
 
@@ -1707,6 +1735,7 @@ pub fn run() {
                 show_antigravity: settings.show_antigravity,
                 show_session_window: settings.show_session_window,
                 show_weekly_window: settings.show_weekly_window,
+                quota_display_mode: settings.quota_display_mode,
                 alert_threshold_percent: settings.alert_threshold_percent,
                 notified_quota_windows: settings.notified_quota_windows.into_iter().collect(),
                 data: None,
@@ -1819,6 +1848,7 @@ fn render_layered() {
         is_dark,
         embedded,
         language,
+        quota_display_mode,
         strings,
         session_pct,
         session_text,
@@ -1845,6 +1875,7 @@ fn render_layered() {
                 s.is_dark,
                 s.embedded,
                 s.language,
+                s.quota_display_mode,
                 s.language.strings(),
                 s.session_percent,
                 s.session_text.clone(),
@@ -1943,6 +1974,7 @@ fn render_layered() {
             &accent,
             &track,
             language,
+            quota_display_mode,
             strings,
             session_pct,
             &session_text,
@@ -2022,6 +2054,7 @@ fn paint_content(
     accent: &Color,
     track: &Color,
     language: LanguageId,
+    quota_display_mode: QuotaDisplayMode,
     strings: Strings,
     session_pct: f64,
     session_text: &str,
@@ -2044,12 +2077,14 @@ fn paint_content(
     antigravity_accent: &Color,
 ) {
     unsafe {
-        let session_pct = usage_percent_for_display(language, session_pct);
-        let weekly_pct = usage_percent_for_display(language, weekly_pct);
-        let codex_session_pct = usage_percent_for_display(language, codex_session_pct);
-        let codex_weekly_pct = usage_percent_for_display(language, codex_weekly_pct);
-        let antigravity_session_pct = usage_percent_for_display(language, antigravity_session_pct);
-        let antigravity_weekly_pct = usage_percent_for_display(language, antigravity_weekly_pct);
+        let session_pct = usage_percent_for_display(quota_display_mode, session_pct);
+        let weekly_pct = usage_percent_for_display(quota_display_mode, weekly_pct);
+        let codex_session_pct = usage_percent_for_display(quota_display_mode, codex_session_pct);
+        let codex_weekly_pct = usage_percent_for_display(quota_display_mode, codex_weekly_pct);
+        let antigravity_session_pct =
+            usage_percent_for_display(quota_display_mode, antigravity_session_pct);
+        let antigravity_weekly_pct =
+            usage_percent_for_display(quota_display_mode, antigravity_weekly_pct);
         let (label_width, text_width) = usage_layout_widths(language);
 
         let client_rect = RECT {
@@ -3112,6 +3147,22 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     sync_tray_icons(hwnd);
                 }
+                IDM_QUOTA_DISPLAY_USED | IDM_QUOTA_DISPLAY_REMAINING => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.quota_display_mode = if id == IDM_QUOTA_DISPLAY_REMAINING {
+                                QuotaDisplayMode::Remaining
+                            } else {
+                                QuotaDisplayMode::Used
+                            };
+                            refresh_usage_texts(s);
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                    sync_tray_icons(hwnd);
+                }
                 IDM_ALERT_OFF | IDM_ALERT_10 | IDM_ALERT_20 | IDM_ALERT_30 => {
                     let threshold = match id {
                         IDM_ALERT_10 => 10,
@@ -3270,6 +3321,7 @@ fn show_context_menu(hwnd: HWND) {
             show_antigravity,
             show_session_window,
             show_weekly_window,
+            quota_display_mode,
             alert_threshold_percent,
         ) = {
             let state = lock_state();
@@ -3288,6 +3340,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_antigravity,
                     s.show_session_window,
                     s.show_weekly_window,
+                    s.quota_display_mode,
                     s.alert_threshold_percent,
                 ),
                 None => (
@@ -3304,6 +3357,7 @@ fn show_context_menu(hwnd: HWND) {
                     false,
                     true,
                     true,
+                    QuotaDisplayMode::Used,
                     0,
                 ),
             }
@@ -3447,6 +3501,40 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             usage_menu.0 as usize,
             PCWSTR::from_raw(usage_label.as_ptr()),
+        );
+
+        let quota_display_menu = CreatePopupMenu().unwrap();
+        for (id, mode, label) in [
+            (
+                IDM_QUOTA_DISPLAY_USED,
+                QuotaDisplayMode::Used,
+                strings.quota_used,
+            ),
+            (
+                IDM_QUOTA_DISPLAY_REMAINING,
+                QuotaDisplayMode::Remaining,
+                strings.quota_remaining,
+            ),
+        ] {
+            let label = native_interop::wide_str(label);
+            let flags = if quota_display_mode == mode {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                quota_display_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label.as_ptr()),
+            );
+        }
+        let quota_display_label = native_interop::wide_str(strings.quota_display);
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            quota_display_menu.0 as usize,
+            PCWSTR::from_raw(quota_display_label.as_ptr()),
         );
 
         // Low-quota alert threshold submenu. Zero means opt-out.
@@ -3653,6 +3741,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
     let (
         is_dark,
         language,
+        quota_display_mode,
         strings,
         session_pct,
         session_text,
@@ -3677,6 +3766,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             Some(s) => (
                 s.is_dark,
                 s.language,
+                s.quota_display_mode,
                 s.language.strings(),
                 s.session_percent,
                 s.session_text.clone(),
@@ -3743,6 +3833,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &accent,
             &track,
             language,
+            quota_display_mode,
             strings,
             session_pct,
             &session_text,
@@ -4048,6 +4139,7 @@ mod tests {
         assert!(!settings.show_claude_code);
         assert!(settings.show_session_window);
         assert!(settings.show_weekly_window);
+        assert_eq!(settings.quota_display_mode, QuotaDisplayMode::Used);
         assert_eq!(settings.alert_threshold_percent, 0);
         let _ = std::fs::remove_dir_all(base);
     }
@@ -4121,6 +4213,41 @@ mod tests {
         assert!(!settings.show_weekly_window);
         assert_eq!(settings.alert_threshold_percent, 0);
         assert_eq!(settings.notified_quota_windows.len(), 1);
+    }
+
+    #[test]
+    fn quota_display_defaults_to_used_and_persists_remaining() {
+        let defaults: SettingsFile = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.quota_display_mode, QuotaDisplayMode::Used);
+
+        let remaining = SettingsFile {
+            quota_display_mode: QuotaDisplayMode::Remaining,
+            ..SettingsFile::default()
+        };
+        let json = serde_json::to_string(&remaining).unwrap();
+        let restored: SettingsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.quota_display_mode, QuotaDisplayMode::Remaining);
+        assert!(json.contains(r#""quota_display_mode":"remaining""#));
+    }
+
+    #[test]
+    fn quota_percentage_display_inverts_and_clamps_used_values() {
+        assert_eq!(
+            usage_percent_for_display(QuotaDisplayMode::Used, 43.0),
+            43.0
+        );
+        assert_eq!(
+            usage_percent_for_display(QuotaDisplayMode::Remaining, 43.0),
+            57.0
+        );
+        assert_eq!(
+            usage_percent_for_display(QuotaDisplayMode::Used, 120.0),
+            100.0
+        );
+        assert_eq!(
+            usage_percent_for_display(QuotaDisplayMode::Remaining, -5.0),
+            100.0
+        );
     }
 
     #[test]
