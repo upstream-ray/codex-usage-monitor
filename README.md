@@ -102,6 +102,7 @@ Once running, it will appear in your taskbar and as one tray icon in the notific
 - Right-click the taskbar widget or tray icon for refresh, monitored services, usage rows, quota alerts, update frequency, Start with Windows, reset position, language, updates, and exit
 - Left-click the tray icon to toggle the taskbar widget on or off
 - Enable `Start with Windows` from the right-click menu if you want it to launch automatically when you sign in
+- Under **Appearance**, choose the Codex color (green, neutral, blue or purple) and toggle **Show provider logos**. Neutral uses white on dark themes and dark gray on light themes. Hiding logos also removes their reserved space. Preferences are saved; existing settings keep their current green color and logos.
 
 ### Monitored Services
 

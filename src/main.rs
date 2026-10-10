@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod appearance;
 mod diagnose;
 mod localization;
 mod models;
@@ -7,6 +8,7 @@ mod native_interop;
 mod poller;
 mod provider_icons;
 mod provider_poll;
+mod quota_alerts;
 mod quota_refresh;
 mod quota_text;
 mod quota_tooltip;

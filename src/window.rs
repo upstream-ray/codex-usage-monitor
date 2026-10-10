@@ -380,6 +380,8 @@ struct Appearance {
     bar_style: BarStyle,
     bar_thickness: BarThickness,
     font_size: FontSize,
+    #[serde(flatten)]
+    decoration: crate::appearance::Appearance,
 }
 
 impl Appearance {
@@ -389,6 +391,7 @@ impl Appearance {
             bar_style: BarStyle::Continuous,
             bar_thickness: BarThickness::Slim,
             font_size: FontSize::Large,
+            ..Default::default()
         }
     }
     fn is_dark(self, system_is_dark: bool) -> bool {
@@ -777,16 +780,12 @@ fn append_quota_alert(
     section: &crate::models::UsageSection,
 ) {
     let prefix = format!("{provider_key}:{window_key}:");
-    let reset_key = section
+    let reset = section
         .resets_at
         .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map(|value| value.as_secs().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let key = format!("{prefix}{reset_key}");
-    notified.retain(|existing| !existing.starts_with(&prefix) || existing == &key);
-
+        .map(|value| value.as_secs());
     let remaining = poller::remaining_percentage(section.percentage).round() as u8;
-    if remaining > threshold || !notified.insert(key) {
+    if !crate::quota_alerts::should_notify(notified, &prefix, reset, remaining, threshold) {
         return;
     }
 
@@ -1767,7 +1766,7 @@ fn usage_percent_for_display(language: LanguageId, used_percentage: f64) -> f64 
 fn total_widget_width_for(active_models: i32, language: LanguageId, appearance: Appearance) -> i32 {
     let bar_segments = row_bar_segment_count(active_models);
     let (label_width, text_width) = usage_layout_widths(language, appearance);
-    let model_width = model_usage_width(bar_segments, text_width);
+    let model_width = model_usage_width(bar_segments, text_width, appearance);
 
     sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
@@ -2145,7 +2144,7 @@ fn update_quota_tooltips() {
             let chinese = s.language == LanguageId::SimplifiedChinese;
             let count = active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity);
             let (label_width, text_width) = usage_layout_widths(s.language, s.appearance);
-            let width = model_usage_width(row_bar_segment_count(count), text_width);
+            let width = model_usage_width(row_bar_segment_count(count), text_width, s.appearance);
             let mut left = sc(LEFT_DIVIDER_W)
                 + sc(DIVIDER_RIGHT_MARGIN)
                 + label_width
@@ -2293,7 +2292,7 @@ fn render_layered() {
 
     let accent = claude_accent_color();
     let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
-    let codex_accent = provider_icons::codex_color(appearance.is_dark(is_dark));
+    let codex_accent = appearance.decoration.color(appearance.is_dark(is_dark));
     let antigravity_accent = antigravity_accent_color();
 
     unsafe {
@@ -2524,14 +2523,15 @@ fn paint_content(
         let icon_size = sc(provider_icons::SIZE);
         let icon_y = (height - icon_size) / 2;
         let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
-        let model_width = model_usage_width(row_bar_segment_count(active_models), text_width)
-            + sc(MODEL_RIGHT_MARGIN);
+        let model_width =
+            model_usage_width(row_bar_segment_count(active_models), text_width, appearance)
+                + sc(MODEL_RIGHT_MARGIN);
         let mut icon_x = content_x + label_width + sc(LABEL_RIGHT_MARGIN);
-        if show_claude_code {
+        if show_claude_code && appearance.decoration.show_provider_logos {
             provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Claude);
             icon_x += model_width;
         }
-        if show_codex {
+        if show_codex && appearance.decoration.show_provider_logos {
             provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Codex);
         }
 
@@ -2705,7 +2705,7 @@ fn complete_provider_poll(
     attempt: provider_poll::Attempt,
 ) {
     let hwnd = send_hwnd.to_hwnd();
-    let (alerts, auth_notice) = {
+    let (alerts, auth_notice, alert_state_changed) = {
         let mut state = lock_state();
         let Some(s) = state.as_mut() else {
             return;
@@ -2735,7 +2735,9 @@ fn complete_provider_poll(
                 _ => fresh.antigravity = data,
             }
         }
+        let previous_alert_keys = s.notified_quota_windows.clone();
         let alerts = collect_low_quota_alerts(s, &fresh);
+        let alert_state_changed = previous_alert_keys != s.notified_quota_windows;
         let cached = s.monitor.cached();
         for (usage, session, weekly) in [
             (
@@ -2788,12 +2790,12 @@ fn complete_provider_poll(
                 ),
             }
         });
-        (alerts, notice)
+        (alerts, notice, alert_state_changed)
     };
     for alert in &alerts {
         tray_icon::notify_balloon(hwnd, alert.kind, &alert.title, &alert.message);
     }
-    if !alerts.is_empty() {
+    if alert_state_changed {
         save_state_settings();
     }
     if let Some((kind, title, body)) = auth_notice {
@@ -3399,6 +3401,14 @@ unsafe extern "system" fn wnd_proc(
         WM_COMMAND => {
             let id = wparam.0 as u16;
             match id {
+                crate::appearance::FIRST_COMMAND..=crate::appearance::LAST_COMMAND => {
+                    if let Some(s) = lock_state().as_mut() {
+                        s.appearance.decoration.apply_command(id);
+                    }
+                    save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                }
                 1 => {
                     {
                         let mut state = lock_state();
@@ -3993,6 +4003,8 @@ fn show_context_menu(hwnd: HWND) {
 
         let chinese = language == LanguageId::SimplifiedChinese;
         let appearance_menu = CreatePopupMenu().unwrap();
+        appearance.decoration.append_menu(appearance_menu, chinese);
+        let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
         append_appearance_choice(
             appearance_menu,
             IDM_APPEARANCE_RECOMMENDED,
@@ -4441,7 +4453,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
 
     let accent = claude_accent_color();
     let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
-    let codex_accent = provider_icons::codex_color(appearance.is_dark(is_dark));
+    let codex_accent = appearance.decoration.color(appearance.is_dark(is_dark));
     let antigravity_accent = antigravity_accent_color();
 
     unsafe {
@@ -4532,7 +4544,7 @@ fn draw_row(
     } else {
         *text_color
     };
-    let codex_value_color = provider_icons::codex_color(is_dark);
+    let codex_value_color = *codex_accent;
     let antigravity_value_color = if use_model_text_colors {
         antigravity_usage_text_color(is_dark)
     } else {
@@ -4559,7 +4571,7 @@ fn draw_row(
         if show_claude_code {
             draw_usage_bar(
                 hdc,
-                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
+                model_x + sc(appearance.decoration.icon_width()),
                 y,
                 segment_count,
                 claude_percent,
@@ -4571,12 +4583,13 @@ fn draw_row(
                 is_dark,
                 appearance,
             );
-            model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
+            model_x +=
+                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_codex {
             draw_usage_bar(
                 hdc,
-                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
+                model_x + sc(appearance.decoration.icon_width()),
                 y,
                 segment_count,
                 codex_percent,
@@ -4588,12 +4601,13 @@ fn draw_row(
                 is_dark,
                 appearance,
             );
-            model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
+            model_x +=
+                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_antigravity {
             draw_usage_bar(
                 hdc,
-                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
+                model_x + sc(appearance.decoration.icon_width()),
                 y,
                 segment_count,
                 antigravity_percent,
@@ -4609,9 +4623,8 @@ fn draw_row(
     }
 }
 
-fn model_usage_width(segment_count: i32, text_width: i32) -> i32 {
-    sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN)
-        + (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count
+fn model_usage_width(segment_count: i32, text_width: i32, appearance: Appearance) -> i32 {
+    sc(appearance.decoration.icon_width()) + (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count
         - sc(SEGMENT_GAP)
         + sc(BAR_RIGHT_MARGIN)
         + text_width
@@ -4735,6 +4748,150 @@ mod tests {
     use super::*;
 
     #[test]
+    fn appearance_render_uses_selected_color_and_reclaims_logo_space() {
+        use crate::appearance::CodexColor;
+        for language in [LanguageId::English, LanguageId::SimplifiedChinese] {
+            for dark in [false, true] {
+                for color in [
+                    CodexColor::Green,
+                    CodexColor::Neutral,
+                    CodexColor::Blue,
+                    CodexColor::Purple,
+                ] {
+                    for logos in [false, true] {
+                        let appearance = Appearance {
+                            decoration: crate::appearance::Appearance {
+                                codex_color: color,
+                                show_provider_logos: logos,
+                            },
+                            ..Default::default()
+                        };
+                        let width = total_widget_width_for(2, language, appearance);
+                        let hidden = Appearance {
+                            decoration: crate::appearance::Appearance {
+                                show_provider_logos: false,
+                                ..appearance.decoration
+                            },
+                            ..appearance
+                        };
+                        assert_eq!(
+                            width - total_widget_width_for(2, language, hidden),
+                            if logos { 2 * sc(21) } else { 0 }
+                        );
+                        let height = sc(WIDGET_HEIGHT);
+                        unsafe {
+                            let dc = CreateCompatibleDC(None);
+                            let info = BITMAPINFO {
+                                bmiHeader: BITMAPINFOHEADER {
+                                    biSize: 40,
+                                    biWidth: width,
+                                    biHeight: -height,
+                                    biPlanes: 1,
+                                    biBitCount: 32,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            };
+                            let mut bits = std::ptr::null_mut();
+                            let bitmap =
+                                CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0)
+                                    .unwrap();
+                            let old = SelectObject(dc, bitmap);
+                            let bg = Color::from_hex(if dark { "#1C1C1C" } else { "#F3F3F3" });
+                            let fg = Color::from_hex(if dark { "#888888" } else { "#404040" });
+                            let track = Color::from_hex(if dark { "#444444" } else { "#AAAAAA" });
+                            let accent = appearance.decoration.color(dark);
+                            paint_content(
+                                dc,
+                                width,
+                                height,
+                                dark,
+                                appearance,
+                                &bg,
+                                &fg,
+                                &claude_accent_color(),
+                                &track,
+                                language,
+                                language.strings(),
+                                50.0,
+                                "50%",
+                                50.0,
+                                "50%",
+                                50.0,
+                                "50%",
+                                50.0,
+                                "50%",
+                                0.0,
+                                "--",
+                                0.0,
+                                "--",
+                                true,
+                                true,
+                                false,
+                                true,
+                                true,
+                                &accent,
+                                &antigravity_accent_color(),
+                            );
+                            let (label_width, text_width) =
+                                usage_layout_widths(language, appearance);
+                            let codex_x = sc(LEFT_DIVIDER_W
+                                + DIVIDER_RIGHT_MARGIN
+                                + label_width
+                                + LABEL_RIGHT_MARGIN)
+                                + model_usage_width(
+                                    row_bar_segment_count(2),
+                                    text_width,
+                                    appearance,
+                                )
+                                + sc(MODEL_RIGHT_MARGIN)
+                                + sc(appearance.decoration.icon_width());
+                            let sample = GetPixel(
+                                dc,
+                                codex_x + sc(5),
+                                (height - 2 * appearance.row_height() - sc(8)).max(0) / 2
+                                    + appearance.row_height()
+                                    + sc(8)
+                                    + appearance.row_height() / 2,
+                            );
+                            assert_eq!(sample.0, accent.to_colorref());
+                            if let Some(directory) =
+                                std::env::var_os("CODEX_USAGE_APPEARANCE_PREVIEW")
+                            {
+                                let count = (width * height * 4) as usize;
+                                let mut bytes = Vec::new();
+                                bytes.extend(b"BM");
+                                bytes.extend(((54 + count) as u32).to_le_bytes());
+                                bytes.extend([0u8; 4]);
+                                bytes.extend(54u32.to_le_bytes());
+                                bytes.extend(40u32.to_le_bytes());
+                                bytes.extend(width.to_le_bytes());
+                                bytes.extend((-height).to_le_bytes());
+                                bytes.extend(1u16.to_le_bytes());
+                                bytes.extend(32u16.to_le_bytes());
+                                bytes.extend([0u8; 24]);
+                                bytes.extend(std::slice::from_raw_parts(bits as *const u8, count));
+                                std::fs::create_dir_all(&directory).unwrap();
+                                std::fs::write(
+                                    std::path::Path::new(&directory).join(format!(
+                                        "{}-{dark}-{color:?}-{logos}.bmp",
+                                        language.code()
+                                    )),
+                                    bytes,
+                                )
+                                .unwrap();
+                            }
+                            SelectObject(dc, old);
+                            let _ = DeleteObject(bitmap);
+                            let _ = DeleteDC(dc);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn unavailable_quota_has_no_bar_fill() {
         assert_eq!(usage_bar_fill_percentage(100.0, "--"), 0.0);
         assert_eq!(usage_bar_fill_percentage(61.0, "剩余61%"), 61.0);
@@ -4854,6 +5011,16 @@ mod tests {
         let json = serde_json::to_string(&customized).unwrap();
         let restored: SettingsFile = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.appearance, Appearance::translucent_dark_taskbar());
+        let mut selected = restored;
+        selected.appearance.decoration.apply_command(111);
+        selected.appearance.decoration.apply_command(114);
+        let json = serde_json::to_string(&selected).unwrap();
+        let restored: SettingsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.appearance, selected.appearance);
+        assert_eq!(restored.appearance.palette, Palette::HighContrastDark);
+        assert_eq!(restored.appearance.font_size, FontSize::Large);
+        assert!(json.contains("\"codex_color\":\"neutral\""));
+        assert!(json.contains("\"show_provider_logos\":false"));
     }
 
     #[test]
@@ -5042,6 +5209,34 @@ mod tests {
         };
         assert_eq!(format_local_system_time(local), "2026-07-17 18:30");
         assert_eq!(format_precise_reset_time(None), None);
+    }
+
+    #[test]
+    fn low_quota_alert_does_not_repeat_when_reset_time_drifts() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+        for seconds in [2_000_000_000, 2_000_000_001, 1_999_999_999] {
+            append_quota_alert(
+                &mut alerts,
+                &mut notified,
+                10,
+                LanguageId::SimplifiedChinese,
+                tray_icon::TrayIconKind::Claude,
+                "claude",
+                "Claude",
+                "session",
+                "5h",
+                &crate::models::UsageSection {
+                    percentage: 95.0,
+                    resets_at: Some(UNIX_EPOCH + Duration::from_secs(seconds)),
+                },
+            );
+        }
+        assert_eq!(
+            alerts.len(),
+            1,
+            "reset timestamp drift must not trigger another low-quota alert"
+        );
     }
 
     #[test]
