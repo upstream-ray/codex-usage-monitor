@@ -198,6 +198,13 @@ impl Monitor {
             })
             .collect()
     }
+    /// Rearm after every wake, including an early timer with no jobs ready.
+    /// Never leave an early wake waiting for another full periodic interval.
+    pub fn wake(&mut self, now: Instant, base: u32) -> (Vec<Job>, u32) {
+        let jobs = self.plan(now);
+        let delay = self.delay_ms(now, base);
+        (jobs, delay)
+    }
     pub fn finish(
         &mut self,
         job: &Job,
@@ -306,7 +313,8 @@ impl Monitor {
             .map(|s| {
                 s.due
                     .saturating_duration_since(now)
-                    .as_millis()
+                    .as_nanos()
+                    .div_ceil(1_000_000)
                     .clamp(1000, u32::MAX as u128) as u32
             })
             .min()
@@ -407,6 +415,80 @@ impl Service {
 mod tests {
     use super::*;
     use std::sync::{mpsc, Mutex};
+
+    #[test]
+    fn fifteen_minute_timer_does_not_wake_before_the_refresh_deadline() {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let mut monitor = Monitor::new([false, true, false], now);
+        let job = monitor.plan(now).remove(0);
+        complete(&mut monitor, &job, Ok(usage(7.0)), now, wall);
+        // SetTimer accepts whole milliseconds; the scheduling call occurs a
+        // fraction of a millisecond after the last request completed.
+        let armed = now + Duration::from_micros(500);
+        let timer = monitor.delay_ms(armed, 900_000);
+        let wake = armed + Duration::from_millis(timer as u64);
+        let jobs = monitor.plan(wake);
+        assert_eq!(jobs.len(), 1, "a 15-minute timer must reach the strict provider deadline; waking early skips the poll until the next 15-minute tick");
+        assert_eq!(jobs[0].id, 1);
+    }
+
+    #[test]
+    fn early_timer_rearms_soon_and_repeated_automatic_refreshes_stay_fresh() {
+        let mut clock = Instant::now();
+        let mut wall = SystemTime::now();
+        let mut monitor = Monitor::new([false, true, false], clock);
+        let job = monitor.plan(clock).remove(0);
+        complete(&mut monitor, &job, Ok(usage(7.0)), clock, wall);
+        // Simulate two hours of automatic 15-minute ticks, each deliberately
+        // delivered 2ms early. Exercise the same wake/rearm seam as the app.
+        for _ in 0..8 {
+            let early = clock + Duration::from_millis(899_998);
+            let (jobs, delay) = monitor.wake(early, 900_000);
+            assert!(jobs.is_empty());
+            assert_eq!(
+                delay, 1000,
+                "early wake must retry soon, not after another 15 minutes"
+            );
+            let next = early + Duration::from_millis(delay as u64);
+            let (jobs, _) = monitor.wake(next, 900_000);
+            assert_eq!(jobs.len(), 1);
+            wall += next.duration_since(clock);
+            clock = next;
+            assert!(
+                !monitor.services[1].stale(wall),
+                "normal scheduled refresh must not produce a stale marker"
+            );
+            complete(&mut monitor, &jobs[0], Ok(usage(7.0)), clock, wall);
+            assert!(!monitor.services[1].stale(wall));
+        }
+    }
+
+    #[test]
+    fn timer_wakes_do_not_bypass_a_server_retry_deadline() {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let mut monitor = Monitor::new([false, true, false], now);
+        let job = monitor.plan(now).remove(0);
+        complete(
+            &mut monitor,
+            &job,
+            Err(PollError::RateLimited(Some(1_800_000))),
+            now,
+            wall,
+        );
+        let early = now + Duration::from_micros(1_799_999_500);
+        let (jobs, delay) = monitor.wake(early, 900_000);
+        assert!(jobs.is_empty());
+        assert_eq!(delay, 1000);
+        assert_eq!(
+            monitor
+                .wake(early + Duration::from_millis(delay as u64), 900_000)
+                .0
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn server_retry_deadline_survives_manual_refresh_and_selection_changes() {

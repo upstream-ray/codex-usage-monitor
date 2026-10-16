@@ -177,9 +177,11 @@ pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
     unsafe {
         // Preserve existing extended style, add tool window + no activate
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         // Reset alpha mode used by the startup popup fallback before switching
-        // back to UpdateLayeredWindow rendering inside the taskbar.
-        if ex_style & WS_EX_LAYERED.0 as i32 != 0 {
+        // to child rendering. An existing layered child must keep its surface:
+        // toggling WS_EX_LAYERED on it breaks subsequent UpdateLayeredWindow.
+        if ex_style & WS_EX_LAYERED.0 as i32 != 0 && style & WS_CHILD_STYLE == 0 {
             let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style & !(WS_EX_LAYERED.0 as i32));
         }
         let _ = SetWindowLongW(
@@ -188,11 +190,8 @@ pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
             ex_style | WS_EX_TOOLWINDOW.0 as i32 | WS_EX_NOACTIVATE.0 as i32,
         );
 
-        // Change from popup to child
-        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let new_style = (style & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE;
         let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
-
         let _ = SetParent(hwnd, taskbar_hwnd);
     }
 }
@@ -275,14 +274,55 @@ mod attachment_tests {
                 Some(&blend),
                 ULW_ALPHA,
             );
+            assert!(rendered.is_ok());
+            let other_parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("other-taskbar-test"),
+                WS_POPUP,
+                40,
+                -20,
+                20,
+                20,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let mut moved_render = Ok(());
+            for target in [other_parent, parent, other_parent, parent] {
+                embed_in_taskbar(child, target);
+                assert_eq!(GetParent(child).unwrap(), target);
+                move_window(child, 2, 2, 2, 2);
+                moved_render = UpdateLayeredWindow(
+                    child,
+                    None,
+                    None,
+                    Some(&size),
+                    dc,
+                    Some(&point),
+                    COLORREF(0),
+                    Some(&blend),
+                    ULW_ALPHA,
+                );
+                if moved_render.is_err() {
+                    break;
+                }
+            }
             let _ = SelectObject(dc, old);
             let _ = DeleteObject(bitmap);
             let _ = DeleteDC(dc);
             let _ = DestroyWindow(child);
             let _ = DestroyWindow(parent);
+            let _ = DestroyWindow(other_parent);
             assert!(
                 rendered.is_ok(),
                 "fallback alpha mode must not prevent taskbar rendering: {rendered:?}"
+            );
+            assert!(
+                moved_render.is_ok(),
+                "moving between taskbars must remain paintable: {moved_render:?}"
             );
         }
     }

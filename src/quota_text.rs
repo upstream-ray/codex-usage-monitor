@@ -77,6 +77,45 @@ fn text(hdc: HDC, value: &str, mut rect: RECT, flags: DRAW_TEXT_FORMAT) {
     }
 }
 
+/// Physical bounds of the visible countdown, using the same font and column
+/// offset as drawing. Percentage cells and unused column space are excluded.
+pub fn reset_bounds(
+    hdc: HDC,
+    rect: RECT,
+    value: &str,
+    font_px: i32,
+    scale: impl Fn(i32) -> i32,
+) -> Option<RECT> {
+    let (_, reset) = parts(value);
+    if reset.is_empty() {
+        return None;
+    }
+    let left = rect.left + scale(reset_offset(font_px));
+    unsafe {
+        let font = create_reset_font(scale(font_px));
+        if font.is_invalid() {
+            return None;
+        }
+        let previous = SelectObject(hdc, font);
+        let mut size = windows::Win32::Foundation::SIZE::default();
+        let measured =
+            GetTextExtentPoint32W(hdc, &reset.encode_utf16().collect::<Vec<_>>(), &mut size)
+                .as_bool();
+        SelectObject(hdc, previous);
+        let _ = DeleteObject(font);
+        if !measured || size.cx <= 0 || size.cy <= 0 || left >= rect.right {
+            return None;
+        }
+        let top = rect.top + ((rect.bottom - rect.top - size.cy) / 2).max(0);
+        Some(RECT {
+            left,
+            top,
+            right: (left + size.cx).min(rect.right),
+            bottom: (top + size.cy).min(rect.bottom),
+        })
+    }
+}
+
 /// Each digit occupies a fixed cell; reset text starts at the same x for
 /// 0%, 9%, 99% and 100%. Status labels remain in the percentage column.
 /// `x`, `y`, `height` and `width` are physical pixels; `font_px` is logical.

@@ -1575,27 +1575,32 @@ fn is_leap(y: u64) -> bool {
 pub fn format_codex_line(
     section: &UsageSection,
     strings: Strings,
-    show_remaining_in_chinese: bool,
+    simplified_chinese: bool,
+    show_remaining: bool,
     window: UsageWindowKind,
 ) -> String {
     if section.percentage == 0.0 && section.resets_at.is_none() {
         return "--".to_string();
     }
-    format_line(section, strings, show_remaining_in_chinese, window)
+    format_line(section, strings, simplified_chinese, show_remaining, window)
 }
 
 /// Format a usage section for the compact taskbar display.
 pub fn format_line(
     section: &UsageSection,
     strings: Strings,
-    show_remaining_in_chinese: bool,
+    simplified_chinese: bool,
+    show_remaining: bool,
     window: UsageWindowKind,
 ) -> String {
-    if show_remaining_in_chinese {
-        return format_simplified_chinese_line(section, window);
+    if simplified_chinese {
+        return format_simplified_chinese_line(section, window, show_remaining);
     }
 
-    let pct = format!("{:.0}%", section.percentage);
+    let pct = format!(
+        "{:.0}%",
+        display_percentage(section.percentage, show_remaining)
+    );
     let cd = format_countdown(section.resets_at, strings);
     if cd.is_empty() {
         pct
@@ -1604,8 +1609,12 @@ pub fn format_line(
     }
 }
 
-fn format_simplified_chinese_line(section: &UsageSection, window: UsageWindowKind) -> String {
-    let remaining = remaining_percentage(section.percentage);
+fn format_simplified_chinese_line(
+    section: &UsageSection,
+    window: UsageWindowKind,
+    show_remaining: bool,
+) -> String {
+    let remaining = display_percentage(section.percentage, show_remaining);
     let reset = section
         .resets_at
         .and_then(native_interop::system_time_to_local);
@@ -1637,6 +1646,14 @@ pub fn remaining_percentage(used_percentage: f64) -> f64 {
     (100.0 - used_percentage).clamp(0.0, 100.0)
 }
 
+pub fn display_percentage(used_percentage: f64, show_remaining: bool) -> f64 {
+    if show_remaining {
+        remaining_percentage(used_percentage)
+    } else {
+        used_percentage.clamp(0.0, 100.0)
+    }
+}
+
 fn format_countdown(resets_at: Option<SystemTime>, strings: Strings) -> String {
     let reset = match resets_at {
         Some(t) => t,
@@ -1664,7 +1681,12 @@ fn format_countdown_from_secs(total_secs: u64, strings: Strings) -> String {
     let total_days = total_secs / 86400;
 
     if total_days >= 1 {
-        format!("{total_days}{}", strings.day_suffix)
+        format!(
+            "{total_days}{} {}{}",
+            strings.day_suffix,
+            total_hours % 24,
+            strings.hour_suffix
+        )
     } else if total_hours >= 1 {
         format!("{total_hours}{}", strings.hour_suffix)
     } else if total_mins >= 1 {
@@ -1677,11 +1699,8 @@ fn format_countdown_from_secs(total_secs: u64, strings: Strings) -> String {
 fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
     let total_mins = total_secs / 60;
     let total_hours = total_secs / 3600;
-    let total_days = total_secs / 86400;
 
-    let current_bucket_start = if total_days >= 1 {
-        total_days * 86400
-    } else if total_hours >= 1 {
+    let current_bucket_start = if total_hours >= 1 {
         total_hours * 3600
     } else if total_mins >= 1 {
         total_mins * 60
@@ -1733,6 +1752,57 @@ mod tests {
     }
 
     #[test]
+    fn weekly_countdown_shows_days_and_hours_and_updates_each_hour() {
+        let strings = crate::localization::LanguageId::English.strings();
+        let seconds = 5 * 86400 + 15 * 3600;
+        assert_eq!(format_countdown_from_secs(seconds, strings), "5d 15h");
+        assert_eq!(format_countdown_from_secs(86400, strings), "1d 0h");
+        assert_eq!(
+            time_until_display_change_from_secs(seconds + 1800),
+            Duration::from_secs(1801)
+        );
+        assert_eq!(
+            time_until_display_change_from_secs(seconds),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn percentage_choice_applies_to_text_independently_of_language() {
+        let strings = crate::localization::LanguageId::English.strings();
+        let section = UsageSection {
+            percentage: 21.0,
+            resets_at: None,
+        };
+        assert_eq!(
+            format_line(&section, strings, false, false, UsageWindowKind::Weekly),
+            "21%"
+        );
+        assert_eq!(
+            format_line(&section, strings, false, true, UsageWindowKind::Weekly),
+            "79%"
+        );
+        assert_eq!(
+            format_line(&section, strings, true, false, UsageWindowKind::Weekly),
+            "21%"
+        );
+        assert_eq!(
+            format_line(&section, strings, true, true, UsageWindowKind::Weekly),
+            "79%"
+        );
+        assert_eq!(
+            format_codex_line(
+                &UsageSection::default(),
+                strings,
+                false,
+                true,
+                UsageWindowKind::Weekly
+            ),
+            "--"
+        );
+    }
+
+    #[test]
     fn remaining_percentage_is_clamped() {
         assert_eq!(remaining_percentage(30.0), 70.0);
         assert_eq!(remaining_percentage(-5.0), 100.0);
@@ -1769,6 +1839,7 @@ mod tests {
                 format_codex_line(
                     &usage.session,
                     language.strings(),
+                    language == crate::localization::LanguageId::SimplifiedChinese,
                     language == crate::localization::LanguageId::SimplifiedChinese,
                     UsageWindowKind::Session,
                 ),
@@ -1818,12 +1889,16 @@ mod tests {
         .unwrap();
         let usage = codex_usage_from_response(response).unwrap();
         let strings = crate::localization::LanguageId::SimplifiedChinese.strings();
-        assert!(
-            format_codex_line(&usage.session, strings, true, UsageWindowKind::Session)
-                .starts_with("100%")
-        );
+        assert!(format_codex_line(
+            &usage.session,
+            strings,
+            true,
+            true,
+            UsageWindowKind::Session
+        )
+        .starts_with("100%"));
         assert_eq!(
-            format_codex_line(&usage.weekly, strings, true, UsageWindowKind::Weekly),
+            format_codex_line(&usage.weekly, strings, true, true, UsageWindowKind::Weekly),
             "--"
         );
     }
@@ -1866,7 +1941,7 @@ mod tests {
             resets_at: None,
         };
         assert_eq!(
-            format_line(&section, strings, true, UsageWindowKind::Session),
+            format_line(&section, strings, true, true, UsageWindowKind::Session),
             "70%"
         );
         let session_reset = windows::Win32::Foundation::SYSTEMTIME {
