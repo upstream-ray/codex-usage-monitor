@@ -17,6 +17,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::codex_colors::{CodexColors, ColorPreset, ColorRole};
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
@@ -35,6 +36,7 @@ use crate::settings_store;
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
+use crate::user_presets::{UserPresets, MAX_USER_PRESETS};
 
 /// Wrapper to make HWND sendable across threads (safe for PostMessage usage)
 #[derive(Clone, Copy)]
@@ -62,6 +64,7 @@ struct AppState {
     language_override: Option<LanguageId>,
     language: LanguageId,
     appearance: Appearance,
+    color_presets: UserPresets,
     install_channel: InstallChannel,
 
     session_percent: f64,
@@ -164,6 +167,17 @@ const IDM_FONT_STANDARD: u16 = 97;
 const IDM_FONT_LARGE: u16 = 98;
 const IDM_APPEARANCE_RECOMMENDED: u16 = 99;
 const IDM_APPEARANCE_RESET: u16 = 100;
+const IDM_BAR_CLASSIC: u16 = 101;
+const IDM_CODEX_ICON_COLOR: u16 = 102;
+const IDM_CODEX_BAR_COLOR: u16 = 103;
+const IDM_CODEX_PERCENT_COLOR: u16 = 104;
+const IDM_CODEX_PRESET_FIRST: u16 = 110;
+const IDM_CODEX_PRESET_LAST: u16 = 114;
+const IDM_SAVE_COLOR_PRESET: u16 = 115;
+const IDM_USER_PRESET_FIRST: u16 = 400;
+const IDM_USER_PRESET_LAST: u16 = IDM_USER_PRESET_FIRST + MAX_USER_PRESETS as u16 - 1;
+const IDM_DELETE_PRESET_FIRST: u16 = 500;
+const IDM_DELETE_PRESET_LAST: u16 = IDM_DELETE_PRESET_FIRST + MAX_USER_PRESETS as u16 - 1;
 const IDM_MONITOR_FIRST: u16 = 200;
 const MAX_MONITOR_MENU_ITEMS: usize = 100;
 
@@ -355,6 +369,7 @@ enum BarStyle {
     #[default]
     Continuous,
     Segmented,
+    ClassicSegmented,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,6 +395,7 @@ struct Appearance {
     bar_style: BarStyle,
     bar_thickness: BarThickness,
     font_size: FontSize,
+    codex_colors: CodexColors,
 }
 
 impl Appearance {
@@ -389,6 +405,7 @@ impl Appearance {
             bar_style: BarStyle::Continuous,
             bar_thickness: BarThickness::Slim,
             font_size: FontSize::Large,
+            codex_colors: CodexColors::default(),
         }
     }
     fn is_dark(self, system_is_dark: bool) -> bool {
@@ -440,6 +457,8 @@ struct SettingsFile {
     language: Option<String>,
     #[serde(default)]
     appearance: Appearance,
+    #[serde(default)]
+    color_presets: UserPresets,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_update_check_unix: Option<u64>,
     #[serde(default = "default_widget_visible")]
@@ -471,6 +490,7 @@ impl Default for SettingsFile {
             adaptive_refresh: true,
             language: None,
             appearance: Appearance::default(),
+            color_presets: UserPresets::default(),
             last_update_check_unix: None,
             widget_visible: true,
             show_claude_code: false,
@@ -604,6 +624,7 @@ fn save_state_settings() {
                 .language_override
                 .map(|language| language.code().to_string()),
             appearance: s.appearance,
+            color_presets: s.color_presets.clone(),
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
             show_claude_code: s.show_claude_code,
@@ -1999,6 +2020,7 @@ pub fn run() {
                 language_override,
                 language,
                 appearance: settings.appearance,
+                color_presets: settings.color_presets.clone(),
                 install_channel,
                 session_percent: 0.0,
                 session_text: "--".to_string(),
@@ -2293,7 +2315,10 @@ fn render_layered() {
 
     let accent = claude_accent_color();
     let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
-    let codex_accent = provider_icons::codex_color(appearance.is_dark(is_dark));
+    let codex_accent = appearance
+        .codex_colors
+        .resolve(appearance.is_dark(is_dark))
+        .bar;
     let antigravity_accent = antigravity_accent_color();
 
     unsafe {
@@ -2532,7 +2557,13 @@ fn paint_content(
             icon_x += model_width;
         }
         if show_codex {
-            provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Codex);
+            provider_icons::draw_codex(
+                hdc,
+                icon_x,
+                icon_y,
+                icon_size,
+                appearance.codex_colors.icon_tint(is_dark),
+            );
         }
 
         if show_session_window {
@@ -3566,6 +3597,69 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     sync_tray_icons(hwnd);
                 }
+                IDM_SAVE_COLOR_PRESET => save_current_color_preset(hwnd),
+                IDM_USER_PRESET_FIRST..=IDM_USER_PRESET_LAST => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            if let Some(colors) = s
+                                .color_presets
+                                .entries()
+                                .get((id - IDM_USER_PRESET_FIRST) as usize)
+                                .map(|entry| entry.colors)
+                            {
+                                s.appearance.codex_colors = colors;
+                            }
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                }
+                IDM_DELETE_PRESET_FIRST..=IDM_DELETE_PRESET_LAST => {
+                    delete_color_preset(hwnd, (id - IDM_DELETE_PRESET_FIRST) as usize);
+                }
+                IDM_CODEX_ICON_COLOR | IDM_CODEX_BAR_COLOR | IDM_CODEX_PERCENT_COLOR => {
+                    let role = match id {
+                        IDM_CODEX_ICON_COLOR => ColorRole::Icon,
+                        IDM_CODEX_BAR_COLOR => ColorRole::Bar,
+                        _ => ColorRole::Percentage,
+                    };
+                    let initial = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| {
+                            s.appearance
+                                .codex_colors
+                                .color(role, s.appearance.is_dark(s.is_dark))
+                        })
+                    };
+                    // The native dialog runs a nested message loop: never hold STATE here.
+                    if let Some(initial) = initial {
+                        if let Some(color) = crate::color_picker::choose(hwnd, initial) {
+                            {
+                                let mut state = lock_state();
+                                if let Some(s) = state.as_mut() {
+                                    s.appearance.codex_colors.set(role, color);
+                                }
+                            }
+                            save_state_settings();
+                            render_layered();
+                        }
+                    }
+                }
+                IDM_CODEX_PRESET_FIRST..=IDM_CODEX_PRESET_LAST => {
+                    if let Some(preset) =
+                        ColorPreset::ALL.get((id - IDM_CODEX_PRESET_FIRST) as usize)
+                    {
+                        {
+                            let mut state = lock_state();
+                            if let Some(s) = state.as_mut() {
+                                s.appearance.codex_colors = CodexColors::from_preset(*preset);
+                            }
+                        }
+                        save_state_settings();
+                        render_layered();
+                    }
+                }
                 IDM_APPEARANCE_RECOMMENDED
                 | IDM_APPEARANCE_RESET
                 | IDM_PALETTE_SYSTEM
@@ -3573,6 +3667,7 @@ unsafe extern "system" fn wnd_proc(
                 | IDM_PALETTE_LIGHT
                 | IDM_BAR_CONTINUOUS
                 | IDM_BAR_SEGMENTED
+                | IDM_BAR_CLASSIC
                 | IDM_BAR_STANDARD
                 | IDM_BAR_SLIM
                 | IDM_FONT_STANDARD
@@ -3594,6 +3689,9 @@ unsafe extern "system" fn wnd_proc(
                                 }
                                 IDM_BAR_CONTINUOUS => s.appearance.bar_style = BarStyle::Continuous,
                                 IDM_BAR_SEGMENTED => s.appearance.bar_style = BarStyle::Segmented,
+                                IDM_BAR_CLASSIC => {
+                                    s.appearance.bar_style = BarStyle::ClassicSegmented
+                                }
                                 IDM_BAR_STANDARD => {
                                     s.appearance.bar_thickness = BarThickness::Standard
                                 }
@@ -3775,8 +3873,130 @@ unsafe fn append_appearance_submenu(parent: HMENU, child: HMENU, label: &str) {
     );
 }
 
+fn save_current_color_preset(hwnd: HWND) {
+    let snapshot = {
+        let state = lock_state();
+        state.as_ref().map(|s| {
+            (
+                s.appearance.codex_colors,
+                s.color_presets.clone(),
+                s.language == LanguageId::SimplifiedChinese,
+            )
+        })
+    };
+    let Some((colors, library, chinese)) = snapshot else {
+        return;
+    };
+    let initial = (1..=MAX_USER_PRESETS + 1)
+        .map(|index| {
+            if chinese {
+                format!("我的配色 {index}")
+            } else {
+                format!("Custom {index}")
+            }
+        })
+        .find(|name| library.find(name).is_none())
+        .unwrap_or_default();
+    // Both dialogs run nested message loops; all STATE guards must be released.
+    let Some(name) = crate::preset_dialog::prompt(hwnd, chinese, &initial) else {
+        return;
+    };
+    if library.find(&name).is_some() {
+        let question = if chinese {
+            format!("已存在预设“{name}”。是否用当前配色覆盖？")
+        } else {
+            format!("A preset named “{name}” already exists. Replace it with the current colors?")
+        };
+        if !confirm_preset_action(hwnd, chinese, &question) {
+            return;
+        }
+    }
+    let result = {
+        let mut state = lock_state();
+        state.as_mut().map(|s| s.color_presets.save(&name, colors))
+    };
+    if matches!(result, Some(Ok(()))) {
+        save_state_settings();
+    } else if matches!(result, Some(Err(_))) {
+        let text = native_interop::wide_str(if chinese {
+            "无法保存：名称须为 1–40 个字符，最多保存 32 个预设。请删除不需要的预设后再试。"
+        } else {
+            "Unable to save. Use a name of 1–40 characters; up to 32 presets can be saved. Delete an unused preset and try again."
+        });
+        let title = native_interop::wide_str(if chinese {
+            "配色预设"
+        } else {
+            "Color presets"
+        });
+        unsafe {
+            MessageBoxW(
+                hwnd,
+                PCWSTR(text.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+    }
+}
+
+fn confirm_preset_action(hwnd: HWND, chinese: bool, question: &str) -> bool {
+    let title = native_interop::wide_str(if chinese {
+        "配色预设"
+    } else {
+        "Color presets"
+    });
+    let question = native_interop::wide_str(question);
+    unsafe {
+        MessageBoxW(
+            hwnd,
+            PCWSTR(question.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        ) == IDYES
+    }
+}
+
+fn delete_color_preset(hwnd: HWND, index: usize) {
+    let snapshot = {
+        let state = lock_state();
+        state.as_ref().and_then(|s| {
+            s.color_presets.entries().get(index).map(|entry| {
+                (
+                    entry.name.clone(),
+                    s.language == LanguageId::SimplifiedChinese,
+                )
+            })
+        })
+    };
+    let Some((name, chinese)) = snapshot else {
+        return;
+    };
+    let question = if chinese {
+        format!("删除预设“{name}”？当前显示的配色不会改变。")
+    } else {
+        format!("Delete the preset “{name}”? The current colors will not change.")
+    };
+    if !confirm_preset_action(hwnd, chinese, &question) {
+        return;
+    }
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.color_presets.remove(index);
+        }
+    }
+    save_state_settings();
+}
+
 fn show_context_menu(hwnd: HWND) {
     unsafe {
+        let color_presets = {
+            let state = lock_state();
+            state
+                .as_ref()
+                .map(|s| s.color_presets.clone())
+                .unwrap_or_default()
+        };
         let (
             current_interval,
             strings,
@@ -4014,6 +4234,98 @@ fn show_context_menu(hwnd: HWND) {
             },
         );
         let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let codex_colors_menu = CreatePopupMenu().unwrap();
+        for (index, preset) in ColorPreset::ALL.iter().enumerate() {
+            append_appearance_choice(
+                codex_colors_menu,
+                IDM_CODEX_PRESET_FIRST + index as u16,
+                appearance.codex_colors.is_preset(*preset),
+                preset.label(chinese),
+            );
+        }
+        if !color_presets.entries().is_empty() {
+            let _ = AppendMenuW(codex_colors_menu, MF_SEPARATOR, 0, PCWSTR::null());
+            for (index, entry) in color_presets.entries().iter().enumerate() {
+                append_appearance_choice(
+                    codex_colors_menu,
+                    IDM_USER_PRESET_FIRST + index as u16,
+                    appearance.codex_colors == entry.colors,
+                    &entry.name.replace('&', "&&"),
+                );
+            }
+        }
+        let _ = AppendMenuW(codex_colors_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        for (id, label) in [
+            (
+                IDM_CODEX_ICON_COLOR,
+                if chinese {
+                    "图标颜色…"
+                } else {
+                    "Icon color…"
+                },
+            ),
+            (
+                IDM_CODEX_BAR_COLOR,
+                if chinese {
+                    "进度条颜色…"
+                } else {
+                    "Bar color…"
+                },
+            ),
+            (
+                IDM_CODEX_PERCENT_COLOR,
+                if chinese {
+                    "百分比颜色…"
+                } else {
+                    "Percentage color…"
+                },
+            ),
+        ] {
+            let label = native_interop::wide_str(label);
+            let _ = AppendMenuW(
+                codex_colors_menu,
+                MF_STRING,
+                id as usize,
+                PCWSTR(label.as_ptr()),
+            );
+        }
+        let _ = AppendMenuW(codex_colors_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let save_label = native_interop::wide_str(if chinese {
+            "保存当前配色为自定义预设…"
+        } else {
+            "Save current colors as preset…"
+        });
+        let _ = AppendMenuW(
+            codex_colors_menu,
+            MF_STRING,
+            IDM_SAVE_COLOR_PRESET as usize,
+            PCWSTR(save_label.as_ptr()),
+        );
+        if !color_presets.entries().is_empty() {
+            let delete_menu = CreatePopupMenu().unwrap();
+            for (index, entry) in color_presets.entries().iter().enumerate() {
+                append_appearance_choice(
+                    delete_menu,
+                    IDM_DELETE_PRESET_FIRST + index as u16,
+                    false,
+                    &entry.name.replace('&', "&&"),
+                );
+            }
+            append_appearance_submenu(
+                codex_colors_menu,
+                delete_menu,
+                if chinese {
+                    "删除自定义预设"
+                } else {
+                    "Delete custom preset"
+                },
+            );
+        }
+        append_appearance_submenu(
+            appearance_menu,
+            codex_colors_menu,
+            if chinese { "配色" } else { "Colors" },
+        );
         let palette_menu = CreatePopupMenu().unwrap();
         append_appearance_choice(
             palette_menu,
@@ -4049,9 +4361,9 @@ fn show_context_menu(hwnd: HWND) {
             appearance_menu,
             palette_menu,
             if chinese {
-                "文字与颜色"
+                "背景样式"
             } else {
-                "Text and colors"
+                "Background style"
             },
         );
 
@@ -4071,6 +4383,16 @@ fn show_context_menu(hwnd: HWND) {
             IDM_BAR_SEGMENTED,
             appearance.bar_style == BarStyle::Segmented,
             if chinese { "分段" } else { "Segmented" },
+        );
+        append_appearance_choice(
+            style_menu,
+            IDM_BAR_CLASSIC,
+            appearance.bar_style == BarStyle::ClassicSegmented,
+            if chinese {
+                "经典分段（矩形）"
+            } else {
+                "Classic segmented (tiles)"
+            },
         );
         append_appearance_submenu(
             appearance_menu,
@@ -4441,7 +4763,10 @@ fn paint(hdc: HDC, hwnd: HWND) {
 
     let accent = claude_accent_color();
     let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
-    let codex_accent = provider_icons::codex_color(appearance.is_dark(is_dark));
+    let codex_accent = appearance
+        .codex_colors
+        .resolve(appearance.is_dark(is_dark))
+        .bar;
     let antigravity_accent = antigravity_accent_color();
 
     unsafe {
@@ -4532,7 +4857,7 @@ fn draw_row(
     } else {
         *text_color
     };
-    let codex_value_color = provider_icons::codex_color(is_dark);
+    let codex_value_color = appearance.codex_colors.resolve(is_dark).percentage;
     let antigravity_value_color = if use_model_text_colors {
         antigravity_usage_text_color(is_dark)
     } else {
@@ -4643,11 +4968,18 @@ fn draw_usage_bar(
     let seg_h = appearance.bar_height();
     let seg_gap = sc(SEGMENT_GAP);
     let bar_width = segment_count * (seg_w + seg_gap) - seg_gap;
-    let corner_r = seg_h / 2;
+    let corner_r = if appearance.bar_style == BarStyle::ClassicSegmented {
+        sc(2)
+    } else {
+        seg_h / 2
+    };
     let bar_y = y + (appearance.row_height() - seg_h) / 2;
 
     let percent_clamped = usage_bar_fill_percentage(percent, text);
-    if appearance.bar_style == BarStyle::Segmented {
+    if matches!(
+        appearance.bar_style,
+        BarStyle::Segmented | BarStyle::ClassicSegmented
+    ) {
         for i in 0..segment_count {
             let rect = RECT {
                 left: bar_x + i * (seg_w + seg_gap),
@@ -4731,8 +5063,42 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 }
 
 #[cfg(test)]
+#[path = "appearance_preview.rs"]
+mod appearance_preview;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_appearance_keeps_its_style_and_default_codex_colors() {
+        let settings: SettingsFile = serde_json::from_str(
+            r#"{"tray_offset":321,"appearance":{"bar_style":"segmented","font_size":"large"}}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.tray_offset, 321);
+        assert_eq!(settings.appearance.bar_style, BarStyle::Segmented);
+        assert_eq!(settings.appearance.codex_colors, CodexColors::default());
+        assert!(settings.color_presets.entries().is_empty());
+        let mut saved = UserPresets::default();
+        saved
+            .save("Evening rose", CodexColors::from_preset(ColorPreset::Rose))
+            .unwrap();
+        let customized = SettingsFile {
+            color_presets: saved,
+            appearance: Appearance {
+                bar_style: BarStyle::ClassicSegmented,
+                codex_colors: CodexColors::from_preset(ColorPreset::Clay),
+                ..Appearance::default()
+            },
+            ..settings
+        };
+        let json = serde_json::to_string(&customized).unwrap();
+        let restored: SettingsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.appearance, customized.appearance);
+        assert_eq!(restored.color_presets, customized.color_presets);
+        assert_eq!(restored.tray_offset, 321);
+    }
 
     #[test]
     fn unavailable_quota_has_no_bar_fill() {

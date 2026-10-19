@@ -9,7 +9,7 @@
 
 ![Screenshot](.github/animation.gif)
 
-This animation shows the original segmented-bar design. Current builds let you choose segmented or continuous bars in **Appearance**.
+This animation shows the original segmented-bar design. Choose **Classic segmented (tiles)** in **Appearance > Bar style** for rectangular segments, or use the existing segmented and continuous styles.
 
 A lightweight native Windows taskbar widget for monitoring Codex usage, with optional Claude Code and Google Antigravity usage display.
 
@@ -151,6 +151,14 @@ Refresh behavior:
 - Shortly after a quota window resets, the app checks again so the new window shows quickly.
 
 ### Appearance
+
+**Appearance > Colors** offers Original, Terracotta, Rose, Glacier, and Lilac presets. Presets adapt to light and dark backgrounds. Choose **Icon color…**, **Bar color…**, or **Percentage color…** to customize each Codex color independently with the Windows color picker; cancelling leaves settings unchanged. Custom colors are fixed RGB values and do not change with the system theme. Selecting a preset clears the three custom overrides. **Original** restores only Codex colors; **Reset appearance** resets all appearance settings.
+
+These choices affect the Codex mark and quota rows in the taskbar widget, not the notification-area application icon, reset-time text, or other providers. Colors are stored under `appearance.codex_colors` in the existing local settings file. Existing settings retain their original colors and bar style.
+
+Use **Save current colors as preset…**, below the three color pickers, to name and save the current scheme. Saved presets appear directly below the built-in presets in **Appearance > Colors** and survive restarts. Names allow 1–40 characters; up to 32 presets can be saved. Saving an existing name asks before replacing it (name matching ignores case). **Delete custom preset** asks before removing an entry and leaves the currently displayed colors unchanged. Cancelling either dialog makes no changes.
+
+Saved presets retain the base preset and the three independent overrides, so theme-aware base colors keep adapting while manually chosen RGB colors stay fixed. They are stored in the local `color_presets` array. **Original** and **Reset appearance** do not delete this library. See [Appearance customization](docs/appearance-customization.md) for implementation and validation notes.
 
 Right-click the widget or tray icon and open **Appearance** to choose a system, high-contrast dark, or high-contrast light palette; continuous or segmented bars; standard or slim bars; and standard or larger text. High-contrast palettes add a solid backdrop and bold text for readability over translucent taskbars. The **Recommended: translucent dark taskbar** action applies high-contrast dark colors, slim continuous rounded bars, and larger text. The widget also fits its height to the selected taskbar, avoiding clipped rows on 40-pixel taskbars. Appearance choices are saved in `settings.json`; existing settings keep their previous appearance until changed.
 

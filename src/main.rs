@@ -1,10 +1,13 @@
 #![windows_subsystem = "windows"]
 
+mod codex_colors;
+mod color_picker;
 mod diagnose;
 mod localization;
 mod models;
 mod native_interop;
 mod poller;
+mod preset_dialog;
 mod provider_icons;
 mod provider_poll;
 mod quota_refresh;
@@ -16,6 +19,7 @@ mod settings_store;
 mod theme;
 mod tray_icon;
 mod updater;
+mod user_presets;
 mod window;
 
 fn main() {
