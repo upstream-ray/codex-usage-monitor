@@ -6,41 +6,85 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
-  RELEASE_ASSET_NAME: codex-usage.exe
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: '1.99.1'
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          components: rustfmt
+
+      - name: Verify release source
+        shell: pwsh
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to read package metadata.' }
+          $version = ($metadata.packages | Where-Object name -eq 'codex-usage').version
+          if ($env:GITHUB_REF_NAME -cne "v$version") { throw 'Tag does not match Cargo.toml version.' }
+          git merge-base --is-ancestor $env:GITHUB_SHA "origin/$env:DEFAULT_BRANCH"
+          if ($LASTEXITCODE -ne 0) { throw 'Release commit must belong to the default branch.' }
+
+      - name: Check formatting and tests
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'Formatting check failed.' }
+          cargo test --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
+          ./scripts/test-installer.ps1
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Prepare release assets
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/codex-usage.exe dist/codex-usage.exe
-          Copy-Item scripts/install.ps1 dist/install.ps1
-          Copy-Item scripts/uninstall.ps1 dist/uninstall.ps1
+        run: ./scripts/package-release.ps1
 
-          $hash = (Get-FileHash -Algorithm SHA256 dist/codex-usage.exe).Hash.ToLowerInvariant()
-          "$hash  codex-usage.exe" | Set-Content -Encoding ascii dist/codex-usage.exe.sha256
+      - name: Test installation and upgrades in Windows PowerShell 5.1
+        shell: powershell
+        run: ./scripts/test-managed-install.ps1 -PackageDirectory ./dist -ExpectedPSEdition Desktop
+
+      - name: Test installation and upgrades in PowerShell 7
+        shell: pwsh
+        run: ./scripts/test-managed-install.ps1 -PackageDirectory ./dist -ExpectedPSEdition Core
+
+      - name: Attest release provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*
+          create-storage-record: false
+
+      - name: Preserve release package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codex-usage-release-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/codex-usage.exe
-            dist/codex-usage.exe.sha256
-            dist/install.ps1
-            dist/uninstall.ps1
-          generate_release_notes: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = @(Get-ChildItem -File dist | ForEach-Object FullName)
+          gh release create $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --verify-tag --generate-notes @assets
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }

@@ -3,6 +3,8 @@ use super::Strings;
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Bijwerken via WinGet";
 
 pub(super) const STRINGS: Strings = Strings {
+    privacy_information: "Privacy- en update-instellingen…",
+    settings_save_failed: "De instellingen konden niet worden opgeslagen. Wijzigingen gelden alleen totdat de app opnieuw wordt gestart.",
     window_title: "Codex Usage",
     refresh: "Vernieuwen",
     update_frequency: "Updatefrequentie",
@@ -15,6 +17,12 @@ pub(super) const STRINGS: Strings = Strings {
     codex_model: "Codex",
     antigravity_model: "Antigravity",
     settings: "Instellingen",
+    passive_monitoring: "Passieve monitoring",
+    allow_updates: "Updates toestaan",
+    managed_policy: "Beheerd door je organisatie",
+    policy_error: "Het beleid kon niet worden gelezen; passieve monitoring is ingeschakeld en updates zijn uitgeschakeld",
+    sign_in_required: "Meld je opnieuw aan via de CLI van de aanbieder en ververs daarna",
+    passive_monitoring_description: "Passieve monitoring leest alleen gebruiksgegevens. Als je sessie verloopt, meld je dan aan via de CLI van de aanbieder. De monitor stuurt geen prompts naar modellen om de authenticatie te vernieuwen.",
     start_with_windows: "Opstarten met Windows",
     reset_position: "Positie herstellen",
     language: "Taal",

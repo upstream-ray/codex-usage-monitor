@@ -5,6 +5,7 @@ mod localization;
 mod models;
 mod native_interop;
 mod poller;
+mod privacy;
 mod provider_icons;
 mod provider_poll;
 mod quota_refresh;
@@ -20,6 +21,8 @@ mod window;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Applies even to --apply-update, before either helper or UI side effects.
+    privacy::initialize(&args);
     let diagnose_enabled = args.iter().any(|arg| arg == "--diagnose");
     if diagnose_enabled {
         match diagnose::init() {
@@ -39,6 +42,12 @@ fn main() {
                 let _ = error;
             }
         }
+    }
+
+    if privacy::policy().read_error {
+        diagnose::log(
+            "machine policy could not be read; passive monitoring forced and updates disabled",
+        );
     }
 
     if let Some(exit_code) = updater::handle_cli_mode(&args) {

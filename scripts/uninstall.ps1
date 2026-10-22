@@ -7,16 +7,21 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$InstallDirectory = Join-Path $env:LOCALAPPDATA 'Programs\CodexUsage'
+$UserLocalDirectory = [Environment]::GetFolderPath('LocalApplicationData')
+$UserRoamingDirectory = [Environment]::GetFolderPath('ApplicationData')
+if ([string]::IsNullOrWhiteSpace($UserLocalDirectory) -or [string]::IsNullOrWhiteSpace($UserRoamingDirectory)) {
+    throw 'Unable to resolve the Windows user data folders.'
+}
+$InstallDirectory = Join-Path $UserLocalDirectory 'Programs\CodexUsage'
 $ExpectedInstallDirectory = [IO.Path]::GetFullPath($InstallDirectory).TrimEnd('\')
 $TargetPath = Join-Path $ExpectedInstallDirectory 'codex-usage.exe'
-$ShortcutPath = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Codex Usage.lnk'
+$ShortcutPath = Join-Path $UserRoamingDirectory 'Microsoft\Windows\Start Menu\Programs\Codex Usage.lnk'
 $DesktopShortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Codex Usage.lnk'
 $UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexUsage'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-$SettingsDirectory = Join-Path $env:APPDATA 'CodexUsage'
+$SettingsDirectory = Join-Path $UserRoamingDirectory 'CodexUsage'
 
-$AllowedRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Programs')).TrimEnd('\')
+$AllowedRoot = [IO.Path]::GetFullPath((Join-Path $UserLocalDirectory 'Programs')).TrimEnd('\')
 if (-not $ExpectedInstallDirectory.StartsWith($AllowedRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
     throw "Refusing to remove unexpected install directory: $ExpectedInstallDirectory"
 }
@@ -27,7 +32,6 @@ Get-CimInstance Win32_Process -Filter "Name='codex-usage.exe'" -ErrorAction Sile
 
 if (Test-Path -LiteralPath $RunKey) {
     Remove-ItemProperty -Path $RunKey -Name 'CodexUsage' -ErrorAction SilentlyContinue
-    Remove-ItemProperty -Path $RunKey -Name 'ClaudeCodeUsageMonitor' -ErrorAction SilentlyContinue
 }
 
 Remove-Item -LiteralPath $ShortcutPath -Force -ErrorAction SilentlyContinue
@@ -35,7 +39,7 @@ Remove-Item -LiteralPath $DesktopShortcutPath -Force -ErrorAction SilentlyContin
 Remove-Item -LiteralPath $UninstallKey -Recurse -Force -ErrorAction SilentlyContinue
 
 if ($RemoveSettings) {
-    $ExpectedSettingsDirectory = [IO.Path]::GetFullPath((Join-Path $env:APPDATA 'CodexUsage')).TrimEnd('\')
+    $ExpectedSettingsDirectory = [IO.Path]::GetFullPath((Join-Path $UserRoamingDirectory 'CodexUsage')).TrimEnd('\')
     $ResolvedSettingsDirectory = [IO.Path]::GetFullPath($SettingsDirectory).TrimEnd('\')
     if ($ResolvedSettingsDirectory -eq $ExpectedSettingsDirectory) {
         Remove-Item -LiteralPath $ResolvedSettingsDirectory -Recurse -Force -ErrorAction SilentlyContinue

@@ -2,6 +2,7 @@
 use crate::models::{AppUsageData, UsageData};
 use crate::poller::{CredentialWatchMode, CredentialWatchSnapshot, PollError};
 use crate::quota_refresh::{self, History, ResetRefresh};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -11,6 +12,7 @@ pub struct Service {
     pub error: Option<PollError>,
     pub interval_ms: u32,
     enabled: bool,
+    active: Arc<AtomicBool>,
     generation: u64,
     in_flight: Option<u64>,
     next_ticket: u64,
@@ -24,6 +26,7 @@ pub struct Service {
 #[derive(Clone)]
 pub struct Job {
     pub id: usize,
+    active: Arc<AtomicBool>,
     generation: u64,
     ticket: u64,
     forced: bool,
@@ -40,6 +43,21 @@ pub struct Completion {
 }
 pub struct Monitor {
     pub services: [Service; 3],
+}
+
+impl Job {
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+impl Attempt {
+    fn cancelled() -> Self {
+        Self {
+            result: None,
+            auth: None,
+        }
+    }
 }
 
 fn is_auth(error: PollError) -> bool {
@@ -78,6 +96,9 @@ pub fn execute(
     poll: impl FnOnce() -> Result<UsageData, PollError>,
     credentials: impl Fn(CredentialWatchMode) -> CredentialWatchSnapshot,
 ) -> Attempt {
+    if !job.is_active() {
+        return Attempt::cancelled();
+    }
     if !job.forced {
         if let Some((mode, old)) = &job.auth {
             let current = credentials(*mode);
@@ -89,16 +110,25 @@ pub fn execute(
             }
         }
     }
+    if !job.is_active() {
+        return Attempt::cancelled();
+    }
     let result = poll();
-    let auth = result
-        .as_ref()
-        .err()
-        .copied()
-        .filter(|e| is_auth(*e))
-        .map(|error| {
-            let mode = watch_mode(job.id, error);
-            (mode, credentials(mode))
-        });
+    // A provider can be disabled while its HTTP request is pending. Keep the
+    // result for server retry deadlines, but do not read credentials afterward.
+    let auth = if job.is_active() {
+        result
+            .as_ref()
+            .err()
+            .copied()
+            .filter(|e| is_auth(*e))
+            .map(|error| {
+                let mode = watch_mode(job.id, error);
+                (mode, credentials(mode))
+            })
+    } else {
+        None
+    };
     Attempt {
         result: Some(result),
         auth,
@@ -145,6 +175,7 @@ impl Monitor {
                 error: None,
                 interval_ms: 900_000,
                 enabled: enabled[id],
+                active: Arc::new(AtomicBool::new(enabled[id])),
                 generation: 0,
                 in_flight: None,
                 next_ticket: 0,
@@ -160,6 +191,10 @@ impl Monitor {
     pub fn configure(&mut self, enabled: [bool; 3], now: Instant) {
         for (service, enabled) in self.services.iter_mut().zip(enabled) {
             if service.enabled != enabled {
+                // Re-enabling a provider must not revive work planned before
+                // it was disabled. Each selection gets its own cancellation flag.
+                service.active.store(false, Ordering::Release);
+                service.active = Arc::new(AtomicBool::new(enabled));
                 service.enabled = enabled;
                 service.generation = service.generation.wrapping_add(1);
                 service.due = service
@@ -190,6 +225,7 @@ impl Monitor {
                 let forced = std::mem::take(&mut s.forced);
                 Some(Job {
                     id,
+                    active: s.active.clone(),
                     generation: s.generation,
                     ticket: s.next_ticket,
                     forced,
@@ -406,7 +442,103 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::sync::{mpsc, Mutex};
+
+    #[test]
+    fn only_enabled_provider_credentials_are_checked_at_startup_and_recovery() {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let mut monitor = Monitor::new([false, true, false], now);
+        let watched = Cell::new(0);
+        let credentials = |mode| {
+            assert_eq!(mode, CredentialWatchMode::Codex);
+            watched.set(watched.get() + 1);
+            vec!["codex-credential-v1".into()]
+        };
+
+        let jobs = monitor.plan(now);
+        assert_eq!(jobs.iter().map(|job| job.id).collect::<Vec<_>>(), vec![1]);
+        let attempt = execute(&jobs[0], || Err(PollError::AuthRequired), credentials);
+        monitor.finish(&jobs[0], attempt, now, wall, 900_000, true);
+
+        let recovered = now + Duration::from_secs(1);
+        monitor.force(recovered, false);
+        let jobs = monitor.plan(recovered);
+        assert_eq!(jobs.iter().map(|job| job.id).collect::<Vec<_>>(), vec![1]);
+        let attempt = execute(
+            &jobs[0],
+            || panic!("unchanged authentication must remain paused"),
+            credentials,
+        );
+        monitor.finish(&jobs[0], attempt, recovered, wall, 900_000, true);
+        assert_eq!(watched.get(), 2);
+
+        monitor.configure([false, false, false], recovered);
+        monitor.force(recovered, true);
+        assert!(monitor.plan(recovered).is_empty());
+    }
+
+    #[test]
+    fn disabling_provider_cancels_queued_credential_watch_even_after_reenable() {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let mut monitor = Monitor::new([true, false, false], now);
+        let initial = monitor.plan(now).remove(0);
+        complete(
+            &mut monitor,
+            &initial,
+            Err(PollError::NoCredentials),
+            now,
+            wall,
+        );
+        let due = now + Duration::from_secs(900);
+        let queued = monitor.plan(due).remove(0);
+        assert!(matches!(
+            queued.auth,
+            Some((CredentialWatchMode::AllSources, _))
+        ));
+
+        monitor.configure([false, false, false], due);
+        monitor.configure([true, false, false], due);
+        let attempt = execute(
+            &queued,
+            || panic!("obsolete work must not poll a provider"),
+            |_| panic!("obsolete work must not inspect credentials or enumerate WSL"),
+        );
+        assert!(
+            !monitor
+                .finish(&queued, attempt, due, wall, 900_000, true)
+                .accepted
+        );
+
+        let selected = monitor.plan(due).remove(0);
+        assert!(complete(&mut monitor, &selected, Ok(usage(20.0)), due, wall).accepted);
+    }
+
+    #[test]
+    fn disabling_provider_during_request_skips_auth_credential_discovery() {
+        for error in [PollError::AuthRequired, PollError::NoCredentials] {
+            let now = Instant::now();
+            let wall = SystemTime::now();
+            let mut monitor = Monitor::new([true, false, false], now);
+            let job = monitor.plan(now).remove(0);
+            let attempt = execute(
+                &job,
+                || {
+                    monitor.configure([false, true, false], now);
+                    Err(error)
+                },
+                |_| panic!("a disabled provider must not start a credential search"),
+            );
+            assert!(attempt.auth.is_none());
+            assert!(
+                !monitor
+                    .finish(&job, attempt, now, wall, 900_000, true)
+                    .accepted
+            );
+        }
+    }
 
     #[test]
     fn server_retry_deadline_survives_manual_refresh_and_selection_changes() {
@@ -446,16 +578,18 @@ mod tests {
             .into_iter()
             .find(|job| job.id == 0)
             .unwrap();
-        monitor.configure([false, true, false], due);
+        let attempt = execute(
+            &job,
+            || {
+                monitor.configure([false, true, false], due);
+                Err(PollError::RateLimited(Some(120_000)))
+            },
+            |_| panic!("a rate-limit response does not require credential discovery"),
+        );
         assert!(
-            !complete(
-                &mut monitor,
-                &job,
-                Err(PollError::RateLimited(Some(120_000))),
-                due,
-                wall
-            )
-            .accepted
+            !monitor
+                .finish(&job, attempt, due, wall, 900_000, true)
+                .accepted
         );
         monitor.configure([true, true, false], due);
         assert!(monitor.plan(due).iter().all(|job| job.id != 0));

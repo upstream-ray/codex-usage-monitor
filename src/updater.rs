@@ -22,6 +22,19 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const CREATE_NEW_CONSOLE: u32 = 0x00000010;
 // Keep this aligned with the package identifier used in winget-pkgs.
 const WINGET_PACKAGE_ID: &str = "Ray.CodexUsage";
+const UPDATES_DISABLED: &str = "Updates are disabled in Privacy settings. Use your organization's approved installation process.";
+
+fn require_updates_enabled() -> Result<(), String> {
+    require_update_permission(crate::privacy::updates_enabled())
+}
+
+fn require_update_permission(enabled: bool) -> Result<(), String> {
+    if enabled {
+        Ok(())
+    } else {
+        Err(UPDATES_DISABLED.to_string())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstallChannel {
@@ -55,7 +68,26 @@ struct GitHubAsset {
 }
 
 pub fn handle_cli_mode(args: &[String]) -> Option<i32> {
-    if args.len() == 5 && args[1] == "--apply-update" {
+    if args.get(1).map(String::as_str) == Some("--check-update-policy") {
+        // The WinGet child invokes this after waiting for the parent. Use the
+        // same parser and system folders as every other update boundary.
+        return Some(if args.len() == 2 && require_updates_enabled().is_ok() {
+            0
+        } else {
+            1
+        });
+    }
+    if args.get(1).map(String::as_str) == Some("--apply-update") {
+        // This entry point also runs in the staged helper, before the UI starts.
+        // Never allow command-line invocation to bypass the persisted policy.
+        if let Err(error) = require_updates_enabled() {
+            eprintln!("{error}");
+            return Some(1);
+        }
+        if args.len() != 5 {
+            eprintln!("Invalid update helper arguments.");
+            return Some(1);
+        }
         let target = PathBuf::from(&args[2]);
         let source = PathBuf::from(&args[3]);
         let pid = args[4].parse::<u32>().unwrap_or(0);
@@ -80,13 +112,22 @@ pub fn current_install_channel() -> InstallChannel {
 }
 
 pub fn check_for_updates() -> Result<UpdateCheckResult, String> {
-    match fetch_latest_release()? {
+    check_for_updates_with(crate::privacy::updates_enabled(), fetch_latest_release)
+}
+
+fn check_for_updates_with(
+    enabled: bool,
+    fetch: impl FnOnce() -> Result<Option<ReleaseDescriptor>, String>,
+) -> Result<UpdateCheckResult, String> {
+    require_update_permission(enabled)?;
+    match fetch()? {
         Some(release) => Ok(UpdateCheckResult::Available(release)),
         None => Ok(UpdateCheckResult::UpToDate),
     }
 }
 
 pub fn begin_winget_update() -> Result<(), String> {
+    require_updates_enabled()?;
     let current_exe =
         std::env::current_exe().map_err(|e| format!("Unable to locate current executable: {e}"))?;
     let current_dir = current_exe
@@ -98,8 +139,10 @@ pub fn begin_winget_update() -> Result<(), String> {
         &current_dir.to_string_lossy(),
     );
 
+    require_updates_enabled()?;
     Command::new("powershell.exe")
         .arg("-NoLogo")
+        .arg("-NoProfile")
         .arg("-Command")
         .arg(&command)
         .creation_flags(CREATE_NEW_CONSOLE)
@@ -110,6 +153,7 @@ pub fn begin_winget_update() -> Result<(), String> {
 }
 
 pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
+    require_updates_enabled()?;
     let current_exe =
         std::env::current_exe().map_err(|e| format!("Unable to locate current executable: {e}"))?;
     ensure_target_location_writable(&current_exe)?;
@@ -138,6 +182,7 @@ pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
         &partial_download_path,
         &download_path,
     )?;
+    require_updates_enabled()?;
     std::fs::copy(&current_exe, &helper_path)
         .map_err(|e| format!("Unable to prepare updater helper: {e}"))?;
 
@@ -145,6 +190,7 @@ pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
     let target = current_exe.to_string_lossy().to_string();
     let source = download_path.to_string_lossy().to_string();
 
+    require_updates_enabled()?;
     Command::new(&helper_path)
         .arg("--apply-update")
         .arg(target)
@@ -161,6 +207,16 @@ pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
 }
 
 fn apply_update(target: PathBuf, source: PathBuf, pid: u32) -> Result<(), String> {
+    apply_update_with_policy(target, source, pid, crate::privacy::updates_enabled)
+}
+
+fn apply_update_with_policy(
+    target: PathBuf,
+    source: PathBuf,
+    pid: u32,
+    updates_enabled: impl Fn() -> bool,
+) -> Result<(), String> {
+    require_update_permission(updates_enabled())?;
     if !source.exists() {
         return Err(format!(
             "Downloaded update not found at {}",
@@ -169,7 +225,13 @@ fn apply_update(target: PathBuf, source: PathBuf, pid: u32) -> Result<(), String
     }
 
     wait_for_process_exit(pid, Duration::from_secs(30))?;
+    // Recheck after waiting: the user may have disabled updates meanwhile.
+    require_update_permission(updates_enabled())?;
     let backup = replace_target_binary(&target, &source)?;
+    if let Err(error) = require_update_permission(updates_enabled()) {
+        rollback_target_binary(&target, backup.as_deref())?;
+        return Err(error);
+    }
     if let Err(error) = relaunch_target(&target) {
         rollback_target_binary(&target, backup.as_deref())?;
         return Err(error);
@@ -183,10 +245,12 @@ fn apply_update(target: PathBuf, source: PathBuf, pid: u32) -> Result<(), String
 }
 
 fn fetch_latest_release() -> Result<Option<ReleaseDescriptor>, String> {
+    require_updates_enabled()?;
     let (owner, repo) = github_repo()?;
     let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
     let agent = build_agent()?;
 
+    require_updates_enabled()?;
     let response = agent
         .get(&url)
         .set("Accept", GITHUB_API_ACCEPT)
@@ -224,6 +288,7 @@ fn fetch_latest_release() -> Result<Option<ReleaseDescriptor>, String> {
 }
 
 fn fetch_release_checksum(agent: &ureq::Agent, url: &str) -> Result<String, String> {
+    require_updates_enabled()?;
     let response = agent
         .get(url)
         .set("User-Agent", user_agent())
@@ -260,7 +325,9 @@ fn download_release_asset(
     partial_path: &Path,
     final_path: &Path,
 ) -> Result<(), String> {
+    require_updates_enabled()?;
     let agent = build_agent()?;
+    require_updates_enabled()?;
     let response = agent
         .get(url)
         .set("User-Agent", user_agent())
@@ -273,6 +340,11 @@ fn download_release_asset(
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
+        if let Err(error) = require_updates_enabled() {
+            drop(file);
+            let _ = std::fs::remove_file(partial_path);
+            return Err(error);
+        }
         let count = reader
             .read(&mut buffer)
             .map_err(|e| format!("Unable to read the downloaded update: {e}"))?;
@@ -295,6 +367,8 @@ fn download_release_asset(
         ));
     }
 
+    require_updates_enabled()?;
+    drop(file);
     std::fs::rename(partial_path, final_path)
         .map_err(|e| format!("Unable to finalize the downloaded update file: {e}"))?;
 
@@ -440,7 +514,11 @@ fn winget_upgrade_command(pid: u32, target: &str, working_dir: &str) -> String {
             "$pidToWait = {pid}; ",
             "$target = '{target}'; ",
             "$workingDir = '{working_dir}'; ",
-            "try {{ Wait-Process -Id $pidToWait -Timeout 30 -ErrorAction Stop }} catch {{ }}; ",
+            "try {{ Wait-Process -Id $pidToWait -Timeout 30 -ErrorAction Stop }} ",
+            "catch {{ if (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) {{ throw }} }}; ",
+            "$policyCheck = Start-Process -FilePath $target -ArgumentList '--check-update-policy' ",
+            "-WorkingDirectory $workingDir -WindowStyle Hidden -Wait -PassThru; ",
+            "if ($policyCheck.ExitCode -ne 0) {{ throw 'Updates are disabled or policy could not be read.' }}; ",
             "winget upgrade --id {package_id} --exact; ",
             "$exitCode = $LASTEXITCODE; ",
             "if ($exitCode -eq 0) {{ ",
@@ -597,6 +675,7 @@ fn wide_str(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_directory(name: &str) -> PathBuf {
@@ -618,6 +697,83 @@ mod tests {
             hash.to_ascii_uppercase()
         );
         assert!(parse_release_checksum("not-a-checksum").is_err());
+    }
+
+    #[test]
+    fn disabled_updates_do_not_invoke_release_http_client() {
+        let requests = Cell::new(0);
+        let result = check_for_updates_with(false, || {
+            requests.set(requests.get() + 1);
+            Ok(None)
+        });
+        assert_eq!(result.unwrap_err(), UPDATES_DISABLED);
+        assert_eq!(requests.get(), 0);
+    }
+
+    #[test]
+    fn enabled_update_check_invokes_client_once() {
+        let requests = Cell::new(0);
+        let result = check_for_updates_with(true, || {
+            requests.set(requests.get() + 1);
+            Ok(None)
+        });
+        assert!(matches!(result, Ok(UpdateCheckResult::UpToDate)));
+        assert_eq!(requests.get(), 1);
+    }
+
+    #[test]
+    fn disabled_staged_update_leaves_binaries_untouched() {
+        let directory = test_directory("disabled-apply");
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("codex-usage.exe");
+        let source = directory.join("download.exe");
+        std::fs::write(&target, b"approved-version").unwrap();
+        std::fs::write(&source, b"staged-update").unwrap();
+
+        let error =
+            apply_update_with_policy(target.clone(), source.clone(), 0, || false).unwrap_err();
+
+        assert_eq!(error, UPDATES_DISABLED);
+        assert_eq!(std::fs::read(&target).unwrap(), b"approved-version");
+        assert_eq!(std::fs::read(&source).unwrap(), b"staged-update");
+        assert!(!backup_path_for(&target).exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn disabling_updates_during_apply_restores_approved_binary() {
+        let directory = test_directory("disable-during-apply");
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("codex-usage.exe");
+        let source = directory.join("download.exe");
+        std::fs::write(&target, b"approved-version").unwrap();
+        std::fs::write(&source, b"staged-update").unwrap();
+        let policy_reads = Cell::new(0);
+
+        let error = apply_update_with_policy(target.clone(), source.clone(), 0, || {
+            policy_reads.set(policy_reads.get() + 1);
+            policy_reads.get() < 3
+        })
+        .unwrap_err();
+
+        assert_eq!(error, UPDATES_DISABLED);
+        assert_eq!(policy_reads.get(), 3);
+        assert_eq!(std::fs::read(&target).unwrap(), b"approved-version");
+        assert_eq!(std::fs::read(&source).unwrap(), b"staged-update");
+        assert!(!backup_path_for(&target).exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn winget_child_rechecks_policy_after_parent_exits_before_upgrade() {
+        let command = winget_upgrade_command(42, r"C:\O'Brien\codex-usage.exe", r"C:\O'Brien");
+        let wait = command.find("Wait-Process").unwrap();
+        let check = command.find("--check-update-policy").unwrap();
+        let denied = command.find("$policyCheck.ExitCode -ne 0").unwrap();
+        let upgrade = command.find("winget upgrade").unwrap();
+        assert!(wait < check && check < denied && denied < upgrade);
+        assert!(command.contains("-Wait -PassThru"));
+        assert!(command.contains(r"C:\O''Brien\codex-usage.exe"));
     }
 
     #[test]
@@ -651,7 +807,7 @@ mod tests {
         std::fs::write(&target, b"known-good-version").unwrap();
         std::fs::write(&source, b"not-a-windows-executable").unwrap();
 
-        let error = apply_update(target.clone(), source, 0).unwrap_err();
+        let error = apply_update_with_policy(target.clone(), source, 0, || true).unwrap_err();
 
         assert!(error.contains("restarted") || error.contains("start"));
         assert_eq!(std::fs::read(&target).unwrap(), b"known-good-version");

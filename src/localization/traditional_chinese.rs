@@ -3,6 +3,8 @@ use super::Strings;
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "透過 WinGet 更新";
 
 pub(super) const STRINGS: Strings = Strings {
+    privacy_information: "隱私與更新控制…",
+    settings_save_failed: "無法儲存設定。變更僅在應用程式重新啟動前有效。",
     window_title: "Codex Usage",
     refresh: "重新整理",
     update_frequency: "更新頻率",
@@ -15,6 +17,12 @@ pub(super) const STRINGS: Strings = Strings {
     codex_model: "Codex",
     antigravity_model: "Antigravity",
     settings: "設定",
+    passive_monitoring: "被動監控",
+    allow_updates: "允許更新",
+    managed_policy: "由你的組織管理",
+    policy_error: "無法讀取原則；已啟用被動監控並停用更新",
+    sign_in_required: "請在服務供應商的 CLI 中重新登入，然後重新整理",
+    passive_monitoring_description: "被動監控僅讀取使用量。工作階段到期時，請透過服務供應商的 CLI 登入。監控工具不會透過向模型傳送提示詞來更新登入憑證。",
     start_with_windows: "開機時啟動",
     reset_position: "重置位置",
     language: "語言",

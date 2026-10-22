@@ -3,6 +3,8 @@ use super::Strings;
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "WinGet で更新";
 
 pub(super) const STRINGS: Strings = Strings {
+    privacy_information: "プライバシーと更新の設定…",
+    settings_save_failed: "設定を保存できませんでした。変更はアプリを再起動するまで有効です。",
     window_title: "Codex Usage",
     refresh: "更新",
     update_frequency: "更新間隔",
@@ -15,6 +17,12 @@ pub(super) const STRINGS: Strings = Strings {
     codex_model: "Codex",
     antigravity_model: "Antigravity",
     settings: "設定",
+    passive_monitoring: "パッシブモニタリング",
+    allow_updates: "更新を許可",
+    managed_policy: "組織によって管理されています",
+    policy_error: "ポリシーを読み取れませんでした。パッシブモニタリングは有効、更新は無効になっています",
+    sign_in_required: "プロバイダーの CLI で再度サインインしてから、更新してください",
+    passive_monitoring_description: "パッシブモニタリングでは使用状況の読み取りのみを行います。セッションの有効期限が切れた場合は、プロバイダーの CLI からサインインしてください。認証を更新するためにモデルへのプロンプトを実行することはありません。",
     start_with_windows: "Windows と同時に開始",
     reset_position: "位置をリセット",
     language: "言語",

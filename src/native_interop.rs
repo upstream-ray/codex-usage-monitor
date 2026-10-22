@@ -1,9 +1,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, FILETIME, HWND, LPARAM, RECT, SYSTEMTIME};
+use windows::core::{Error, Result, PCWSTR};
+use windows::Win32::Foundation::{
+    GetLastError, SetLastError, BOOL, COLORREF, ERROR_SUCCESS, E_FAIL, E_INVALIDARG, FILETIME,
+    HWND, LPARAM, POINT, RECT, SYSTEMTIME,
+};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, MapWindowPoints, MonitorFromPoint, MONITORINFO, MONITORINFOEXW,
+    MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -172,37 +176,469 @@ pub fn get_window_rect_safe(hwnd: HWND) -> Option<RECT> {
     }
 }
 
-/// Embed our window as a child of the taskbar
-pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
+/// Convert a desktop point using the actual parent client origin. Subtracting
+/// a taskbar's outer RECT is incorrect when its client area has a border offset.
+pub fn screen_to_client_point(hwnd: HWND, point: POINT) -> Option<POINT> {
     unsafe {
-        // Preserve existing extended style, add tool window + no activate
-        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-        // Reset alpha mode used by the startup popup fallback before switching
-        // back to UpdateLayeredWindow rendering inside the taskbar.
-        if ex_style & WS_EX_LAYERED.0 as i32 != 0 {
-            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style & !(WS_EX_LAYERED.0 as i32));
+        if !IsWindow(hwnd).as_bool() {
+            return None;
         }
-        let _ = SetWindowLongW(
-            hwnd,
-            GWL_EXSTYLE,
-            ex_style | WS_EX_TOOLWINDOW.0 as i32 | WS_EX_NOACTIVATE.0 as i32,
+        let mut points = [point];
+        SetLastError(ERROR_SUCCESS);
+        let offset = MapWindowPoints(HWND::default(), hwnd, &mut points);
+        // A zero offset is also a successful mapping at the desktop origin.
+        if offset == 0 && GetLastError() != ERROR_SUCCESS {
+            None
+        } else {
+            Some(points[0])
+        }
+    }
+}
+
+/// Find the notification/clock area on this taskbar, including nested primary
+/// trays and secondary clocks. Unknown layouts return None rather than claiming
+/// that the full right edge is available to the widget.
+pub fn taskbar_notification_rect(taskbar_hwnd: HWND) -> Option<RECT> {
+    struct Search {
+        taskbar: RECT,
+        notification: Option<RECT>,
+    }
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = &mut *(lparam.0 as *mut Search);
+        if !IsWindowVisible(hwnd).as_bool() {
+            return BOOL(1);
+        }
+        let mut class_name = [0u16; 128];
+        let len = GetClassNameW(hwnd, &mut class_name);
+        if len > 0 {
+            let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
+            if let Some(rect) = get_window_rect_safe(hwnd)
+                .and_then(|rect| notification_candidate_rect(search.taskbar, &class_name, rect))
+            {
+                search.notification = Some(match search.notification {
+                    Some(previous) => RECT {
+                        left: previous.left.min(rect.left),
+                        top: previous.top.min(rect.top),
+                        right: previous.right.max(rect.right),
+                        bottom: previous.bottom.max(rect.bottom),
+                    },
+                    None => rect,
+                });
+            }
+        }
+        BOOL(1)
+    }
+
+    let mut search = Search {
+        taskbar: get_window_rect_safe(taskbar_hwnd)?,
+        notification: None,
+    };
+    unsafe {
+        // EnumChildWindows visits descendants as well as direct children.
+        let _ = EnumChildWindows(
+            taskbar_hwnd,
+            Some(enum_proc),
+            LPARAM(&mut search as *mut _ as isize),
         );
+    }
+    search.notification
+}
 
-        // Change from popup to child
-        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-        let new_style = (style & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE;
-        let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
+fn notification_candidate_rect(taskbar: RECT, class_name: &str, child: RECT) -> Option<RECT> {
+    let rect = RECT {
+        left: taskbar.left.max(child.left),
+        top: taskbar.top.max(child.top),
+        right: taskbar.right.min(child.right),
+        bottom: taskbar.bottom.min(child.bottom),
+    };
+    if rect.left >= rect.right || rect.top >= rect.bottom {
+        return None;
+    }
+    match class_name {
+        "TrayNotifyWnd" | "TrayClockWClass" | "ClockButton" => Some(rect),
+        // Some Windows 11 secondary taskbars expose a distinct composition
+        // window for the clock. Reject the full-taskbar composition canvas and
+        // centered task-button hosts; only accept a narrow right-edge region.
+        "Windows.UI.Composition.DesktopWindowContentBridge"
+            if rect.left > taskbar.left + (taskbar.right - taskbar.left) / 2
+                && rect.right == taskbar.right =>
+        {
+            Some(rect)
+        }
+        _ => None,
+    }
+}
 
-        let _ = SetParent(hwnd, taskbar_hwnd);
+fn set_window_style(hwnd: HWND, index: WINDOW_LONG_PTR_INDEX, style: i32) -> Result<()> {
+    unsafe {
+        SetLastError(ERROR_SUCCESS);
+        let previous = SetWindowLongW(hwnd, index, style);
+        if previous == 0 && GetLastError() != ERROR_SUCCESS {
+            Err(Error::from_win32())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Embed our window as a child of the taskbar. Preserve an existing layered
+/// child's backing image across display changes, and leave the old attachment
+/// intact if native reparenting or its final positioning fails.
+pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) -> Result<()> {
+    embed_in_taskbar_with(hwnd, taskbar_hwnd, |hwnd, was_visible| unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )?;
+        if was_visible {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        Ok(())
+    })
+}
+
+fn embed_in_taskbar_with(
+    hwnd: HWND,
+    taskbar_hwnd: HWND,
+    finish: impl FnOnce(HWND, bool) -> Result<()>,
+) -> Result<()> {
+    unsafe {
+        if hwnd == taskbar_hwnd || !IsWindow(hwnd).as_bool() || !IsWindow(taskbar_hwnd).as_bool() {
+            return Err(Error::new(
+                E_INVALIDARG,
+                "The widget or target taskbar is unavailable.",
+            ));
+        }
+        let original_style = GetWindowLongW(hwnd, GWL_STYLE);
+        let original_ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        let original_parent = GetParent(hwnd).unwrap_or_default();
+        let original_rect = get_window_rect_safe(hwnd);
+        let was_visible = original_style as u32 & WS_VISIBLE.0 != 0;
+        let was_child = original_style as u32 & WS_CHILD_STYLE != 0;
+        let reset_alpha_mode = !was_child && original_ex_style as u32 & WS_EX_LAYERED.0 != 0;
+        let mut original_color_key = COLORREF(0);
+        let mut original_alpha = 0;
+        let mut original_alpha_flags = LAYERED_WINDOW_ATTRIBUTES_FLAGS(0);
+        let restore_alpha = reset_alpha_mode
+            && GetLayeredWindowAttributes(
+                hwnd,
+                Some(&mut original_color_key),
+                Some(&mut original_alpha),
+                Some(&mut original_alpha_flags),
+            )
+            .is_ok();
+
+        let result = (|| {
+            // The startup fallback uses SetLayeredWindowAttributes. Its mode
+            // must be reset before UpdateLayeredWindow; child-to-child display
+            // changes must not discard the existing per-pixel backing image.
+            if reset_alpha_mode {
+                set_window_style(
+                    hwnd,
+                    GWL_EXSTYLE,
+                    original_ex_style & !(WS_EX_LAYERED.0 as i32),
+                )?;
+            }
+            set_window_style(
+                hwnd,
+                GWL_EXSTYLE,
+                original_ex_style | WS_EX_TOOLWINDOW.0 as i32 | WS_EX_NOACTIVATE.0 as i32,
+            )?;
+            let child_style =
+                (original_style as u32 & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE;
+            set_window_style(hwnd, GWL_STYLE, child_style as i32)?;
+
+            SetLastError(ERROR_SUCCESS);
+            let reparented = SetParent(hwnd, taskbar_hwnd);
+            let parent_error = GetLastError();
+            // SetParent returns the PREVIOUS parent, which can legitimately be
+            // null on first attachment. Verify the resulting parent directly.
+            if GetParent(hwnd).ok() != Some(taskbar_hwnd) {
+                return Err(if parent_error != ERROR_SUCCESS {
+                    Error::from_hresult(windows::core::HRESULT::from_win32(parent_error.0))
+                } else {
+                    reparented.err().unwrap_or_else(|| {
+                        Error::new(E_FAIL, "The widget did not attach to the selected taskbar.")
+                    })
+                });
+            }
+            finish(hwnd, was_visible)
+        })();
+
+        if result.is_err() {
+            let _ = SetParent(hwnd, original_parent);
+            let _ = set_window_style(hwnd, GWL_STYLE, original_style);
+            let _ = set_window_style(hwnd, GWL_EXSTYLE, original_ex_style);
+            if restore_alpha {
+                let _ = SetLayeredWindowAttributes(
+                    hwnd,
+                    original_color_key,
+                    original_alpha,
+                    original_alpha_flags,
+                );
+            }
+            if let Some(rect) = original_rect {
+                let point = POINT {
+                    x: rect.left,
+                    y: rect.top,
+                };
+                let point = if was_child {
+                    screen_to_client_point(original_parent, point)
+                } else {
+                    Some(point)
+                };
+                if let Some(point) = point {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        HWND::default(),
+                        point.x,
+                        point.y,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                    );
+                }
+            }
+            let _ = ShowWindow(
+                hwnd,
+                if was_visible {
+                    SW_SHOWNOACTIVATE
+                } else {
+                    SW_HIDE
+                },
+            );
+        }
+        result
     }
 }
 
 #[cfg(test)]
 mod attachment_tests {
     use super::*;
+    use std::sync::Once;
     use windows::core::w;
-    use windows::Win32::Foundation::{COLORREF, POINT, SIZE};
+    use windows::Win32::Foundation::{COLORREF, HINSTANCE, LRESULT, POINT, SIZE, WPARAM};
     use windows::Win32::Graphics::Gdi::*;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+
+    struct TestWindow(HWND);
+
+    unsafe extern "system" fn test_window_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        DefWindowProcW(hwnd, message, wparam, lparam)
+    }
+
+    impl TestWindow {
+        fn new(class_name: &str, parent: Option<HWND>, rect: RECT, visible: bool) -> Self {
+            static REGISTER_CLASSES: Once = Once::new();
+            REGISTER_CLASSES.call_once(|| unsafe {
+                let instance = HINSTANCE(GetModuleHandleW(None).unwrap().0);
+                for name in ["TrayNotifyWnd", "TrayClockWClass", "ClockButton"] {
+                    let name = wide_str(name);
+                    let class = WNDCLASSW {
+                        lpfnWndProc: Some(test_window_proc),
+                        hInstance: instance,
+                        lpszClassName: PCWSTR(name.as_ptr()),
+                        ..Default::default()
+                    };
+                    assert_ne!(RegisterClassW(&class), 0);
+                }
+            });
+            unsafe {
+                let class_name = wide_str(class_name);
+                let style = if parent.is_some() { WS_CHILD } else { WS_POPUP }
+                    | if visible { WS_VISIBLE } else { WINDOW_STYLE(0) };
+                Self(
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE(0),
+                        PCWSTR(class_name.as_ptr()),
+                        w!("taskbar-boundary-test"),
+                        style,
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        parent.unwrap_or_default(),
+                        None,
+                        HINSTANCE(GetModuleHandleW(None).unwrap().0),
+                        None,
+                    )
+                    .unwrap(),
+                )
+            }
+        }
+    }
+
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+
+    fn rect(left: i32, top: i32, width: i32, height: i32) -> RECT {
+        RECT {
+            left,
+            top,
+            right: left + width,
+            bottom: top + height,
+        }
+    }
+
+    #[test]
+    fn discovers_nested_primary_tray_without_hidden_or_outside_children() {
+        let parent = TestWindow::new("STATIC", None, rect(50, 100, 1_000, 50), true);
+        let nested = TestWindow::new("STATIC", Some(parent.0), rect(800, 0, 200, 50), true);
+        let tray = TestWindow::new("TrayNotifyWnd", Some(nested.0), rect(20, 0, 180, 50), true);
+        let _clock = TestWindow::new("TrayClockWClass", Some(tray.0), rect(100, 0, 80, 50), true);
+        let _hidden = TestWindow::new("ClockButton", Some(parent.0), rect(0, 0, 90, 50), false);
+        let _outside = TestWindow::new("ClockButton", Some(parent.0), rect(1_050, 0, 90, 50), true);
+
+        assert_eq!(
+            taskbar_notification_rect(parent.0),
+            get_window_rect_safe(tray.0)
+        );
+    }
+
+    #[test]
+    fn secondary_taskbar_clock_is_detected_at_negative_desktop_origin() {
+        let parent = TestWindow::new("STATIC", None, rect(-1_600, 400, 1_400, 40), true);
+        let clock = TestWindow::new("ClockButton", Some(parent.0), rect(1_280, 0, 120, 40), true);
+        let unrelated = TestWindow::new("STATIC", None, rect(0, 400, 1_000, 40), true);
+        let _other_clock = TestWindow::new(
+            "ClockButton",
+            Some(unrelated.0),
+            rect(800, 0, 200, 40),
+            true,
+        );
+
+        assert_eq!(
+            taskbar_notification_rect(parent.0),
+            get_window_rect_safe(clock.0)
+        );
+        assert_eq!(taskbar_notification_rect(parent.0).unwrap().left, -320);
+    }
+
+    #[test]
+    fn composition_detection_rejects_the_full_taskbar_and_centered_app_canvas() {
+        let taskbar = rect(-1_200, 900, 1_200, 48);
+        let class = "Windows.UI.Composition.DesktopWindowContentBridge";
+        assert!(notification_candidate_rect(taskbar, class, taskbar).is_none());
+        assert!(notification_candidate_rect(taskbar, class, rect(-800, 900, 400, 48)).is_none());
+        assert!(
+            notification_candidate_rect(taskbar, "ClockButton", rect(20, 900, 120, 48)).is_none()
+        );
+        assert_eq!(
+            notification_candidate_rect(taskbar, class, rect(-140, 900, 140, 48)),
+            Some(rect(-140, 900, 140, 48))
+        );
+    }
+
+    #[test]
+    fn screen_mapping_uses_client_origin_and_handles_a_zero_offset() {
+        let parent = TestWindow::new("STATIC", None, rect(-900, -100, 300, 180), true);
+        unsafe {
+            let style = GetWindowLongW(parent.0, GWL_STYLE) | WS_BORDER.0 as i32;
+            set_window_style(parent.0, GWL_STYLE, style).unwrap();
+            SetWindowPos(
+                parent.0,
+                HWND::default(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            .unwrap();
+        }
+        let child = TestWindow::new("STATIC", Some(parent.0), rect(17, 9, 20, 10), true);
+        let child_rect = get_window_rect_safe(child.0).unwrap();
+        assert_eq!(
+            screen_to_client_point(
+                parent.0,
+                POINT {
+                    x: child_rect.left,
+                    y: child_rect.top
+                }
+            ),
+            Some(POINT { x: 17, y: 9 })
+        );
+
+        let origin = TestWindow::new("STATIC", None, rect(0, 0, 20, 20), false);
+        assert_eq!(
+            screen_to_client_point(origin.0, POINT::default()),
+            Some(POINT::default())
+        );
+        assert!(screen_to_client_point(HWND::default(), POINT::default()).is_none());
+    }
+
+    #[test]
+    fn display_switch_keeps_visible_child_and_failed_switch_restores_attachment() {
+        let first = TestWindow::new("STATIC", None, rect(-900, 100, 400, 100), true);
+        let second = TestWindow::new("STATIC", None, rect(800, 250, 400, 100), true);
+        let widget = TestWindow::new("STATIC", None, rect(-880, 120, 100, 30), true);
+        unsafe {
+            set_window_style(widget.0, GWL_EXSTYLE, WS_EX_LAYERED.0 as i32).unwrap();
+            SetLayeredWindowAttributes(widget.0, COLORREF(0), 255, LWA_ALPHA).unwrap();
+        }
+        embed_in_taskbar(widget.0, first.0).unwrap();
+        // Layer state is an observable sentinel for clearing WS_EX_LAYERED.
+        // The startup transition must reset its old mode; later display
+        // switches must preserve a child's existing composition state.
+        unsafe {
+            SetLayeredWindowAttributes(widget.0, COLORREF(0), 173, LWA_ALPHA).unwrap();
+        }
+        embed_in_taskbar(widget.0, second.0).unwrap();
+        unsafe {
+            assert_eq!(GetParent(widget.0).unwrap(), second.0);
+            assert!(IsWindowVisible(widget.0).as_bool());
+            let mut alpha = 0;
+            GetLayeredWindowAttributes(widget.0, None, Some(&mut alpha), None).unwrap();
+            assert_eq!(
+                alpha, 173,
+                "display changes must retain the child's layer state"
+            );
+            let original_style = GetWindowLongW(widget.0, GWL_STYLE);
+            let original_ex_style = GetWindowLongW(widget.0, GWL_EXSTYLE);
+            let original_rect = get_window_rect_safe(widget.0);
+            // Simulate the final native positioning step failing after the
+            // parent has changed. The existing visible attachment must survive.
+            let failed = embed_in_taskbar_with(widget.0, first.0, |_, _| {
+                Err(Error::new(E_FAIL, "injected positioning failure"))
+            });
+            assert!(failed.is_err());
+            assert_eq!(GetParent(widget.0).unwrap(), second.0);
+            assert_eq!(GetWindowLongW(widget.0, GWL_STYLE), original_style);
+            assert_eq!(GetWindowLongW(widget.0, GWL_EXSTYLE), original_ex_style);
+            assert_eq!(get_window_rect_safe(widget.0), original_rect);
+            assert!(IsWindowVisible(widget.0).as_bool());
+
+            assert!(embed_in_taskbar(widget.0, HWND::default()).is_err());
+            assert_eq!(GetParent(widget.0).unwrap(), second.0);
+        }
+    }
+
+    #[test]
+    fn attaching_hidden_widget_does_not_override_user_visibility() {
+        let parent = TestWindow::new("STATIC", None, rect(80, 100, 400, 100), true);
+        let widget = TestWindow::new("STATIC", None, rect(0, 0, 100, 30), false);
+        embed_in_taskbar(widget.0, parent.0).unwrap();
+        unsafe {
+            assert_eq!(GetParent(widget.0).unwrap(), parent.0);
+            assert_eq!(GetWindowLongW(widget.0, GWL_STYLE) as u32 & WS_VISIBLE.0, 0);
+        }
+    }
 
     #[test]
     fn startup_popup_can_switch_to_layered_child_rendering() {
@@ -238,7 +674,7 @@ mod attachment_tests {
             )
             .unwrap();
             SetLayeredWindowAttributes(child, COLORREF(0), 255, LWA_ALPHA).unwrap();
-            embed_in_taskbar(child, parent);
+            embed_in_taskbar(child, parent).unwrap();
             assert_eq!(GetParent(child).unwrap(), parent);
             let dc = CreateCompatibleDC(None);
             let info = BITMAPINFO {
@@ -285,13 +721,6 @@ mod attachment_tests {
                 "fallback alpha mode must not prevent taskbar rendering: {rendered:?}"
             );
         }
-    }
-}
-
-/// Move the window
-pub fn move_window(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
-    unsafe {
-        let _ = MoveWindow(hwnd, x, y, w, h, true);
     }
 }
 

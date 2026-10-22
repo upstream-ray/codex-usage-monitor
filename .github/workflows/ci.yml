@@ -1,0 +1,57 @@
+name: Windows build and tests
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: '1.99.1'
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      # Action revisions verified against their publishers' GitHub repositories.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test with locked dependencies
+        run: cargo test --locked
+      - name: Validate installer boundaries
+        shell: pwsh
+        run: ./scripts/test-installer.ps1
+      - name: Build portable executable
+        run: cargo build --release --locked
+      - name: Prepare verifiable package
+        shell: pwsh
+        run: ./scripts/package-release.ps1
+      - name: Test installation and upgrades in Windows PowerShell 5.1
+        shell: powershell
+        run: ./scripts/test-managed-install.ps1 -PackageDirectory ./dist -ExpectedPSEdition Desktop
+      - name: Test installation and upgrades in PowerShell 7
+        shell: pwsh
+        run: ./scripts/test-managed-install.ps1 -PackageDirectory ./dist -ExpectedPSEdition Core
+      - name: Upload Windows package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codex-usage-windows-x64-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

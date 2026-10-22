@@ -36,12 +36,14 @@
 - 各服务独立刷新和重试；刷新失败时保留上次的数字并标记 `*`
 - 鼠标悬停在服务列上，可查看上次成功更新时间、下次刷新时间和错误原因
 - 电脑从睡眠中唤醒或网络恢复后自动刷新
+- 默认启用被动监控，登录失效时通过服务商自己的登录流程恢复
+- 可通过受管策略强制启用被动监控并禁用软件更新
 
 ## 适用人群
 
-本应用适合已经在 Windows 上**安装并登录 Codex CLI 或 Codex 应用**的用户。
+本应用适合在 Windows 上使用 **Codex ChatGPT 登录，且登录信息保存在受支持的本地凭据文件中**的用户。安装前请查看[账户支持](#账户支持)。
 
-Codex 默认启用，应用会读取 Codex 使用的同一份本地登录凭据。
+Codex 默认启用。监控器复用受支持的凭据文件，不提供独立的登录流程。
 
 Antigravity 也是可选功能。若要显示其用量，请安装并登录 Google Antigravity，然后在右键菜单的**监控服务**中启用 **Antigravity**。
 
@@ -50,7 +52,7 @@ Antigravity 也是可选功能。若要显示其用量，请安装并登录 Goog
 ## 系统要求
 
 - Windows 10 或 Windows 11
-- 已安装并完成身份验证的 Codex CLI 或 Codex 应用
+- 使用[受支持的文件身份验证](#账户支持)的 Codex CLI 或应用 ChatGPT 登录
 - 可选：已安装并完成身份验证的 Claude Code
 - 可选：若需查看 Antigravity 用量，需安装并登录 Google Antigravity
 
@@ -60,18 +62,20 @@ Antigravity 也是可选功能。若要显示其用量，请安装并登录 Goog
 
 ## 安装
 
-如需按用户安装，请从[最新版本](https://github.com/upstream-ray/codex-usage-monitor/releases/latest)下载 `install.ps1`，然后运行：
+如需按用户安装，请从[最新版本](https://github.com/upstream-ray/codex-usage-monitor/releases/latest)下载 `install.ps1`，按[发布验证指南](docs/release-verification.md)验证后运行：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+powershell.exe -NoProfile -File .\install.ps1
 ```
 
-安装程序会校验发布文件的 SHA256，并在无需管理员权限的情况下安装到 `%LOCALAPPDATA%\Programs\CodexUsage`。它还会创建开始菜单快捷方式，并在 Windows“已安装的应用”中添加卸载项。
+安装程序会校验可执行文件及卸载脚本的 SHA256，并在无需管理员权限的情况下安装到 `%LOCALAPPDATA%\Programs\CodexUsage`。它还会创建开始菜单快捷方式，并在 Windows“已安装的应用”中添加卸载项。安装过程遵守设备的 PowerShell 执行策略。
+
+使用公司管理的账户时，请采用[受管安装配置](docs/installation.md#managed-installation)，从本地安装已批准的可执行文件并提供已批准的哈希。此配置会在首次启动前启用被动监控并禁用更新。管理员还可以通过[设备策略](docs/managed-policy.md)强制实施这些限制。
 
 如需便携使用，可从同一版本页面下载 `codex-usage.exe`，放在任意具有写入权限的目录中运行。你也可以在本地构建：
 
 ```powershell
-cargo build --release
+cargo build --release --locked
 ```
 
 本地构建的可执行文件位于 `target\release\codex-usage.exe`。
@@ -81,7 +85,7 @@ cargo build --release
 可在 Windows“设置”>“应用”>“已安装的应用”中卸载 **Codex Usage**，或运行：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\CodexUsage\uninstall.ps1"
+powershell.exe -NoProfile -File "$env:LOCALAPPDATA\Programs\CodexUsage\uninstall.ps1"
 ```
 
 卸载时会保留 `%APPDATA%\CodexUsage\settings.json`。如需同时删除设置，请显式添加 `-RemoveSettings`。有关升级、便携版和开机启动的说明，请参阅[安装机制](docs/installation.md)。
@@ -108,12 +112,24 @@ codex-usage
 通过右键菜单中的**监控服务**选择组件要显示的独立服务。这些服务不是互斥模型，因此可以同时监控多个账户：
 
 - **Codex** 默认启用
-- **Claude Code** 在已安装并登录 Claude Code CLI 时，可与 Codex 同时显示或单独显示
+- **Claude Code** 可与 Codex 同时显示或单独显示
 - **Antigravity** 可与其他提供商同时显示，也可作为独立服务列单独显示
 
 显示多个服务时，每个服务都有自己的用量条和对应的文字颜色。Antigravity 会优先使用 Google 的 Gemini 配额摘要，必要时回退到模型配额数据。
 
-Claude 桌面客户端与 Claude Code CLI 使用相互独立的本地登录状态。只登录 Claude 桌面客户端不会启用 Claude Code 监控。检测不到受支持的 Claude Code CLI 凭据时，菜单会以禁用状态显示 **Claude Code（需登录 CLI）**，并自动关闭该服务。
+应用先加载服务选择，再发现凭据。未启用的服务不会触发凭据文件、凭据存储或 WSL 凭据探测。也可以关闭所有服务；此选择会被保存，重新启用服务之前不会轮询用量。
+
+Claude 桌面客户端与 Claude Code CLI 使用相互独立的本地登录状态。只登录 Claude 桌面客户端不会启用 Claude Code 监控。没有 CLI 登录时仍可选择 Claude Code。已启用的服务缺少有效凭据时，其服务列显示 `!`，悬停提示会说明如何登录；应用不会自动关闭该服务。请通过服务商自己的应用或 CLI 登录，然后选择**刷新**。
+
+### 被动监控与软件更新
+
+**设置 → 被动监控**默认开启，旧设置中没有此字段时也会开启。监控器只使用已启用服务的现有凭据查询用量，不会通过运行模型提示来恢复登录，也不会为了获取备用速率限制响应头而提交模型请求。凭据缺失、过期或被拒绝时，应用显示重新登录提示，并暂停该服务的自动重试，直到凭据改变或你手动刷新。
+
+普通安装默认开启**设置 → 允许更新**。开启后，应用约每天自动向 GitHub 检查一次新版本，并允许手动检查和安装更新。关闭后，应用会阻止更新检查、下载、WinGet 更新和已暂存的自更新，仍然显示当前安装版本。[受管安装程序](docs/installation.md#managed-installation)会在首次启动前关闭此选项。
+
+这两个选项保存在 `%APPDATA%\CodexUsage\settings.json`。菜单中的更改会在下一次相关操作时生效。管理员可以[强制启用被动监控并禁用更新](docs/managed-policy.md)；受策略约束的菜单项会标明由组织管理，无法在应用中放宽限制。
+
+主动关闭被动监控会启用旧版恢复行为：可能执行 `codex exec .` 或 `claude -p .`，Claude 的备用流程也可能提交 Messages API 请求。这些是真实的模型请求，可能消耗配额、产生费用，并涉及 CLI 钩子及当前项目的配置。未获批准时，请保持被动监控开启。
 
 ### 系统托盘图标
 
@@ -147,7 +163,7 @@ Claude 桌面客户端与 Claude Code CLI 使用相互独立的本地登录状�
 
 - **更新频率**设置正常刷新间隔。**剩余 ≤20% 时每分钟刷新**默认开启：某个服务的任一额度窗口剩余不超过 20% 时，该服务改为每分钟刷新一次。额度已经用完的服务保持正常间隔，因为重置前它不会再消耗额度。
 - 网络和服务器错误会按逐渐变长的间隔重试。服务器返回 `429` 并带有 `Retry-After` 时，应用会等到该时间再请求。
-- 登录过期或找不到凭据时，应用停止重试该服务，直到凭据文件发生变化，或你手动选择**刷新**。
+- 在被动模式下，登录过期、凭据缺失或被服务商拒绝时，应用停止重试该服务，直到凭据改变或你手动选择**刷新**。重复的唤醒或网络恢复事件不会恢复被暂停的登录重试。
 - 额度窗口刚重置后，应用会很快再查一次，让新窗口尽快显示。
 
 ### 自定义外观
@@ -175,7 +191,7 @@ codex-usage --diagnose
 %TEMP%\codex-usage.log
 ```
 
-日志会记录应用版本、安装渠道、可执行文件路径、轮询失败类别和重试时间，但不会记录访问令牌或凭据内容。有关任务栏错误标签及恢复步骤，请参阅[故障排除](docs/troubleshooting.md)。
+日志会记录应用版本、安装渠道、可执行文件路径、轮询失败类别和重试时间，也可能包含本地路径、启动参数和 WSL 发行版名称；分享前请先检查。有关任务栏错误标签及恢复步骤，请参阅[故障排除](docs/troubleshooting.md)。
 
 设置保存在：
 
@@ -185,7 +201,13 @@ codex-usage --diagnose
 
 ## 账户支持
 
-Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Code 监控功能支持 Claude Code 本身所支持的账户类型。
+Codex 监控目前支持**基于文件的 ChatGPT 身份验证**。监控器读取 Windows 用户的 `.codex\auth.json`，或其进程继承的 `CODEX_HOME` 目录中的 `auth.json`。文件必须包含 `tokens.access_token`；存在 `tokens.account_id` 时也会发送该账户 ID。仅在终端中设置的 `CODEX_HOME` 不一定会传递给从开始菜单或登录时启动的监控器。
+
+不支持仅存储在系统密钥环中的 Codex 会话、临时内存会话、API 密钥身份验证或仅在浏览器中登录。不会自动发现 WSL 中的 Codex 凭据。监控器访问固定的 `https://chatgpt.com/backend-api/wham/usage` 端点，不读取 Codex 的自定义网关或后端配置。公司或 SSO 会话只有在提供受支持的文件且工作区允许访问此端点时才能使用；仅登录 Codex 不代表一定兼容。
+
+被动模式下，令牌续期由 **Codex 官方应用或 CLI** 处理。待其更新已保存的会话，或在其中重新登录后，请在监控器中选择**刷新**。监控本身不会保持登录有效。请遵守组织的凭据存储和网关要求，不要为了适配此版本而导出令牌或降低这些要求。
+
+可选的 Claude Code 监控功能支持 Claude Code 本身所支持的账户类型。
 
 截至 **2026 年 3 月 19 日**，Anthropic 的 Claude Code 设置文档说明：
 
@@ -198,20 +220,18 @@ Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Co
 
 本项目是**开源软件**，你可以直接检查它的具体行为。
 
-应用读取的内容：
+应用读取的内容（仅限已启用的服务）：
 
-- `~/.claude/.credentials.json` 中的本地 Claude Code OAuth 凭据
-- 如果设置了 `CLAUDE_CONFIG_DIR`，读取该目录中的 Claude Code 凭据文件
-- 必要时，已安装 WSL 发行版中的同一凭据文件
-- 启用 Codex 时，读取 `$CODEX_HOME/auth.json` 或 `~/.codex/auth.json` 中的本地 Codex 凭据
+- 启用 Claude Code 时，读取 `~/.claude/.credentials.json`、`CLAUDE_CONFIG_DIR` 指定目录或受支持 WSL 环境中的本地 OAuth 凭据
+- 启用 Codex 时，读取[账户支持](#账户支持)中说明的 Windows Codex 凭据文件；整个文件会被读入内存，但仅使用访问令牌和可选的账户 ID
 - 启用 Antigravity 时，读取 Windows 凭据管理器中目标为 `gemini:antigravity` 的本地 OAuth 令牌
 
 应用通过网络发送的请求：
 
-- 请求 Anthropic 的 Claude 端点，以读取用量和速率限制信息
+- 启用 Claude Code 时，请求 Anthropic 的 Claude 用量端点
 - 启用 Codex 时，请求 ChatGPT 的 Codex 用量端点，以读取 Codex 用量和速率限制信息
 - 启用 Antigravity 时，请求 Google Cloud Code / Antigravity 端点，以读取 Antigravity 配额信息
-- 仅在使用软件更新检查或自更新功能时请求 GitHub
+- 仅在**允许更新**开启且设备策略允许时，向 GitHub 发送每日自动版本检查和手动更新请求
 - 如果设置了 `HTTPS_PROXY`、`HTTP_PROXY` 或 `ALL_PROXY` 等代理环境变量，上述出站请求可能通过代理发送
 
 应用在本地保存的内容：
@@ -226,35 +246,38 @@ Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Co
 - 用于避免重复提醒的配额窗口通知键
 - 显示模型偏好
 - 外观、所选显示器、左侧固定和加快刷新设置
+- 被动监控和软件更新偏好
 
 应用**不会**执行的操作：
 
 - 不会将凭据发送到其他服务器
 - 不使用独立的后端服务
 - 不收集分析数据或遥测信息
-- 不上传项目文件
+- 被动模式下，不会为恢复登录或读取用量而提交模型提示或调用 CLI 推理
 - 不直接修改 Codex 凭据文件
 - 不读取或复用 Claude 桌面客户端的认证数据
 
 注意：
 
-- 如果 Claude Code 令牌过期，应用可能会在后台调用本地 Claude CLI 进行刷新
-- 如果 Codex 令牌过期，应用可能会在后台调用本地 Codex CLI 进行刷新。监控器本身不会写入 `auth.json`，任何凭据更新都由 Codex CLI 完成
+- 被动模式下，Claude Code 或 Codex 凭据过期或被拒绝时，需要通过服务商的应用或 CLI 重新登录，监控器不会用模型请求刷新登录。只有主动关闭被动监控且设备策略允许时，才会启用旧版 CLI 恢复及 Messages API 备用流程
 - 如果 Antigravity 令牌过期，请打开 Antigravity 并重新登录。监控器不会写入 Windows 凭据管理器
-- 便携版可以从本仓库下载最新版本进行自更新
+- OAuth Bearer 令牌仍保留服务商赋予的原有权限。被动模式限制的是监控器的行为，不会把令牌转换成只读凭据，也不会将可执行文件放进安全沙箱
+- 便携版仅在允许更新时才能从本仓库自更新。发布校验和用于验证完整性；与源代码提交绑定的构建来源证明及其限制见[发布验证指南](docs/release-verification.md)。本项目不宣称提供 Authenticode 发布者签名
 - 代理必须可信，因为代理转发的用量请求会在 TLS 连接内包含 OAuth Bearer 令牌
+
+[受管策略文档](docs/managed-policy.md)说明了系统策略路径、读取失败时的行为、部署要求和限制。在限制更改前已经发出的请求或启动的外部进程无法撤回。
 
 ## 工作原理
 
 监控器会：
 
-1. 查找已启用模型的登录凭据
+1. 加载服务选择及隐私偏好，应用设备策略，然后仅发现已启用服务的凭据
 2. 从 Anthropic、ChatGPT 和/或 Google Antigravity 端点读取当前用量
 3. 将结果直接显示在 Windows 任务栏中
 4. 保持组件与所选任务栏及托盘区域对齐
 5. 在后台定期刷新
 
-如果较新的用量端点不可用，应用可以回退为读取 Claude Messages API 返回的速率限制响应头。
+被动模式下，用量端点不可用时会显示错误，不会提交模型请求。只有主动关闭被动监控且设备策略允许时，才可使用 Claude Messages API 备用流程。
 
 ## 开源说明
 

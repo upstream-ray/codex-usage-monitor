@@ -3,6 +3,8 @@ use super::Strings;
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Обновить через WinGet";
 
 pub(super) const STRINGS: Strings = Strings {
+    privacy_information: "Настройки конфиденциальности и обновлений…",
+    settings_save_failed: "Не удалось сохранить настройки. Изменения действуют только до перезапуска приложения.",
     window_title: "Codex Usage",
     refresh: "Обновить",
     update_frequency: "Частота обновления",
@@ -15,6 +17,12 @@ pub(super) const STRINGS: Strings = Strings {
     codex_model: "Codex",
     antigravity_model: "Antigravity",
     settings: "Настройки",
+    passive_monitoring: "Пассивный мониторинг",
+    allow_updates: "Разрешить обновления",
+    managed_policy: "Управляется вашей организацией",
+    policy_error: "Не удалось прочитать политику; пассивный мониторинг включён, обновления отключены",
+    sign_in_required: "Войдите снова через CLI провайдера, затем обновите данные",
+    passive_monitoring_description: "Пассивный мониторинг только считывает данные об использовании. Если срок действия сеанса истёк, войдите через CLI провайдера. Монитор не отправляет запросы моделям для обновления аутентификации.",
     start_with_windows: "Запускать вместе с Windows",
     reset_position: "Сбросить позицию",
     language: "Язык",
