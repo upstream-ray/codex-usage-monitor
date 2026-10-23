@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -179,6 +179,7 @@ static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None)
 
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
+static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Scale a base pixel value (designed at 96 DPI) to the current DPI.
 fn sc(px: i32) -> i32 {
@@ -278,11 +279,20 @@ fn spawn_taskbar_watchdog() {
             continue;
         };
         let taskbars = native_interop::find_taskbars();
-        if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
+        let widget = {
+            let state = lock_state();
+            state.as_ref().map(|s| s.hwnd.to_hwnd())
+        };
+        let widget_alive = widget
+            .map(|hwnd| unsafe { IsWindow(hwnd).as_bool() })
+            .unwrap_or(false);
+        if !taskbars.is_empty()
+            && (!widget_alive || !taskbars.iter().any(|taskbar| taskbar.hwnd == old))
+        {
             let new = taskbars[0].hwnd;
             diagnose::log(format!(
-                "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
-                old.0, new.0
+                "watchdog: widget_alive={widget_alive} taskbar old={:?} new={:?} -> relaunching",
+                old.0, new.0,
             ));
             relaunch_self();
         }
@@ -3446,6 +3456,7 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
                 2 => {
+                    EXIT_REQUESTED.store(true, Ordering::Relaxed);
                     let hook = {
                         let state = lock_state();
                         state.as_ref().and_then(|s| s.win_event_hook)
@@ -3748,7 +3759,16 @@ unsafe extern "system" fn wnd_proc(
                 native_interop::unhook_win_event(h);
             }
             tray_icon::remove_all(hwnd);
-            PostQuitMessage(0);
+            if EXIT_REQUESTED.load(Ordering::Relaxed) {
+                PostQuitMessage(0);
+            } else {
+                // Disconnecting a display destroys its taskbar and all child
+                // windows. Keep the message loop alive so the watchdog can
+                // relaunch us on the remaining taskbar.
+                diagnose::log(
+                    "widget window destroyed unexpectedly; waiting for watchdog recovery",
+                );
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
