@@ -10,6 +10,7 @@ pub struct Service {
     pub history: History,
     pub error: Option<PollError>,
     pub interval_ms: u32,
+    cached_only: bool,
     enabled: bool,
     generation: u64,
     in_flight: Option<u64>,
@@ -32,6 +33,7 @@ pub struct Job {
 pub struct Attempt {
     result: Option<Result<UsageData, PollError>>,
     auth: Option<(CredentialWatchMode, CredentialWatchSnapshot)>,
+    pub cache_scope: Option<String>,
 }
 pub struct Completion {
     pub accepted: bool,
@@ -85,6 +87,7 @@ pub fn execute(
                 return Attempt {
                     result: None,
                     auth: Some((*mode, current)),
+                    cache_scope: None,
                 };
             }
         }
@@ -102,6 +105,7 @@ pub fn execute(
     Attempt {
         result: Some(result),
         auth,
+        cache_scope: None,
     }
 }
 
@@ -130,6 +134,7 @@ pub fn launch(
                 Attempt {
                     result: Some(Err(PollError::RequestFailed)),
                     auth: None,
+                    cache_scope: None,
                 },
             );
         }
@@ -144,6 +149,7 @@ impl Monitor {
                 history: History::default(),
                 error: None,
                 interval_ms: 900_000,
+                cached_only: false,
                 enabled: enabled[id],
                 generation: 0,
                 in_flight: None,
@@ -157,6 +163,19 @@ impl Monitor {
             }),
         }
     }
+    pub fn restore_cached(&mut self, id: usize, data: UsageData, updated_at: SystemTime) {
+        let service = &mut self.services[id];
+        service.data = Some(data);
+        service
+            .history
+            .record_success(updated_at, service.interval_ms);
+        service.cached_only = true;
+    }
+    pub fn invalidate_freshness(&mut self) {
+        for service in &mut self.services {
+            service.cached_only = true;
+        }
+    }
     pub fn configure(&mut self, enabled: [bool; 3], now: Instant) {
         for (service, enabled) in self.services.iter_mut().zip(enabled) {
             if service.enabled != enabled {
@@ -166,6 +185,7 @@ impl Monitor {
                     .retry_not_before
                     .map_or(now, |deadline| deadline.max(now));
                 service.forced = enabled;
+                service.cached_only = true;
             }
         }
     }
@@ -230,6 +250,7 @@ impl Monitor {
         match attempt.result {
             Some(Ok(data)) => {
                 successful = true;
+                s.cached_only = false;
                 s.retries = 0;
                 s.error = None;
                 s.auth = None;
@@ -328,12 +349,22 @@ impl Monitor {
 }
 impl Service {
     pub fn stale(&self, now: SystemTime) -> bool {
-        self.error.is_some() || self.history.is_stale(now)
+        self.cached_only
+            || self.history.last_success.is_none()
+            || self.error.is_some()
+            || self.history.is_stale(now)
     }
     pub fn description(&self, now: SystemTime, clock: Instant, chinese: bool) -> String {
         let mut text =
             self.history
                 .description(now, chinese, self.error.is_none(), self.interval_ms);
+        if self.cached_only && self.data.is_some() {
+            text.push_str(if chinese {
+                "\n显示本地记录，尚未联网确认；灰色表示非最新额度。"
+            } else {
+                "\nShowing a local record, not yet confirmed online. Gray indicates cached quota."
+            });
+        }
         if self.in_flight.is_some() {
             text.push_str(if chinese {
                 "\n正在刷新…"
@@ -407,6 +438,70 @@ impl Service {
 mod tests {
     use super::*;
     use std::sync::{mpsc, Mutex};
+
+    #[test]
+    fn local_records_stay_stale_until_each_provider_succeeds_online() {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let mut monitor = Monitor::new([true; 3], now);
+        for id in 0..3 {
+            monitor.restore_cached(id, usage(20.0 + id as f64), wall - Duration::from_secs(600));
+            assert!(monitor.services[id].stale(wall));
+        }
+        let jobs = monitor.plan(now);
+        assert_eq!(
+            jobs.len(),
+            3,
+            "restoring records must not delay online refresh"
+        );
+        complete(
+            &mut monitor,
+            &jobs[0],
+            Err(PollError::NetworkUnavailable),
+            now,
+            wall,
+        );
+        complete(&mut monitor, &jobs[1], Ok(usage(40.0)), now, wall);
+        complete(
+            &mut monitor,
+            &jobs[2],
+            Err(PollError::AuthRequired),
+            now,
+            wall,
+        );
+        assert!(monitor.services[0].stale(wall));
+        assert!(!monitor.services[1].stale(wall));
+        assert!(monitor.services[2].stale(wall));
+        assert_eq!(
+            monitor.services[0]
+                .data
+                .as_ref()
+                .unwrap()
+                .session
+                .percentage,
+            20.0
+        );
+        assert_eq!(
+            monitor.services[2]
+                .data
+                .as_ref()
+                .unwrap()
+                .session
+                .percentage,
+            22.0
+        );
+        monitor.invalidate_freshness();
+        assert!(monitor.services[1].stale(wall));
+        monitor.force(now, true);
+        let job = monitor
+            .plan(now)
+            .into_iter()
+            .find(|job| job.id == 1)
+            .unwrap();
+        complete(&mut monitor, &job, Ok(usage(45.0)), now, wall);
+        assert!(!monitor.services[1].stale(wall));
+        assert!(monitor.services[0].stale(wall));
+    }
 
     #[test]
     fn server_retry_deadline_survives_manual_refresh_and_selection_changes() {

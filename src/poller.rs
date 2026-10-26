@@ -7,6 +7,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
@@ -114,11 +115,18 @@ const CODEX_SESSION_WINDOW_MAX_SECONDS: u64 = 24 * 60 * 60;
 #[derive(Deserialize)]
 struct AntigravityAuthFile {
     token: AntigravityTokenData,
+    #[serde(default)]
+    id_token_email: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct AntigravityTokenData {
     access_token: String,
+}
+
+struct AntigravityCredentials {
+    access_token: String,
+    id_token_email: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -199,12 +207,78 @@ extern "system" {
     fn CredFree(buffer: *mut c_void);
 }
 
-pub fn poll_provider(id: usize) -> Result<UsageData, PollError> {
+pub fn poll_provider(id: usize) -> Result<(UsageData, String), PollError> {
     match id {
         0 => poll_claude_code(),
         1 => poll_codex(),
         2 => poll_antigravity(),
         _ => Err(PollError::RequestFailed),
+    }
+}
+
+/// Return an opaque fingerprint for the currently selected provider credential.
+/// The digest changes with credential refreshes and never exposes the credential.
+pub fn cache_scope(id: usize) -> Option<String> {
+    match id {
+        0 => {
+            let credentials = read_first_credentials()?;
+            usage_cache_scope("claude", &credentials.access_token, None)
+        }
+        1 => {
+            let credentials = read_codex_credentials()?;
+            codex_cache_scope(&credentials)
+        }
+        2 => {
+            let credentials = read_antigravity_credentials()?;
+            antigravity_cache_scope(&credentials)
+        }
+        _ => None,
+    }
+}
+
+fn usage_cache_scope(provider: &str, token: &str, account_id: Option<&str>) -> Option<String> {
+    if token.is_empty() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(provider.as_bytes());
+    digest.update([0]);
+    digest.update((token.len() as u64).to_be_bytes());
+    digest.update(token.as_bytes());
+    match account_id {
+        Some(account_id) => {
+            digest.update([1]);
+            digest.update((account_id.len() as u64).to_be_bytes());
+            digest.update(account_id.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+    Some(format!("{:x}", digest.finalize()))
+}
+
+fn codex_cache_scope(credentials: &CodexTokenData) -> Option<String> {
+    usage_cache_scope(
+        "codex",
+        &credentials.access_token,
+        credentials.account_id.as_deref(),
+    )
+}
+
+fn antigravity_cache_scope(credentials: &AntigravityCredentials) -> Option<String> {
+    if let Some(email) = credentials
+        .id_token_email
+        .as_deref()
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+    {
+        let normalized_email = email.to_lowercase();
+        let mut digest = Sha256::new();
+        digest.update(b"codex-usage-monitor\0antigravity-account-email-v1\0");
+        digest.update((normalized_email.len() as u64).to_be_bytes());
+        digest.update(normalized_email.as_bytes());
+        Some(format!("{:x}", digest.finalize()))
+    } else {
+        usage_cache_scope("antigravity", &credentials.access_token, None)
     }
 }
 
@@ -214,7 +288,7 @@ pub fn claude_code_credentials_available() -> bool {
     read_first_credentials().is_some()
 }
 
-fn poll_claude_code() -> Result<UsageData, PollError> {
+fn poll_claude_code() -> Result<(UsageData, String), PollError> {
     let creds = match read_first_credentials() {
         Some(c) => c,
         None => {
@@ -224,11 +298,13 @@ fn poll_claude_code() -> Result<UsageData, PollError> {
     };
 
     let creds = refresh_or_fallback(creds)?;
-
-    fetch_usage_with_fallback(&creds.access_token)
+    let data = fetch_usage_with_fallback(&creds.access_token)?;
+    let scope =
+        usage_cache_scope("claude", &creds.access_token, None).ok_or(PollError::NoCredentials)?;
+    Ok((data, scope))
 }
 
-fn poll_codex() -> Result<UsageData, PollError> {
+fn poll_codex() -> Result<(UsageData, String), PollError> {
     let creds = match read_codex_credentials() {
         Some(creds) => creds,
         None => {
@@ -237,18 +313,23 @@ fn poll_codex() -> Result<UsageData, PollError> {
         }
     };
 
-    match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
-        Ok(data) => Ok(data),
-        Err(PollError::AuthRequired) => {
-            cli_refresh_codex_token();
-            let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
-            fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())
-        }
-        Err(error) => Err(error),
-    }
+    let (data, credentials) =
+        match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
+            Ok(data) => (data, creds),
+            Err(PollError::AuthRequired) => {
+                cli_refresh_codex_token();
+                let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
+                let data =
+                    fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())?;
+                (data, refreshed)
+            }
+            Err(error) => return Err(error),
+        };
+    let scope = codex_cache_scope(&credentials).ok_or(PollError::NoCredentials)?;
+    Ok((data, scope))
 }
 
-fn poll_antigravity() -> Result<UsageData, PollError> {
+fn poll_antigravity() -> Result<(UsageData, String), PollError> {
     let creds = match read_antigravity_credentials() {
         Some(creds) => creds,
         None => {
@@ -257,7 +338,9 @@ fn poll_antigravity() -> Result<UsageData, PollError> {
         }
     };
 
-    fetch_antigravity_usage(&creds.access_token)
+    let data = fetch_antigravity_usage(&creds.access_token)?;
+    let scope = antigravity_cache_scope(&creds).ok_or(PollError::NoCredentials)?;
+    Ok((data, scope))
 }
 
 fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError> {
@@ -1301,13 +1384,16 @@ fn read_codex_credentials() -> Option<CodexTokenData> {
     auth.tokens.filter(|tokens| !tokens.access_token.is_empty())
 }
 
-fn read_antigravity_credentials() -> Option<AntigravityTokenData> {
+fn read_antigravity_credentials() -> Option<AntigravityCredentials> {
     let content = read_windows_generic_credential(ANTIGRAVITY_CREDENTIAL_TARGET)?;
     let auth: AntigravityAuthFile = serde_json::from_str(&content).ok()?;
     if auth.token.access_token.is_empty() {
         None
     } else {
-        Some(auth.token)
+        Some(AntigravityCredentials {
+            access_token: auth.token.access_token,
+            id_token_email: auth.id_token_email,
+        })
     }
 }
 
@@ -1695,6 +1781,77 @@ fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_cache_scope_tracks_the_token_used_by_a_fallback_source() {
+        let windows_token_scope = usage_cache_scope("claude", "windows-token", None).unwrap();
+        let fallback_token_scope = usage_cache_scope("claude", "wsl-fallback-token", None).unwrap();
+
+        assert_ne!(windows_token_scope, fallback_token_scope);
+        assert!(!fallback_token_scope.contains("wsl-fallback-token"));
+    }
+
+    #[test]
+    fn codex_cache_scope_includes_account_id_and_distinguishes_missing_ids() {
+        let account_one = usage_cache_scope("codex", "same-token", Some("account-one")).unwrap();
+        let account_two = usage_cache_scope("codex", "same-token", Some("account-two")).unwrap();
+        let no_account = usage_cache_scope("codex", "same-token", None).unwrap();
+
+        assert_ne!(account_one, account_two);
+        assert_ne!(account_one, no_account);
+        assert!(!account_one.contains("account-one"));
+    }
+
+    #[test]
+    fn antigravity_cache_scope_is_stable_across_token_refresh_for_same_email() {
+        let before_refresh = AntigravityCredentials {
+            access_token: "old-antigravity-token".to_string(),
+            id_token_email: Some(" User@Example.invalid ".to_string()),
+        };
+        let after_refresh = AntigravityCredentials {
+            access_token: "new-antigravity-token".to_string(),
+            id_token_email: Some("user@example.INVALID".to_string()),
+        };
+
+        let before_scope = antigravity_cache_scope(&before_refresh).unwrap();
+        let after_scope = antigravity_cache_scope(&after_refresh).unwrap();
+        assert_eq!(before_scope, after_scope);
+        assert!(!before_scope.contains("user@example.invalid"));
+    }
+
+    #[test]
+    fn antigravity_cache_scope_separates_different_emails() {
+        let first_account = AntigravityCredentials {
+            access_token: "same-token".to_string(),
+            id_token_email: Some("first@example.invalid".to_string()),
+        };
+        let second_account = AntigravityCredentials {
+            access_token: "same-token".to_string(),
+            id_token_email: Some("second@example.invalid".to_string()),
+        };
+
+        assert_ne!(
+            antigravity_cache_scope(&first_account),
+            antigravity_cache_scope(&second_account)
+        );
+    }
+
+    #[test]
+    fn antigravity_cache_scope_without_email_falls_back_to_access_token() {
+        let first_token = AntigravityCredentials {
+            access_token: "first-token".to_string(),
+            id_token_email: None,
+        };
+        let rotated_token = AntigravityCredentials {
+            access_token: "rotated-token".to_string(),
+            id_token_email: None,
+        };
+
+        assert_ne!(
+            antigravity_cache_scope(&first_token),
+            antigravity_cache_scope(&rotated_token)
+        );
+    }
 
     #[test]
     fn credential_signature_detects_same_length_rewrites_within_one_second() {

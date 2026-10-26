@@ -135,6 +135,10 @@ Percentages use fixed digit columns, so the reset text does not shift when a val
 
 Each enabled service keeps its own data, last successful update, error, and retry schedule. A slow or failing service does not delay or replace the numbers of another service.
 
+The last successful quota for each provider is saved locally and shown immediately at the next startup. Bars and quota text remain gray until that provider refreshes successfully online; a failed refresh, lost connection or overdue update also turns them gray while keeping the last known numbers. Provider icons retain their colors. Color indicates a recent successful refresh at the configured interval, not a continuous live feed.
+
+Snapshots are tied to the active account scope. Before the first successful request, or when no matching local record is available, the app waits for online data. It does not assume quota has recovered just because a reset time has passed.
+
 | Display | Meaning |
 | --- | --- |
 | `--` and an empty bar | The service did not report this quota window. For example, some Codex accounts only have a weekly limit. |
@@ -209,6 +213,8 @@ What the app sends over the network:
 
 What the app stores locally:
 
+- Per-provider quota snapshots, update times and opaque account-scope hashes; snapshots contain no raw credentials or email addresses
+
 - Widget position
 - Selected taskbar / screen
 - Widget visibility
@@ -254,6 +260,8 @@ If the newer usage endpoint is unavailable, it can fall back to reading the rate
 This project is licensed under the MIT License. The original [LICENSE](LICENSE) and copyright notice are preserved.
 
 The Claude and OpenAI marks come from [Lobe Icons](https://github.com/lobehub/lobe-icons) under the MIT License. See [src/icons/providers](src/icons/providers). Brand names and marks belong to their owners.
+
+The Antigravity mark uses the same source and license.
 
 Codex Usage is a maintained derivative of [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor). Thanks to Craig Constable and the upstream contributors for the original project. Changes in this repository are not affiliated with or endorsed by the upstream maintainers or OpenAI.
 

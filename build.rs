@@ -8,6 +8,8 @@ fn main() {
     let numeric_version = pack_version(version);
 
     res.set_icon("src/icons/icon.ico")
+        // Layered child windows require a Windows 8+ compatibility declaration.
+        .set_manifest(include_str!("app.manifest"))
         .set("FileVersion", version)
         .set("ProductVersion", version)
         .set_version_info(VersionInfo::FILEVERSION, numeric_version)

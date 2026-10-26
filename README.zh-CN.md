@@ -135,6 +135,10 @@ Claude 桌面客户端与 Claude Code CLI 使用相互独立的本地登录状�
 
 每个已启用的服务分别保存自己的数据、上次成功更新时间、错误和重试计划。一个服务变慢或出错，不会拖慢或覆盖其他服务的数字。
 
+每个服务上次成功取得的额度会保存在本地，下次启动时立即显示。在该服务成功联网更新前，进度条和额度文字保持灰色；更新失败、断网或数据过期时，也会变灰并保留上次数字。工具图标保留原色，便于辨认。恢复颜色表示最近一次联网更新成功，后续仍按设置的间隔查询，并非逐秒同步。
+
+记录与当前账号范围绑定。首次还没有成功记录，或没有匹配的本地记录时，会等待联网读取；即使重置时间已过，也不会自行认定额度已经恢复。
+
 | 显示 | 含义 |
 | --- | --- |
 | `--` 和空进度条 | 服务没有返回这个额度窗口。例如，部分 Codex 账户只有每周额度。 |
@@ -216,6 +220,8 @@ Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Co
 
 应用在本地保存的内容：
 
+- 各服务的额度快照、更新时间和不透明的账号范围摘要；快照不保存登录令牌或邮箱原文
+
 - 组件位置
 - 选中的任务栏或屏幕
 - 组件显示状态
@@ -261,6 +267,8 @@ Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Co
 本项目采用 MIT License。原始 [LICENSE](LICENSE) 及版权声明均予以保留。
 
 Claude 和 OpenAI 标志来自 [Lobe Icons](https://github.com/lobehub/lobe-icons)，采用 MIT License，详见 [src/icons/providers](src/icons/providers)。品牌名称和标志归各自所有者所有。
+
+Antigravity 标志采用相同来源与许可。
 
 Codex Usage 是 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) 的持续维护衍生版本。感谢 Craig Constable 和上游贡献者创建原始项目。本仓库中的修改与上游维护者或 OpenAI 不存在隶属或背书关系。
 

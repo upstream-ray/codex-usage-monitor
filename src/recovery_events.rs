@@ -18,16 +18,20 @@ use windows::Win32::System::Power::{
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, DEVICE_NOTIFY_WINDOW_HANDLE};
 
 pub const MESSAGE: u32 = 0x8000 + 4;
+pub const DISCONNECTED_MESSAGE: u32 = 0x8000 + 5;
 static CONNECTIVITY: Mutex<Connectivity> = Mutex::new(Connectivity { online: None });
 #[derive(Default)]
 struct Connectivity {
     online: Option<bool>,
 }
 impl Connectivity {
-    fn observe(&mut self, online: bool) -> bool {
-        let restored = self.online == Some(false) && online;
-        self.online = Some(online);
-        restored
+    fn observe(&mut self, online: bool) -> Option<u32> {
+        let previous = self.online.replace(online);
+        match (previous, online) {
+            (Some(false), true) => Some(MESSAGE),
+            (None | Some(true), false) => Some(DISCONNECTED_MESSAGE),
+            _ => None,
+        }
     }
 }
 #[derive(Default)]
@@ -68,12 +72,13 @@ unsafe extern "system" fn network_changed(
     context: *const c_void,
     hint: NL_NETWORK_CONNECTIVITY_HINT,
 ) {
-    let restored = CONNECTIVITY
+    let online = hint.ConnectivityLevel == NetworkConnectivityLevelHintInternetAccess;
+    let message = CONNECTIVITY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .observe(hint.ConnectivityLevel == NetworkConnectivityLevelHintInternetAccess);
-    if restored {
-        let _ = PostMessageW(HWND(context as *mut _), MESSAGE, WPARAM(1), LPARAM(0));
+        .observe(online);
+    if let Some(message) = message {
+        let _ = PostMessageW(HWND(context as *mut _), message, WPARAM(1), LPARAM(0));
     }
 }
 impl Watch {
@@ -129,12 +134,14 @@ mod tests {
     #[test]
     fn initial_or_cost_only_changes_do_not_refresh_but_restored_internet_does() {
         let mut state = Connectivity::default();
-        assert!(!state.observe(true));
-        assert!(!state.observe(true));
-        assert!(!state.observe(false));
-        assert!(!state.observe(false));
-        assert!(state.observe(true));
-        assert!(!state.observe(true));
+        assert_eq!(state.observe(true), None);
+        assert_eq!(state.observe(true), None);
+        assert_eq!(state.observe(false), Some(DISCONNECTED_MESSAGE));
+        assert_eq!(state.observe(false), None);
+        assert_eq!(state.observe(true), Some(MESSAGE));
+        assert_eq!(state.observe(true), None);
+        let mut offline_start = Connectivity::default();
+        assert_eq!(offline_start.observe(false), Some(DISCONNECTED_MESSAGE));
     }
     #[test]
     fn duplicate_wake_events_coalesce_without_suppressing_a_later_network_recovery() {

@@ -205,7 +205,7 @@ mod attachment_tests {
     use windows::Win32::Graphics::Gdi::*;
 
     #[test]
-    fn startup_popup_can_switch_to_layered_child_rendering() {
+    fn startup_popup_and_reattached_child_can_use_layered_rendering() {
         unsafe {
             let parent = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
@@ -213,6 +213,21 @@ mod attachment_tests {
                 w!("attachment-test"),
                 WS_POPUP,
                 0,
+                0,
+                20,
+                20,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let second_parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("second-attachment-test"),
+                WS_POPUP,
+                20,
                 0,
                 20,
                 20,
@@ -238,6 +253,10 @@ mod attachment_tests {
             )
             .unwrap();
             SetLayeredWindowAttributes(child, COLORREF(0), 255, LWA_ALPHA).unwrap();
+            embed_in_taskbar(child, parent);
+            // Switching displays reattaches an existing child rather than a startup popup.
+            embed_in_taskbar(child, second_parent);
+            assert_eq!(GetParent(child).unwrap(), second_parent);
             embed_in_taskbar(child, parent);
             assert_eq!(GetParent(child).unwrap(), parent);
             let dc = CreateCompatibleDC(None);
@@ -279,6 +298,7 @@ mod attachment_tests {
             let _ = DeleteObject(bitmap);
             let _ = DeleteDC(dc);
             let _ = DestroyWindow(child);
+            let _ = DestroyWindow(second_parent);
             let _ = DestroyWindow(parent);
             assert!(
                 rendered.is_ok(),

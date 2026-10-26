@@ -169,6 +169,7 @@ const MAX_MONITOR_MENU_ITEMS: usize = 100;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
+const WM_APP_TASKBARS_CHANGED: u32 = WM_APP + 6;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 /// How often the watchdog thread polls for an explorer.exe restart (which
@@ -271,20 +272,39 @@ fn spawn_taskbar_watchdog() {
         std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
         let stored = {
             let state = lock_state();
-            state.as_ref().and_then(|s| s.taskbar_hwnd)
+            state.as_ref().and_then(|s| {
+                s.taskbar_hwnd
+                    .map(|taskbar| (taskbar, s.hwnd, s.monitor_device.clone(), s.taskbar_index))
+            })
         };
         // Only relevant once we have embedded into a taskbar at least once.
-        let Some(old) = stored else {
+        let Some((old, hwnd, preferred, legacy_index)) = stored else {
             continue;
         };
         let taskbars = native_interop::find_taskbars();
-        if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
+        if taskbars.is_empty() {
+            continue;
+        }
+        if !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
             let new = taskbars[0].hwnd;
             diagnose::log(format!(
                 "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
                 old.0, new.0
             ));
             relaunch_self();
+        } else {
+            let selected = preferred_taskbar_index(&taskbars, preferred.as_deref(), legacy_index);
+            if taskbars[selected].hwnd != old {
+                // Display broadcasts do not reliably reach an embedded child window.
+                unsafe {
+                    let _ = PostMessageW(
+                        hwnd.to_hwnd(),
+                        WM_APP_TASKBARS_CHANGED,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
         }
     });
 }
@@ -960,35 +980,52 @@ fn preferred_taskbar_index(
     monitor_device: Option<&str>,
     legacy_index: usize,
 ) -> usize {
+    let devices: Vec<_> = taskbars
+        .iter()
+        .map(|taskbar| {
+            (
+                native_interop::taskbar_monitor_device(taskbar),
+                taskbar.is_primary,
+            )
+        })
+        .collect();
+    preferred_taskbar_device_index(&devices, monitor_device, legacy_index)
+}
+
+fn preferred_taskbar_device_index(
+    taskbars: &[(Option<String>, bool)],
+    monitor_device: Option<&str>,
+    legacy_index: usize,
+) -> usize {
     match monitor_device {
         Some(device) => taskbars
             .iter()
-            .position(|taskbar| {
-                native_interop::taskbar_monitor_device(taskbar).as_deref() == Some(device)
-            })
-            .unwrap_or_else(|| {
-                taskbars
-                    .iter()
-                    .position(|taskbar| taskbar.is_primary)
-                    .unwrap_or(0)
-            }),
+            .position(|taskbar| taskbar.0.as_deref() == Some(device))
+            .unwrap_or_else(|| taskbars.iter().position(|taskbar| taskbar.1).unwrap_or(0)),
         None => legacy_index.min(taskbars.len().saturating_sub(1)),
     }
 }
 
-fn refresh_taskbar_selection(hwnd: HWND) {
+fn refresh_taskbar_selection(hwnd: HWND) -> bool {
     let taskbars = native_interop::find_taskbars();
     if taskbars.is_empty() {
-        return;
+        return false;
     }
     let (preferred, legacy_index, current) = {
         let state = lock_state();
-        let Some(s) = state.as_ref() else { return };
+        let Some(s) = state.as_ref() else {
+            return false;
+        };
+        if s.dragging {
+            return false;
+        }
         (s.monitor_device.clone(), s.taskbar_index, s.taskbar_hwnd)
     };
     let index = preferred_taskbar_index(&taskbars, preferred.as_deref(), legacy_index);
     if current != Some(taskbars[index].hwnd) {
-        attach_to_taskbar(hwnd, index);
+        attach_to_taskbar(hwnd, index)
+    } else {
+        false
     }
 }
 
@@ -1079,6 +1116,33 @@ fn effective_poll_interval(state: &AppState) -> u32 {
     state
         .monitor
         .delay_ms(Instant::now(), state.poll_interval_ms)
+}
+
+fn sync_usage_data(state: &mut AppState) {
+    let data = state.monitor.cached();
+    for (usage, session, weekly) in [
+        (
+            data.claude_code.as_ref(),
+            &mut state.session_percent,
+            &mut state.weekly_percent,
+        ),
+        (
+            data.codex.as_ref(),
+            &mut state.codex_session_percent,
+            &mut state.codex_weekly_percent,
+        ),
+        (
+            data.antigravity.as_ref(),
+            &mut state.antigravity_session_percent,
+            &mut state.antigravity_weekly_percent,
+        ),
+    ] {
+        *session = usage.map_or(0.0, |u| u.session.percentage);
+        *weekly = usage.map_or(0.0, |u| u.weekly.percentage);
+        state.has_poll_result |= usage.is_some();
+    }
+    state.data = Some(data);
+    refresh_usage_texts(state);
 }
 
 fn refresh_usage_texts(state: &mut AppState) {
@@ -1986,6 +2050,20 @@ pub fn run() {
 
         let is_dark = theme::is_dark_mode();
         let mut embedded = false;
+        let mut monitor = provider_poll::Monitor::new(
+            [
+                settings.show_claude_code,
+                settings.show_codex,
+                settings.show_antigravity,
+            ],
+            Instant::now(),
+        );
+        for id in 0..3 {
+            if let Some(cached) = crate::quota_cache::load(id) {
+                monitor.restore_cached(id, cached.data, cached.updated_at);
+                diagnose::log(format!("loaded local quota record id={id}"));
+            }
+        }
 
         {
             let mut state = lock_state();
@@ -2023,14 +2101,7 @@ pub fn run() {
                 data: None,
                 poll_interval_ms: settings.poll_interval_ms,
                 adaptive_refresh: settings.adaptive_refresh,
-                monitor: provider_poll::Monitor::new(
-                    [
-                        settings.show_claude_code,
-                        settings.show_codex,
-                        settings.show_antigravity,
-                    ],
-                    Instant::now(),
-                ),
+                monitor,
                 recovery_watch: Some(recovery_events::Watch::register(hwnd)),
                 recovery_debounce: recovery_events::Debounce::default(),
                 has_poll_result: false,
@@ -2046,6 +2117,9 @@ pub fn run() {
                 drag_start_offset: 0,
                 widget_visible: settings.widget_visible,
             });
+            if let Some(s) = state.as_mut() {
+                sync_usage_data(s);
+            }
         }
 
         // Try to embed in taskbar
@@ -2088,6 +2162,8 @@ pub fn run() {
 
         // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
         render_layered();
+
+        schedule_countdown_timer();
 
         // Poll timer: 15 minutes
         let initial_poll_ms = {
@@ -2239,6 +2315,7 @@ fn render_layered() {
         show_antigravity,
         show_session_window,
         show_weekly_window,
+        stale,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -2266,6 +2343,7 @@ fn render_layered() {
                 s.show_antigravity,
                 s.show_session_window,
                 s.show_weekly_window,
+                std::array::from_fn(|id| s.monitor.services[id].stale(SystemTime::now())),
             ),
             None => return,
         }
@@ -2360,6 +2438,7 @@ fn render_layered() {
             show_weekly_window,
             &codex_accent,
             &antigravity_accent,
+            stale,
         );
 
         // System mode blends with the taskbar. High contrast modes use a solid
@@ -2393,7 +2472,7 @@ fn render_layered() {
             AlphaFormat: 1, // AC_SRC_ALPHA
         };
 
-        let _ = UpdateLayeredWindow(
+        let rendered = UpdateLayeredWindow(
             hwnd,
             screen_dc,
             None,
@@ -2404,6 +2483,9 @@ fn render_layered() {
             Some(&blend),
             ULW_ALPHA,
         );
+        if let Err(error) = rendered {
+            diagnose::log_error("UpdateLayeredWindow failed", error);
+        }
 
         // Cleanup
         SelectObject(mem_dc, old_bmp);
@@ -2445,6 +2527,7 @@ fn paint_content(
     show_weekly_window: bool,
     codex_accent: &Color,
     antigravity_accent: &Color,
+    stale: [bool; 3],
 ) {
     unsafe {
         let is_dark = appearance.is_dark(is_dark);
@@ -2533,6 +2616,10 @@ fn paint_content(
         }
         if show_codex {
             provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Codex);
+            icon_x += model_width;
+        }
+        if show_antigravity {
+            provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Antigravity);
         }
 
         if show_session_window {
@@ -2563,6 +2650,7 @@ fn paint_content(
                 track,
                 label_width,
                 text_width,
+                stale,
             );
         }
         if show_weekly_window {
@@ -2593,6 +2681,7 @@ fn paint_content(
                 track,
                 label_width,
                 text_width,
+                stale,
             );
         }
 
@@ -2643,6 +2732,7 @@ fn request_poll(hwnd: SendHwnd, force: bool) {
         if let Some(s) = state.as_mut() {
             let enabled = [s.show_claude_code, s.show_codex, s.show_antigravity];
             s.monitor.configure(enabled, Instant::now());
+            sync_usage_data(s);
             if force {
                 s.monitor.force(Instant::now(), true);
             }
@@ -2689,11 +2779,19 @@ fn do_poll(send_hwnd: SendHwnd) {
     provider_poll::launch(
         jobs,
         |job| {
-            provider_poll::execute(
+            let mut scope = None;
+            let mut attempt = provider_poll::execute(
                 job,
-                || poller::poll_provider(job.id),
+                || {
+                    poller::poll_provider(job.id).map(|(data, used_scope)| {
+                        scope = Some(used_scope);
+                        data
+                    })
+                },
                 poller::credential_watch_snapshot,
-            )
+            );
+            attempt.cache_scope = scope;
+            attempt
         },
         move |job, attempt| complete_provider_poll(send_hwnd, job, attempt),
     );
@@ -2705,7 +2803,8 @@ fn complete_provider_poll(
     attempt: provider_poll::Attempt,
 ) {
     let hwnd = send_hwnd.to_hwnd();
-    let (alerts, auth_notice) = {
+    let cache_scope = attempt.cache_scope.clone();
+    let (alerts, auth_notice, cache_update) = {
         let mut state = lock_state();
         let Some(s) = state.as_mut() else {
             return;
@@ -2736,30 +2835,8 @@ fn complete_provider_poll(
             }
         }
         let alerts = collect_low_quota_alerts(s, &fresh);
-        let cached = s.monitor.cached();
-        for (usage, session, weekly) in [
-            (
-                cached.claude_code.as_ref(),
-                &mut s.session_percent,
-                &mut s.weekly_percent,
-            ),
-            (
-                cached.codex.as_ref(),
-                &mut s.codex_session_percent,
-                &mut s.codex_weekly_percent,
-            ),
-            (
-                cached.antigravity.as_ref(),
-                &mut s.antigravity_session_percent,
-                &mut s.antigravity_weekly_percent,
-            ),
-        ] {
-            *session = usage.map_or(0.0, |u| u.session.percentage);
-            *weekly = usage.map_or(0.0, |u| u.weekly.percentage);
-        }
-        s.data = Some(cached);
+        sync_usage_data(s);
         s.has_poll_result = true;
-        refresh_usage_texts(s);
         unsafe {
             SetTimer(hwnd, TIMER_POLL, effective_poll_interval(s), None);
         }
@@ -2788,8 +2865,22 @@ fn complete_provider_poll(
                 ),
             }
         });
-        (alerts, notice)
+        let cache_update = if completion.successful {
+            service
+                .data
+                .clone()
+                .zip(service.history.last_success)
+                .zip(cache_scope)
+        } else {
+            None
+        };
+        (alerts, notice, cache_update)
     };
+    if let Some(((data, updated_at), scope)) = cache_update {
+        if let Err(error) = crate::quota_cache::save(job.id, &data, updated_at, &scope) {
+            diagnose::log_error("unable to save local quota record", error);
+        }
+    }
     for alert in &alerts {
         tray_icon::notify_balloon(hwnd, alert.kind, &alert.title, &alert.message);
     }
@@ -3084,10 +3175,13 @@ fn recover_polling(hwnd: HWND, network: bool) {
                 return false;
             }
             s.monitor.force(now, false);
+            s.monitor.invalidate_freshness();
+            refresh_usage_texts(s);
             true
         })
     };
     if accepted {
+        render_layered();
         diagnose::log(if network {
             "network restored: refreshing providers"
         } else {
@@ -3136,6 +3230,26 @@ unsafe extern "system" fn wnd_proc(
             recover_polling(hwnd, true);
             LRESULT(0)
         }
+        _ if msg == recovery_events::DISCONNECTED_MESSAGE => {
+            {
+                let mut state = lock_state();
+                if let Some(s) = state.as_mut() {
+                    s.monitor.invalidate_freshness();
+                    refresh_usage_texts(s);
+                }
+            }
+            render_layered();
+            sync_tray_icons(hwnd);
+            LRESULT(0)
+        }
+        _ if msg == WM_APP_TASKBARS_CHANGED => {
+            if refresh_taskbar_selection(hwnd) {
+                diagnose::log("preferred taskbar restored; reattached widget");
+                position_at_taskbar();
+                render_layered();
+            }
+            LRESULT(0)
+        }
         WM_DISPLAYCHANGE | WM_DPICHANGED_MSG | WM_SETTINGCHANGE => {
             if msg == WM_DPICHANGED_MSG {
                 let new_dpi = (wparam.0 & 0xFFFF) as u32;
@@ -3167,14 +3281,14 @@ unsafe extern "system" fn wnd_proc(
                 TIMER_TASKBAR_RETRY => {
                     let attachment = {
                         let state = lock_state();
-                        state.as_ref().map(|s| (s.embedded, s.taskbar_index))
+                        state.as_ref().map(|s| s.embedded)
                     };
                     match attachment {
-                        Some((true, _)) | None => {
+                        Some(true) | None => {
                             let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
                         }
-                        Some((false, index)) => {
-                            if attach_to_taskbar(hwnd, index) {
+                        Some(false) => {
+                            if refresh_taskbar_selection(hwnd) {
                                 let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
                                 position_at_taskbar();
                                 render_layered();
@@ -4250,6 +4364,18 @@ fn show_context_menu(hwnd: HWND) {
                 } else {
                     format!("Display {} ({device})", index + 1)
                 };
+                let label = if taskbar.is_primary {
+                    format!(
+                        "{label} · {}",
+                        if language == LanguageId::SimplifiedChinese {
+                            "主屏"
+                        } else {
+                            "Primary"
+                        }
+                    )
+                } else {
+                    label
+                };
                 let wide = native_interop::wide_str(&label);
                 let flags = if selected_taskbar == Some(taskbar.hwnd) {
                     MF_CHECKED
@@ -4409,6 +4535,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         show_antigravity,
         show_session_window,
         show_weekly_window,
+        stale,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -4434,6 +4561,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.show_antigravity,
                 s.show_session_window,
                 s.show_weekly_window,
+                std::array::from_fn(|id| s.monitor.services[id].stale(SystemTime::now())),
             ),
             None => return,
         }
@@ -4489,6 +4617,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_weekly_window,
             &codex_accent,
             &antigravity_accent,
+            stale,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -4522,6 +4651,7 @@ fn draw_row(
     track: &Color,
     label_width: i32,
     text_width: i32,
+    stale: [bool; 3],
 ) {
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
     let segment_count = row_bar_segment_count(active_models);
@@ -4570,6 +4700,7 @@ fn draw_row(
                 text_width,
                 is_dark,
                 appearance,
+                stale[0],
             );
             model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -4587,6 +4718,7 @@ fn draw_row(
                 text_width,
                 is_dark,
                 appearance,
+                stale[1],
             );
             model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -4604,6 +4736,7 @@ fn draw_row(
                 text_width,
                 is_dark,
                 appearance,
+                stale[2],
             );
         }
     }
@@ -4618,7 +4751,7 @@ fn model_usage_width(segment_count: i32, text_width: i32) -> i32 {
 }
 
 fn usage_bar_fill_percentage(percent: f64, text: &str) -> f64 {
-    if text == "--" {
+    if !text.contains('%') {
         0.0
     } else {
         percent.clamp(0.0, 100.0)
@@ -4638,7 +4771,20 @@ fn draw_usage_bar(
     text_width: i32,
     is_dark: bool,
     appearance: Appearance,
+    stale: bool,
 ) {
+    let gray = if is_dark {
+        Color::new(160, 160, 160)
+    } else {
+        Color::new(102, 102, 102)
+    };
+    let accent = if stale { &gray } else { accent };
+    let text_color = if stale { &gray } else { text_color };
+    let reset_color = if stale {
+        gray
+    } else {
+        reset_text_color(appearance, is_dark)
+    };
     let seg_w = sc(SEGMENT_W);
     let seg_h = appearance.bar_height();
     let seg_gap = sc(SEGMENT_GAP);
@@ -4680,7 +4826,7 @@ fn draw_usage_bar(
         text_width,
         text,
         text_color,
-        &reset_text_color(appearance, is_dark),
+        &reset_color,
         appearance.font_px(),
         sc,
     );
@@ -4735,10 +4881,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preferred_display_returns_after_missing_taskbar_and_enumeration_changes() {
+        let primary = (Some("primary-device".to_string()), true);
+        let secondary = (Some("secondary-device".to_string()), false);
+        let preferred = Some("primary-device");
+        let initial = [secondary.clone(), primary.clone()];
+        assert_eq!(preferred_taskbar_device_index(&initial, preferred, 0), 1);
+        let during_rebuild = [secondary.clone()];
+        assert_eq!(
+            preferred_taskbar_device_index(&during_rebuild, preferred, 1),
+            0
+        );
+        let restored = [primary, secondary];
+        assert_eq!(preferred_taskbar_device_index(&restored, preferred, 0), 0);
+        assert_eq!(
+            preferred_taskbar_device_index(&restored, Some("secondary-device"), 0),
+            1
+        );
+        assert_eq!(
+            preferred_taskbar_device_index(&restored, Some("disconnected-device"), 1),
+            0
+        );
+        assert_eq!(preferred_taskbar_device_index(&restored, None, 1), 1);
+    }
+
+    #[test]
     fn unavailable_quota_has_no_bar_fill() {
         assert_eq!(usage_bar_fill_percentage(100.0, "--"), 0.0);
+        assert_eq!(usage_bar_fill_percentage(100.0, "..."), 0.0);
+        assert_eq!(usage_bar_fill_percentage(100.0, "NET"), 0.0);
         assert_eq!(usage_bar_fill_percentage(61.0, "剩余61%"), 61.0);
         assert_eq!(usage_bar_fill_percentage(100.0, "剩余100%"), 100.0);
+    }
+
+    #[test]
+    fn cached_bars_are_gray_and_online_bars_keep_their_provider_color() {
+        unsafe {
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, 320, 100);
+            assert!(!bitmap.is_invalid());
+            let old = SelectObject(dc, bitmap);
+            let mut pixels = Vec::new();
+            for dark in [true, false] {
+                for bar_style in [BarStyle::Continuous, BarStyle::Segmented] {
+                    for stale in [true, false] {
+                        let appearance = Appearance {
+                            bar_style,
+                            ..Appearance::default()
+                        };
+                        let accent = Color::new(20, 180, 90);
+                        draw_usage_bar(
+                            dc,
+                            0,
+                            0,
+                            4,
+                            80.0,
+                            "80% 12:00",
+                            &accent,
+                            &Color::new(40, 40, 40),
+                            &accent,
+                            150,
+                            dark,
+                            appearance,
+                            stale,
+                        );
+                        let expected = if stale {
+                            let gray = if dark { 160 } else { 102 };
+                            Color::new(gray, gray, gray)
+                        } else {
+                            accent
+                        };
+                        pixels.push((
+                            GetPixel(dc, sc(4), appearance.row_height() / 2).0,
+                            expected.to_colorref(),
+                        ));
+                    }
+                }
+            }
+            SelectObject(dc, old);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(dc);
+            ReleaseDC(None, screen);
+            for (actual, expected) in pixels {
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     #[test]
