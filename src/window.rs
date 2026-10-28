@@ -164,6 +164,7 @@ const IDM_FONT_STANDARD: u16 = 97;
 const IDM_FONT_LARGE: u16 = 98;
 const IDM_APPEARANCE_RECOMMENDED: u16 = 99;
 const IDM_APPEARANCE_RESET: u16 = 100;
+const IDM_COMPACT_LAYOUT: u16 = 101;
 const IDM_MONITOR_FIRST: u16 = 200;
 const MAX_MONITOR_MENU_ITEMS: usize = 100;
 
@@ -380,6 +381,7 @@ struct Appearance {
     bar_style: BarStyle,
     bar_thickness: BarThickness,
     font_size: FontSize,
+    compact_layout: bool,
 }
 
 impl Appearance {
@@ -389,6 +391,7 @@ impl Appearance {
             bar_style: BarStyle::Continuous,
             bar_thickness: BarThickness::Slim,
             font_size: FontSize::Large,
+            compact_layout: false,
         }
     }
     fn is_dark(self, system_is_dark: bool) -> bool {
@@ -1626,9 +1629,138 @@ const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
 
+fn preferred_widget_height_for(
+    active_models: i32,
+    language: LanguageId,
+    show_session: bool,
+    show_weekly: bool,
+    appearance: Appearance,
+) -> i32 {
+    if uses_compact_layout(active_models, language, appearance) {
+        if show_session && show_weekly {
+            64
+        } else {
+            32
+        }
+    } else {
+        WIDGET_HEIGHT
+    }
+}
+
+fn preferred_widget_height_for_state(state: &AppState) -> i32 {
+    sc(preferred_widget_height_for(
+        active_model_count(
+            state.show_claude_code,
+            state.show_codex,
+            state.show_antigravity,
+        ),
+        state.language,
+        state.show_session_window,
+        state.show_weekly_window,
+        state.appearance,
+    ))
+}
+
+fn preferred_widget_height() -> i32 {
+    lock_state()
+        .as_ref()
+        .map(preferred_widget_height_for_state)
+        .unwrap_or(sc(WIDGET_HEIGHT))
+}
+
+fn uses_compact_layout(active_models: i32, language: LanguageId, appearance: Appearance) -> bool {
+    appearance.compact_layout && active_models == 1 && language == LanguageId::SimplifiedChinese
+}
+
+/// Initial estimate before provider data arrives; live rows are measured again.
+fn compact_widget_width(appearance: Appearance) -> i32 {
+    compact_measured_width(
+        appearance,
+        "100% 23:59重置 *",
+        "100% 12/31重置 *",
+        true,
+        true,
+    )
+}
+fn compact_measured_width(
+    appearance: Appearance,
+    session: &str,
+    weekly: &str,
+    show_session: bool,
+    show_weekly: bool,
+) -> i32 {
+    unsafe {
+        let dc = GetDC(HWND::default());
+        if dc.is_invalid() {
+            return sc(200);
+        }
+        let font = create_widget_font(appearance);
+        let reset_font = quota_text::create_reset_font(sc(appearance.font_px() - 1));
+        let old = SelectObject(dc, font);
+        let measure = |font: HFONT, value: &str| {
+            SelectObject(dc, font);
+            let wide: Vec<u16> = value.encode_utf16().collect();
+            let mut size = SIZE::default();
+            if !wide.is_empty() {
+                let _ = GetTextExtentPoint32W(dc, &wide, &mut size);
+            }
+            size.cx
+        };
+        let mut content_width = 0;
+        for (visible, label, value) in [(show_session, "5h", session), (show_weekly, "7d", weekly)]
+        {
+            if !visible {
+                continue;
+            }
+            let (percentage, reset) = quota_text::parts(value);
+            let mut row_width = measure(font, label) + sc(8) + measure(font, percentage);
+            if !reset.is_empty() {
+                row_width += sc(8) + measure(reset_font, &reset.replace("重置", " 重置"));
+            }
+            content_width = content_width.max(row_width);
+        }
+        SelectObject(dc, old);
+        let _ = DeleteObject(font);
+        let _ = DeleteObject(reset_font);
+        ReleaseDC(HWND::default(), dc);
+        sc(24) + content_width
+    }
+}
+
+/// Available height controls vertical spacing; both quota windows remain inside
+/// short taskbars instead of drawing a 64 px design into a clipped window.
+fn compact_row_geometry(height: i32, rows: i32) -> (i32, i32, i32, i32) {
+    compact_row_geometry_scaled(height, rows, sc)
+}
+
+fn compact_row_geometry_scaled(
+    height: i32,
+    rows: i32,
+    scale: impl Fn(i32) -> i32,
+) -> (i32, i32, i32, i32) {
+    let row_height = height / rows.max(1);
+    let text_height = scale(18).min((row_height - scale(8)).max(scale(12)));
+    let bar_height = scale(8).min((row_height - text_height - scale(2)).max(1));
+    let gap = scale(3).min((row_height - text_height - bar_height).max(0));
+    let inset = ((row_height - text_height - gap - bar_height) / 2).max(0);
+    (row_height, text_height, bar_height, inset)
+}
+
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
     let divider_h = sc(25);
-    let divider_top = (sc(WIDGET_HEIGHT) - divider_h) / 2;
+    let height = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .and_then(|s| unsafe {
+                let mut rect = RECT::default();
+                GetClientRect(s.hwnd.to_hwnd(), &mut rect)
+                    .ok()
+                    .map(|_| rect.bottom)
+            })
+            .unwrap_or(sc(WIDGET_HEIGHT))
+    };
+    let divider_top = (height - divider_h) / 2;
     client_x >= 0
         && client_x < sc(LEFT_DIVIDER_W)
         && client_y >= divider_top
@@ -1765,6 +1897,9 @@ fn usage_percent_for_display(language: LanguageId, used_percentage: f64) -> f64 
 }
 
 fn total_widget_width_for(active_models: i32, language: LanguageId, appearance: Appearance) -> i32 {
+    if uses_compact_layout(active_models, language, appearance) {
+        return compact_widget_width(appearance);
+    }
     let bar_segments = row_bar_segment_count(active_models);
     let (label_width, text_width) = usage_layout_widths(language, appearance);
     let model_width = model_usage_width(bar_segments, text_width);
@@ -1779,6 +1914,30 @@ fn total_widget_width_for(active_models: i32, language: LanguageId, appearance: 
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
+    let count = active_model_count(
+        state.show_claude_code,
+        state.show_codex,
+        state.show_antigravity,
+    );
+    if uses_compact_layout(count, state.language, state.appearance) {
+        let (session, weekly) = if state.show_codex {
+            (&state.codex_session_text, &state.codex_weekly_text)
+        } else if state.show_claude_code {
+            (&state.session_text, &state.weekly_text)
+        } else {
+            (
+                &state.antigravity_session_text,
+                &state.antigravity_weekly_text,
+            )
+        };
+        return compact_measured_width(
+            state.appearance,
+            session,
+            weekly,
+            state.show_session_window,
+            state.show_weekly_window,
+        );
+    }
     total_widget_width_for(
         active_model_count(
             state.show_claude_code,
@@ -1791,20 +1950,10 @@ fn total_widget_width_for_state(state: &AppState) -> i32 {
 }
 
 fn total_widget_width() -> i32 {
-    let (active_models, language, appearance) = {
-        let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| {
-                (
-                    active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
-                    s.language,
-                    s.appearance,
-                )
-            })
-            .unwrap_or((1, LanguageId::English, Appearance::default()))
-    };
-    total_widget_width_for(active_models, language, appearance)
+    lock_state()
+        .as_ref()
+        .map(total_widget_width_for_state)
+        .unwrap_or_else(|| total_widget_width_for(1, LanguageId::English, Appearance::default()))
 }
 
 fn claude_accent_color() -> Color {
@@ -1957,7 +2106,13 @@ pub fn run() {
             0,
             0,
             total_widget_width_for(initial_model_count, language, settings.appearance),
-            sc(WIDGET_HEIGHT),
+            sc(preferred_widget_height_for(
+                initial_model_count,
+                language,
+                settings.show_session_window,
+                settings.show_weekly_window,
+                settings.appearance,
+            )),
             HWND::default(),
             HMENU::default(),
             hinstance,
@@ -2145,11 +2300,19 @@ fn update_quota_tooltips() {
             let chinese = s.language == LanguageId::SimplifiedChinese;
             let count = active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity);
             let (label_width, text_width) = usage_layout_widths(s.language, s.appearance);
-            let width = model_usage_width(row_bar_segment_count(count), text_width);
+            let compact = uses_compact_layout(count, s.language, s.appearance);
+            let width = if compact {
+                total_widget_width_for_state(s) - sc(12)
+            } else {
+                model_usage_width(row_bar_segment_count(count), text_width)
+            };
             let mut left = sc(LEFT_DIVIDER_W)
                 + sc(DIVIDER_RIGHT_MARGIN)
                 + label_width
                 + sc(LABEL_RIGHT_MARGIN);
+            if compact {
+                left = sc(12);
+            }
             for (id, visible, name, session, weekly) in [
                 (
                     0,
@@ -2199,7 +2362,7 @@ fn update_quota_tooltips() {
                         left,
                         top: 0,
                         right: left + width,
-                        bottom: sc(WIDGET_HEIGHT),
+                        bottom: preferred_widget_height_for_state(s),
                     },
                     text,
                 ));
@@ -2214,6 +2377,20 @@ fn update_quota_tooltips() {
 /// Render opaque taskbar content with ClearType via UpdateLayeredWindow.
 fn render_layered() {
     refresh_dpi();
+    let needs_resize = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| unsafe {
+                let mut rect = RECT::default();
+                GetClientRect(s.hwnd.to_hwnd(), &mut rect).is_ok()
+                    && rect.right - rect.left != total_widget_width_for_state(s)
+            })
+            .unwrap_or(false)
+    };
+    if needs_resize {
+        position_at_taskbar();
+    }
     update_quota_tooltips();
     let (
         hwnd_val,
@@ -2503,6 +2680,50 @@ fn paint_content(
         };
         FillRect(hdc, &right_rect, right_brush);
         let _ = DeleteObject(right_brush);
+
+        if uses_compact_layout(
+            active_model_count(show_claude_code, show_codex, show_antigravity),
+            language,
+            appearance,
+        ) {
+            let (session_percent, session_value, weekly_percent, weekly_value, color) =
+                if show_codex {
+                    (
+                        codex_session_pct,
+                        codex_session_text,
+                        codex_weekly_pct,
+                        codex_weekly_text,
+                        codex_accent,
+                    )
+                } else if show_claude_code {
+                    (session_pct, session_text, weekly_pct, weekly_text, accent)
+                } else {
+                    (
+                        antigravity_session_pct,
+                        antigravity_session_text,
+                        antigravity_weekly_pct,
+                        antigravity_weekly_text,
+                        antigravity_accent,
+                    )
+                };
+            paint_compact_quota_rows(
+                hdc,
+                width,
+                height,
+                appearance,
+                is_dark,
+                text_color,
+                color,
+                track,
+                session_percent,
+                session_value,
+                weekly_percent,
+                weekly_value,
+                show_session_window,
+                show_weekly_window,
+            );
+            return;
+        }
 
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
         let row_gap = if height < sc(WIDGET_HEIGHT) {
@@ -2910,7 +3131,7 @@ fn position_at_taskbar() {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
-    let (hwnd, embedded, tray_offset, anchor_left, taskbar_hwnd) = {
+    let (hwnd, embedded, tray_offset, anchor_left, taskbar_hwnd, compact) = {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
@@ -2936,6 +3157,11 @@ fn position_at_taskbar() {
             s.tray_offset,
             s.anchor_left,
             taskbar_hwnd,
+            uses_compact_layout(
+                active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
+                s.language,
+                s.appearance,
+            ),
         )
     };
 
@@ -2978,8 +3204,8 @@ fn position_at_taskbar() {
         save_state_settings();
     }
 
-    let widget_height = sc(WIDGET_HEIGHT).min(taskbar_height);
-    let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
+    let widget_height = preferred_widget_height().min(taskbar_height);
+    let y = compute_anchor_y(anchor_top, anchor_height, widget_height, compact);
     if embedded {
         // Child window: coordinates relative to parent (taskbar)
         let x = compute_anchor_x(
@@ -3024,9 +3250,14 @@ fn compute_anchor_x(
     }
 }
 
-fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32) -> i32 {
-    let anchor_bottom = anchor_top + anchor_height;
-    (anchor_bottom - widget_height).max(anchor_top)
+fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32, compact: bool) -> i32 {
+    let extra_height = (anchor_height - widget_height).max(0);
+    anchor_top
+        + if compact {
+            extra_height / 2
+        } else {
+            extra_height
+        }
 }
 
 /// WinEvent callback for tray icon location changes
@@ -3300,8 +3531,19 @@ unsafe extern "system" fn wnd_proc(
                             let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
                             let anchor_top = taskbar_rect.top;
                             let anchor_height = taskbar_height;
-                            let widget_height = sc(WIDGET_HEIGHT).min(taskbar_height);
-                            let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
+                            let widget_height =
+                                preferred_widget_height_for_state(s).min(taskbar_height);
+                            let compact = uses_compact_layout(
+                                active_model_count(
+                                    s.show_claude_code,
+                                    s.show_codex,
+                                    s.show_antigravity,
+                                ),
+                                s.language,
+                                s.appearance,
+                            );
+                            let y =
+                                compute_anchor_y(anchor_top, anchor_height, widget_height, compact);
                             let x = if embedded {
                                 tray_left - taskbar_rect.left - widget_width - new_offset
                             } else {
@@ -3576,7 +3818,8 @@ unsafe extern "system" fn wnd_proc(
                 | IDM_BAR_STANDARD
                 | IDM_BAR_SLIM
                 | IDM_FONT_STANDARD
-                | IDM_FONT_LARGE => {
+                | IDM_FONT_LARGE
+                | IDM_COMPACT_LAYOUT => {
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
@@ -3585,6 +3828,9 @@ unsafe extern "system" fn wnd_proc(
                                     s.appearance = Appearance::translucent_dark_taskbar()
                                 }
                                 IDM_APPEARANCE_RESET => s.appearance = Appearance::default(),
+                                IDM_COMPACT_LAYOUT => {
+                                    s.appearance.compact_layout = !s.appearance.compact_layout
+                                }
                                 IDM_PALETTE_SYSTEM => s.appearance.palette = Palette::System,
                                 IDM_PALETTE_DARK => {
                                     s.appearance.palette = Palette::HighContrastDark
@@ -3993,6 +4239,17 @@ fn show_context_menu(hwnd: HWND) {
 
         let chinese = language == LanguageId::SimplifiedChinese;
         let appearance_menu = CreatePopupMenu().unwrap();
+        append_appearance_choice(
+            appearance_menu,
+            IDM_COMPACT_LAYOUT,
+            appearance.compact_layout,
+            if chinese {
+                "紧凑布局（简体中文，单服务）"
+            } else {
+                "Compact layout (Simplified Chinese, one service)"
+            },
+        );
+        let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
         append_appearance_choice(
             appearance_menu,
             IDM_APPEARANCE_RECOMMENDED,
@@ -4499,6 +4756,128 @@ fn paint(hdc: HDC, hwnd: HWND) {
     }
 }
 
+fn paint_compact_quota_rows(
+    hdc: HDC,
+    width: i32,
+    height: i32,
+    appearance: Appearance,
+    is_dark: bool,
+    text_color: &Color,
+    accent: &Color,
+    track: &Color,
+    session_percent: f64,
+    session_text: &str,
+    weekly_percent: f64,
+    weekly_text: &str,
+    show_session: bool,
+    show_weekly: bool,
+) {
+    let rows = show_session as i32 + show_weekly as i32;
+    let (row_height, text_height, bar_height, inset) = compact_row_geometry(height, rows);
+    let secondary = reset_text_color(appearance, is_dark);
+    let content_right = (compact_measured_width(
+        appearance,
+        session_text,
+        weekly_text,
+        show_session,
+        show_weekly,
+    ) - sc(12))
+    .min(width - sc(12));
+    unsafe {
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let font = create_widget_font(appearance);
+        let reset_font = quota_text::create_reset_font(sc(appearance.font_px() - 1));
+        let old_font = SelectObject(hdc, font);
+        let mut row = 0;
+        for (visible, label, percent, value) in [
+            (show_session, "5h", session_percent, session_text),
+            (show_weekly, "7d", weekly_percent, weekly_text),
+        ] {
+            if !visible {
+                continue;
+            }
+            let y = row * row_height + inset;
+            let draw_text = |left: i32, right: i32, text: &str, color: &Color, flags| {
+                // No reset text is available during startup or an auth error.
+                // DrawTextW may inspect its buffer even when the count is zero.
+                if text.is_empty() {
+                    return;
+                }
+                let mut wide: Vec<u16> = text.encode_utf16().collect();
+                let mut rect = RECT {
+                    left,
+                    top: y,
+                    right,
+                    bottom: y + text_height,
+                };
+                let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
+                let _ = DrawTextW(
+                    hdc,
+                    &mut wide,
+                    &mut rect,
+                    DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | flags,
+                );
+            };
+            SelectObject(hdc, font);
+            draw_text(sc(12), sc(32), label, text_color, DT_LEFT);
+            let (percentage, reset) = quota_text::parts(value);
+            SelectObject(hdc, font);
+            let measure = |value: &str| {
+                let wide: Vec<u16> = value.encode_utf16().collect();
+                let mut size = SIZE::default();
+                if !wide.is_empty() {
+                    let _ = GetTextExtentPoint32W(hdc, &wide, &mut size);
+                }
+                size.cx
+            };
+            // Equal visible gaps, rather than a right-aligned three-digit slot.
+            let percentage_x = sc(12) + measure(label) + sc(8);
+            let reset_x = percentage_x + measure(percentage) + sc(8);
+            draw_text(percentage_x, reset_x - sc(8), percentage, accent, DT_LEFT);
+            SelectObject(hdc, reset_font);
+            // Include a small space before the suffix as in the approved SVG.
+            let reset = reset.replace("重置", " 重置");
+            draw_text(reset_x, width - sc(12), &reset, &secondary, DT_LEFT);
+
+            let gap = sc(3).min((row_height - text_height - bar_height).max(0));
+            let bar_y = y + text_height + gap;
+            let bar = RECT {
+                left: sc(12),
+                top: bar_y,
+                right: content_right,
+                bottom: bar_y + bar_height,
+            };
+            let fill = usage_bar_fill_percentage(percent, value) / 100.0;
+            if appearance.bar_style == BarStyle::Segmented {
+                let segment_width = (bar.right - bar.left) as f64 / 10.0;
+                for segment in 0..10 {
+                    let rect = RECT {
+                        left: bar.left + (segment_width * segment as f64).round() as i32,
+                        right: bar.left + (segment_width * (segment + 1) as f64).round() as i32
+                            - sc(1),
+                        ..bar
+                    };
+                    draw_rounded_rect(hdc, &rect, track, bar_height / 2);
+                    fill_rounded_bar(
+                        hdc,
+                        &rect,
+                        (fill * 10.0 - segment as f64).clamp(0.0, 1.0),
+                        accent,
+                        bar_height / 2,
+                    );
+                }
+            } else {
+                draw_rounded_rect(hdc, &bar, track, bar_height / 2);
+                fill_rounded_bar(hdc, &bar, fill, accent, bar_height / 2);
+            }
+            row += 1;
+        }
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+        let _ = DeleteObject(reset_font);
+    }
+}
+
 fn draw_row(
     hdc: HDC,
     x: i32,
@@ -4733,6 +5112,133 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_layout_is_opt_in_and_preserved_for_supported_selections() {
+        let mut appearance: Appearance = serde_json::from_str("{}").unwrap();
+        assert!(!appearance.compact_layout);
+        assert!(!uses_compact_layout(
+            1,
+            LanguageId::SimplifiedChinese,
+            appearance
+        ));
+        assert_eq!(
+            preferred_widget_height_for(1, LanguageId::SimplifiedChinese, true, true, appearance),
+            WIDGET_HEIGHT
+        );
+
+        appearance.compact_layout = true;
+        let restored: Appearance =
+            serde_json::from_str(&serde_json::to_string(&appearance).unwrap()).unwrap();
+        assert!(uses_compact_layout(
+            1,
+            LanguageId::SimplifiedChinese,
+            restored
+        ));
+        assert!(!uses_compact_layout(
+            2,
+            LanguageId::SimplifiedChinese,
+            restored
+        ));
+        assert!(!uses_compact_layout(1, LanguageId::English, restored));
+        assert_eq!(
+            preferred_widget_height_for(1, LanguageId::SimplifiedChinese, true, false, restored),
+            32
+        );
+        assert_eq!(
+            preferred_widget_height_for(1, LanguageId::SimplifiedChinese, true, true, restored),
+            64
+        );
+        assert_eq!(
+            preferred_widget_height_for(2, LanguageId::SimplifiedChinese, true, true, restored),
+            WIDGET_HEIGHT
+        );
+    }
+
+    #[test]
+    fn compact_width_uses_only_visible_text_and_reserves_status_markers() {
+        for font_size in [FontSize::Standard, FontSize::Large] {
+            let appearance = Appearance {
+                font_size,
+                compact_layout: true,
+                ..Appearance::default()
+            };
+            let session = "8% 18:30重置";
+            let weekly = "100% 12/31重置 *";
+            let single = compact_measured_width(appearance, session, weekly, true, false);
+            let weekly_only = compact_measured_width(appearance, session, weekly, false, true);
+            assert!(weekly_only > single);
+            assert_eq!(
+                single,
+                compact_measured_width(appearance, session, "", true, false)
+            );
+            assert_eq!(
+                weekly_only,
+                compact_measured_width(appearance, session, weekly, true, true)
+            );
+            assert!(compact_measured_width(appearance, "--", "--", true, true) < single);
+        }
+    }
+
+    #[test]
+    fn widget_is_centered_for_single_and_double_quota_rows() {
+        for (top, available, widget) in [(1704, 96, 64), (1704, 96, 96), (0, 48, 32), (-48, 48, 32)]
+        {
+            let y = compute_anchor_y(top, available, widget, true);
+            assert_eq!(y - top, top + available - y - widget);
+        }
+        assert_eq!(compute_anchor_y(100, 48, 64, true), 100);
+        assert_eq!(compute_anchor_y(100, 48, 32, false), 116);
+    }
+
+    #[test]
+    fn compact_startup_and_error_states_render_without_reset_text() {
+        unsafe {
+            let dc = CreateCompatibleDC(HDC::default());
+            assert!(!dc.is_invalid());
+            let appearance = Appearance::default();
+            let (_, text, track) = appearance_colors(appearance, false);
+            let accent = provider_icons::codex_color(false);
+            for value in ["--", "", "网络", "100%"] {
+                paint_compact_quota_rows(
+                    dc,
+                    sc(192),
+                    sc(48),
+                    appearance,
+                    false,
+                    &text,
+                    &accent,
+                    &track,
+                    0.0,
+                    value,
+                    0.0,
+                    value,
+                    true,
+                    true,
+                );
+            }
+            let _ = DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn compact_rows_fit_short_taskbars_with_both_windows_visible() {
+        for dpi in [96, 120, 144, 192] {
+            let scale = |px: i32| (px as f64 * dpi as f64 / 96.0).round() as i32;
+            for height in [32, 40, 48, 64] {
+                for rows in [1, 2] {
+                    let height = scale(height);
+                    let (row_height, text_height, bar_height, inset) =
+                        compact_row_geometry_scaled(height, rows, scale);
+                    let gap = scale(3).min((row_height - text_height - bar_height).max(0));
+                    assert!(bar_height > 0);
+                    assert!(text_height >= scale(12));
+                    assert!(inset + text_height + gap + bar_height <= row_height);
+                    assert!(row_height * rows <= height);
+                }
+            }
+        }
+    }
 
     #[test]
     fn unavailable_quota_has_no_bar_fill() {
