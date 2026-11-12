@@ -19,6 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
+use crate::mcp_server;
 use crate::models::AppUsageData;
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_FRESHNESS, TIMER_POLL, TIMER_TASKBAR_RETRY,
@@ -84,6 +85,10 @@ struct AppState {
     show_weekly_window: bool,
     alert_threshold_percent: u8,
     notified_quota_windows: BTreeSet<String>,
+    mcp_enabled: bool,
+    mcp_port: Option<u16>,
+    /// The server is enabled but could not start (the port is in use or reserved).
+    mcp_unavailable: bool,
 
     data: Option<AppUsageData>,
 
@@ -131,6 +136,7 @@ const IDM_ADAPTIVE_REFRESH: u16 = 14;
 const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
 const IDM_ANCHOR_LEFT: u16 = 34;
+const IDM_MCP_SERVER: u16 = 35;
 const IDM_VERSION_ACTION: u16 = 31;
 const IDM_LANG_SYSTEM: u16 = 40;
 const IDM_LANG_ENGLISH: u16 = 41;
@@ -458,6 +464,10 @@ struct SettingsFile {
     alert_threshold_percent: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     notified_quota_windows: Vec<String>,
+    #[serde(default)]
+    mcp_server_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mcp_port: Option<u16>,
 }
 
 impl Default for SettingsFile {
@@ -480,6 +490,8 @@ impl Default for SettingsFile {
             show_weekly_window: true,
             alert_threshold_percent: 0,
             notified_quota_windows: Vec::new(),
+            mcp_server_enabled: false,
+            mcp_port: None,
         }
     }
 }
@@ -613,6 +625,8 @@ fn save_state_settings() {
             show_weekly_window: s.show_weekly_window,
             alert_threshold_percent: s.alert_threshold_percent,
             notified_quota_windows: s.notified_quota_windows.iter().cloned().collect(),
+            mcp_server_enabled: s.mcp_enabled,
+            mcp_port: s.mcp_port,
         })
     });
     if let Err(error) = result {
@@ -2020,6 +2034,9 @@ pub fn run() {
                 show_weekly_window: settings.show_weekly_window,
                 alert_threshold_percent: settings.alert_threshold_percent,
                 notified_quota_windows: settings.notified_quota_windows.into_iter().collect(),
+                mcp_enabled: settings.mcp_server_enabled,
+                mcp_port: settings.mcp_port,
+                mcp_unavailable: false,
                 data: None,
                 poll_interval_ms: settings.poll_interval_ms,
                 adaptive_refresh: settings.adaptive_refresh,
@@ -2110,6 +2127,7 @@ pub fn run() {
         // Initial poll
         let send_hwnd = SendHwnd::from_hwnd(hwnd);
         request_poll(send_hwnd, false);
+        apply_mcp_setting();
 
         schedule_auto_update_check(hwnd);
         let should_check_updates = {
@@ -2132,7 +2150,58 @@ pub fn run() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        // Every exit path ends the message loop; release the port before exiting.
+        mcp_server::stop();
     }
+}
+
+/// The optional MCP server's port: `mcp_port` in settings, else the default.
+fn mcp_port(setting: Option<u16>) -> u16 {
+    setting
+        .filter(|port| *port >= 1024)
+        .unwrap_or(mcp_server::DEFAULT_PORT)
+}
+
+/// Start or stop the MCP server to match the setting. Polling is unaffected:
+/// the server only copies the monitor's state when a tool is called.
+fn apply_mcp_setting() {
+    let Some((enabled, port)) = lock_state()
+        .as_ref()
+        .map(|s| (s.mcp_enabled, mcp_port(s.mcp_port)))
+    else {
+        return;
+    };
+    let unavailable = if enabled {
+        match mcp_server::start(port, mcp_snapshot) {
+            Ok(()) => false,
+            Err(error) => {
+                diagnose::log_error("MCP server could not start", error);
+                true
+            }
+        }
+    } else {
+        mcp_server::stop();
+        false
+    };
+    if let Some(s) = lock_state().as_mut() {
+        s.mcp_unavailable = unavailable;
+    }
+}
+
+fn mcp_menu_label(chinese: bool, unavailable: bool, port: u16) -> String {
+    match (chinese, unavailable) {
+        (false, false) => "Local MCP server for AI agents (read-only)".into(),
+        (false, true) => format!("Local MCP server (read-only): port {port} is unavailable"),
+        (true, false) => "供 AI 代理使用的本地 MCP 服务（只读）".into(),
+        (true, true) => format!("本地 MCP 服务（只读）：端口 {port} 不可用"),
+    }
+}
+
+fn mcp_snapshot() -> mcp_server::Snapshot {
+    let state = lock_state();
+    let s = state.as_ref()?;
+    // Tool order: Claude Code (service 0), then Codex (service 1).
+    Some([0, 1].map(|id| mcp_server::ProviderRecord::from_service(&s.monitor.services[id])))
 }
 
 /// Keep missing-window explanations aligned with the Codex quota cells.
@@ -3499,6 +3568,13 @@ unsafe extern "system" fn wnd_proc(
                 IDM_START_WITH_WINDOWS => {
                     set_startup_enabled(!is_startup_enabled());
                 }
+                IDM_MCP_SERVER => {
+                    if let Some(s) = lock_state().as_mut() {
+                        s.mcp_enabled = !s.mcp_enabled;
+                    }
+                    save_state_settings();
+                    apply_mcp_setting();
+                }
                 IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
                     let new_interval = match id {
                         IDM_FREQ_1MIN => POLL_1_MIN,
@@ -4233,6 +4309,26 @@ fn show_context_menu(hwnd: HWND) {
             MENU_ITEM_FLAGS(0),
             IDM_RESET_POSITION as usize,
             PCWSTR::from_raw(reset_pos_str.as_ptr()),
+        );
+
+        let (mcp_enabled, mcp_unavailable, mcp_port_number) = lock_state()
+            .as_ref()
+            .map(|s| (s.mcp_enabled, s.mcp_unavailable, mcp_port(s.mcp_port)))
+            .unwrap_or((false, false, mcp_server::DEFAULT_PORT));
+        let mcp_label = native_interop::wide_str(&mcp_menu_label(
+            language == LanguageId::SimplifiedChinese,
+            mcp_unavailable,
+            mcp_port_number,
+        ));
+        let _ = AppendMenuW(
+            settings_menu,
+            if mcp_enabled {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            },
+            IDM_MCP_SERVER as usize,
+            PCWSTR::from_raw(mcp_label.as_ptr()),
         );
 
         let taskbars = native_interop::find_taskbars();
@@ -5012,6 +5108,25 @@ mod tests {
         assert!(!settings.show_weekly_window);
         assert_eq!(settings.alert_threshold_percent, 0);
         assert_eq!(settings.notified_quota_windows.len(), 1);
+    }
+
+    #[test]
+    fn mcp_server_is_opt_in_and_keeps_older_settings_compatible() {
+        let older: SettingsFile = serde_json::from_str(r#"{"show_codex":true}"#).unwrap();
+        assert!(!older.mcp_server_enabled);
+        assert_eq!(mcp_port(older.mcp_port), mcp_server::DEFAULT_PORT);
+        let saved = serde_json::to_value(&older).unwrap();
+        assert_eq!(saved["mcp_server_enabled"], false);
+        assert!(saved.get("mcp_port").is_none());
+
+        let custom: SettingsFile =
+            serde_json::from_str(r#"{"mcp_server_enabled":true,"mcp_port":47000}"#).unwrap();
+        assert!(custom.mcp_server_enabled);
+        assert_eq!(mcp_port(custom.mcp_port), 47000);
+        // Privileged or zero ports fall back to the default.
+        assert_eq!(mcp_port(Some(80)), mcp_server::DEFAULT_PORT);
+        assert_eq!(mcp_port(Some(0)), mcp_server::DEFAULT_PORT);
+        assert!(mcp_menu_label(false, true, 47000).contains("47000"));
     }
 
     #[test]

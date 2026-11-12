@@ -154,6 +154,10 @@ Refresh behavior:
 
 Right-click the widget or tray icon and open **Appearance** to choose a system, high-contrast dark, or high-contrast light palette; continuous or segmented bars; standard or slim bars; and standard or larger text. High-contrast palettes add a solid backdrop and bold text for readability over translucent taskbars. The **Recommended: translucent dark taskbar** action applies high-contrast dark colors, slim continuous rounded bars, and larger text. The widget also fits its height to the selected taskbar, avoiding clipped rows on 40-pixel taskbars. Appearance choices are saved in `settings.json`; existing settings keep their previous appearance until changed.
 
+### Local MCP Server For AI Agents (Optional)
+
+Turn on **Settings > Local MCP server for AI agents (read-only)** to let Claude Code, Codex CLI, or another MCP client read the widget's Claude Code and Codex quota through two tools, `get_claude_usage` and `get_codex_usage`. The server listens on `http://127.0.0.1:46827/mcp` only. Tool calls return the widget's last reading with its age, reset times, and status. They never start a request, read credentials, or use quota. It is off by default. See [Local MCP server](docs/mcp.md) for setup, the result format, and the security model.
+
 ## Diagnostics
 
 If you need to troubleshoot startup or visibility issues, run:
@@ -219,6 +223,7 @@ What the app stores locally:
 - Quota-window notification keys used to prevent duplicate alerts
 - Displayed model preferences
 - Appearance, selected display, left-edge pinning, and the faster-refresh setting
+- Whether the optional local MCP server is on, and its port if you changed it
 
 What it does **not** do:
 
@@ -228,6 +233,7 @@ What it does **not** do:
 - It does not upload your project files
 - It does not directly edit your Codex credentials file
 - It does not read or reuse Claude Desktop authentication data
+- It does not accept network connections, unless you turn on the optional MCP server, which accepts connections from this computer only (`127.0.0.1`) and returns quota numbers only
 
 Notes:
 
