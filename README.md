@@ -21,7 +21,7 @@ It sits in your taskbar and shows how much of your Codex usage window remains wi
 - A **7d** bar for your current weekly window
 - Simplified Chinese display with explicit remaining usage and reset countdowns
 - Optional Claude Code usage alongside Codex
-- Optional Antigravity model usage bars for Google's 5-hour and weekly Gemini quota windows
+- Optional Antigravity usage bars for the 5-hour and weekly windows of a chosen model group (Gemini Models by default)
 - A live countdown until each limit resets
 - Optional low-quota alerts at 10%, 20%, or 30% remaining, deduplicated per reset window
 - Independent display controls for the 5-hour and weekly rows
@@ -111,7 +111,22 @@ Use the right-click **Monitored services** menu to choose which independent serv
 - **Claude Code** can be enabled alongside Codex or shown by itself when Claude Code CLI is installed and authenticated
 - **Antigravity** can be enabled alongside the other providers or shown by itself as its own service column
 
-When multiple services are shown, each service has its own usage bar and matching usage text color. Antigravity prefers Google's Gemini quota summary when available and falls back to model quota data when needed.
+When multiple services are shown, each service has its own usage bar and matching usage text color.
+
+### Antigravity Quota Groups
+
+Antigravity's quota panel lists several model groups, each with its own 5-hour and weekly limits, such as **Gemini Models**, **Claude and GPT Models** and **Gemini 4 Argon**. Choose the group to show from **Monitored services > Antigravity quota group**:
+
+- **Auto (Gemini Models first)** shows Gemini Models. If that group is not reported, it shows another reported group. The hover tooltip always names the group being shown, for example `Antigravity (Gemini Models)`.
+- **A specific group** shows only that group. If the current source stops reporting it, the last reading stays visible marked stale (`*`), or `--` if there is none. Another group's values are never shown in its place. The group appears again when its data comes back.
+- A window that a group does not have, such as Gemini 4 Argon's 5-hour window, shows `--`, not 0% used.
+
+Where the data comes from:
+
+- **While Antigravity is running**, the monitor reads the same quota summary that Antigravity's own panel shows, from Antigravity's bundled language server on `127.0.0.1`. This source reports every group.
+- **When Antigravity is closed**, or its server cannot be read, the monitor uses Google's online quota service with your Antigravity sign-in. For some accounts that service reports fewer groups, for example only Claude and GPT Models.
+
+The group list in the menu fills in once Antigravity has reported its groups during the current session.
 
 Claude Desktop and Claude Code CLI use separate local sessions. Signing in to Claude Desktop does not enable Claude Code monitoring. When no supported Claude Code CLI credentials are available, the menu shows **Claude Code (CLI login required)** as a disabled item and automatically keeps that service off.
 
@@ -198,12 +213,14 @@ What the app reads:
 - If needed, the same credentials file inside an installed WSL distro
 - If Codex is enabled, your local Codex credentials from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`
 - If Antigravity is enabled, your local Antigravity OAuth token from Windows Credential Manager target `gemini:antigravity`
+- If Antigravity is enabled and running, the per-launch local access token (`--csrf_token`) from the command line of Antigravity's bundled language server (`...\antigravity\resources\bin\language_server*.exe`) in your own Windows session. It is used only for a read-only quota request to that same process on `127.0.0.1`. It is never logged, stored or sent anywhere else.
 
 What the app sends over the network:
 
 - Requests to Anthropic's Claude endpoints to read your usage and rate-limit information
 - Requests to ChatGPT's Codex usage endpoint to read your Codex usage and rate-limit information, if Codex is enabled
-- Requests to Google's Cloud Code / Antigravity endpoints to read your Antigravity quota information, if Antigravity is enabled
+- Requests to Google's Cloud Code / Antigravity endpoints to read your Antigravity quota information, if Antigravity is enabled and its local language server is not available
+- One read-only quota request per refresh to Antigravity's language server on `127.0.0.1`, if Antigravity is enabled and running. It never uses a proxy.
 - Requests to GitHub only if you use the app's update check / self-update feature
 - If proxy environment variables such as `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY` are set, those outbound requests may use that proxy
 
@@ -217,7 +234,7 @@ What the app stores locally:
 - Last update check time
 - Visible quota rows and low-quota alert threshold
 - Quota-window notification keys used to prevent duplicate alerts
-- Displayed model preferences
+- Displayed model preferences and the Antigravity quota group (omitted when Auto)
 - Appearance, selected display, left-edge pinning, and the faster-refresh setting
 
 What it does **not** do:

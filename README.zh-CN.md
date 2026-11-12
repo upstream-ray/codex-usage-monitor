@@ -21,7 +21,7 @@
 - 显示当前**每周**用量窗口
 - 支持简体中文界面，明确显示剩余用量和重置倒计时
 - 可同时显示 Claude Code 用量
-- 可显示 Google 5 小时及每周 Gemini 配额窗口中的 Antigravity 模型用量
+- 可显示所选 Antigravity 模型额度组（默认 Gemini 模型）的 5 小时及每周用量
 - 实时显示各项限额的重置倒计时
 - 可在剩余配额为 10%、20% 或 30% 时发出提醒；每个重置窗口只提醒一次
 - 可分别控制 5 小时和每周用量行的显示
@@ -111,7 +111,22 @@ codex-usage
 - **Claude Code** 在已安装并登录 Claude Code CLI 时，可与 Codex 同时显示或单独显示
 - **Antigravity** 可与其他提供商同时显示，也可作为独立服务列单独显示
 
-显示多个服务时，每个服务都有自己的用量条和对应的文字颜色。Antigravity 会优先使用 Google 的 Gemini 配额摘要，必要时回退到模型配额数据。
+显示多个服务时，每个服务都有自己的用量条和对应的文字颜色。
+
+### Antigravity 额度组
+
+Antigravity 的额度面板列出多个模型额度组，例如 **Gemini Models**、**Claude and GPT Models** 和 **Gemini 4 Argon**，每组都有各自的 5 小时和每周限额。可在**监控服务 > Antigravity 额度组**中选择要显示的额度组：
+
+- **自动（优先 Gemini 模型）**：显示 Gemini Models；若未提供该组，则显示其他已提供的额度组。悬停提示始终会注明当前显示的额度组，例如 `Antigravity (Gemini Models)`。
+- **指定额度组**：只显示该组。若当前数据源不再提供该组，会保留上次读数并标记为过期（`*`），没有读数时显示 `--`；绝不会用其他额度组的数值代替。该组数据恢复后会重新显示。
+- 某个额度组没有的窗口（例如 Gemini 4 Argon 没有 5 小时限额）显示 `--`，而不是已用 0%。
+
+数据来源：
+
+- **Antigravity 运行时**，从 Antigravity 自带的语言服务器（`127.0.0.1`）读取与 Antigravity 额度面板相同的额度摘要，包含所有额度组。
+- **Antigravity 关闭时**，或无法读取其语言服务器时，使用 Antigravity 登录凭据请求 Google 的在线额度服务。部分账户在该服务中提供的额度组较少，例如只有 Claude and GPT Models。
+
+本次运行中 Antigravity 报告过额度组后，菜单中才会列出这些额度组。
 
 Claude 桌面客户端与 Claude Code CLI 使用相互独立的本地登录状态。只登录 Claude 桌面客户端不会启用 Claude Code 监控。检测不到受支持的 Claude Code CLI 凭据时，菜单会以禁用状态显示 **Claude Code（需登录 CLI）**，并自动关闭该服务。
 
@@ -205,12 +220,14 @@ Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Co
 - 必要时，已安装 WSL 发行版中的同一凭据文件
 - 启用 Codex 时，读取 `$CODEX_HOME/auth.json` 或 `~/.codex/auth.json` 中的本地 Codex 凭据
 - 启用 Antigravity 时，读取 Windows 凭据管理器中目标为 `gemini:antigravity` 的本地 OAuth 令牌
+- 启用并运行 Antigravity 时，从当前 Windows 会话中 Antigravity 自带语言服务器（`...\antigravity\resources\bin\language_server*.exe`）的命令行读取其每次启动生成的本地访问令牌（`--csrf_token`）。该令牌仅用于向同一进程在 `127.0.0.1` 上发送只读额度请求，不会被记录、保存或发送到其他地方
 
 应用通过网络发送的请求：
 
 - 请求 Anthropic 的 Claude 端点，以读取用量和速率限制信息
 - 启用 Codex 时，请求 ChatGPT 的 Codex 用量端点，以读取 Codex 用量和速率限制信息
-- 启用 Antigravity 时，请求 Google Cloud Code / Antigravity 端点，以读取 Antigravity 配额信息
+- 启用 Antigravity 且其本地语言服务器不可用时，请求 Google Cloud Code / Antigravity 端点，以读取 Antigravity 配额信息
+- 启用并运行 Antigravity 时，每次刷新向 `127.0.0.1` 上的 Antigravity 语言服务器发送一次只读额度请求，不经过代理
 - 仅在使用软件更新检查或自更新功能时请求 GitHub
 - 如果设置了 `HTTPS_PROXY`、`HTTP_PROXY` 或 `ALL_PROXY` 等代理环境变量，上述出站请求可能通过代理发送
 
@@ -224,7 +241,7 @@ Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Co
 - 上次更新检查时间
 - 可见的配额行和低配额提醒阈值
 - 用于避免重复提醒的配额窗口通知键
-- 显示模型偏好
+- 显示模型偏好和 Antigravity 额度组（自动时不保存）
 - 外观、所选显示器、左侧固定和加快刷新设置
 
 应用**不会**执行的操作：
