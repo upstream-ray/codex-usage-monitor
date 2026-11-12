@@ -157,6 +157,22 @@ impl Monitor {
             }),
         }
     }
+    /// Discards one provider's readings after its data selection changed (an
+    /// Antigravity quota group), so values of the previous selection are never
+    /// shown under the new one, and a request already running cannot publish
+    /// them. Only that provider is refreshed; server retry deadlines are kept.
+    pub fn reselect(&mut self, id: usize, now: Instant) {
+        let s = &mut self.services[id];
+        s.generation = s.generation.wrapping_add(1);
+        s.data = None;
+        s.error = None;
+        s.history = History::default();
+        s.auth = None;
+        s.retries = 0;
+        s.reset = ResetRefresh::default();
+        s.due = s.retry_not_before.map_or(now, |deadline| deadline.max(now));
+        s.forced = s.enabled;
+    }
     pub fn configure(&mut self, enabled: [bool; 3], now: Instant) {
         for (service, enabled) in self.services.iter_mut().zip(enabled) {
             if service.enabled != enabled {
@@ -262,7 +278,9 @@ impl Monitor {
                 };
                 s.interval_ms = if let PollError::RateLimited(Some(ms)) = error {
                     ms
-                } else if s.auth.is_some() {
+                } else if s.auth.is_some() || error == PollError::QuotaGroupUnavailable {
+                    // Nothing to retry quickly: the source answered, just not
+                    // with the selected group.
                     base
                 } else {
                     quota_refresh::retry_interval_ms(base, s.retries)
@@ -378,6 +396,7 @@ impl Service {
                     PollError::RateLimited(_) => "请求过于频繁，正在退避",
                     PollError::ServerError => "服务暂时不可用",
                     PollError::RequestFailed => "无法读取额度响应",
+                    PollError::QuotaGroupUnavailable => "所选额度组暂不可用",
                 }
             } else {
                 error.category()
@@ -842,5 +861,99 @@ mod tests {
         );
         assert_eq!(m.services[1].interval_ms, 5_000);
         assert_eq!(m.plan(now + Duration::from_secs(65))[0].id, 1);
+    }
+
+    #[test]
+    fn reselecting_a_quota_group_discards_only_that_providers_readings() {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let mut m = Monitor::new([true, true, true], now);
+        for job in m.plan(now) {
+            complete(&mut m, &job, Ok(usage(20.0 + job.id as f64)), now, wall);
+        }
+        let later = now + Duration::from_secs(1_000);
+        let running = m.plan(later);
+        let old = running.iter().find(|job| job.id == 2).unwrap().clone();
+        for job in running.iter().filter(|job| job.id != 2) {
+            complete(&mut m, job, Ok(usage(30.0)), later, wall);
+        }
+
+        m.reselect(2, later);
+        assert!(m.services[2].data.is_none(), "the old group is not shown");
+        assert!(m.services[2].history.last_success.is_none());
+        assert!(m.cached().antigravity.is_none());
+        assert!(m.cached().claude_code.is_some() && m.cached().codex.is_some());
+        // A request for the previous group cannot publish its values.
+        assert!(!complete(&mut m, &old, Ok(usage(99.0)), later, wall).accepted);
+        assert!(m.services[2].data.is_none());
+        // Only the reselected provider is due again.
+        let jobs = m.plan(later);
+        assert_eq!(jobs.iter().map(|job| job.id).collect::<Vec<_>>(), [2]);
+        assert!(complete(&mut m, &jobs[0], Ok(usage(40.0)), later, wall).accepted);
+        assert_eq!(
+            m.services[2].data.as_ref().unwrap().session.percentage,
+            40.0
+        );
+        assert_eq!(
+            m.services[0].data.as_ref().unwrap().session.percentage,
+            30.0
+        );
+    }
+
+    #[test]
+    fn reselecting_keeps_a_server_retry_deadline() {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let mut m = Monitor::new([false, false, true], now);
+        let job = m.plan(now).remove(0);
+        complete(
+            &mut m,
+            &job,
+            Err(PollError::RateLimited(Some(600_000))),
+            now,
+            wall,
+        );
+        m.reselect(2, now);
+        assert!(m.plan(now).is_empty());
+        assert_eq!(m.plan(now + Duration::from_secs(600)).len(), 1);
+    }
+
+    #[test]
+    fn an_unavailable_quota_group_keeps_its_last_value_stale_without_fast_retries() {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let mut m = Monitor::new([false, false, true], now);
+        let job = m.plan(now).remove(0);
+        complete(&mut m, &job, Ok(usage(12.0)), now, wall);
+        assert!(!m.services[2].stale(wall));
+
+        for round in 1..=3u64 {
+            let at = now + Duration::from_secs(1_000 * round);
+            let job = m.plan(at).remove(0);
+            complete(
+                &mut m,
+                &job,
+                Err(PollError::QuotaGroupUnavailable),
+                at,
+                wall,
+            );
+            // The selected group's last value stays, marked stale, and is
+            // retried at the normal interval rather than a 30 s backoff.
+            assert_eq!(
+                m.services[2].data.as_ref().unwrap().session.percentage,
+                12.0
+            );
+            assert!(m.services[2].stale(wall));
+            assert_eq!(m.services[2].interval_ms, 900_000);
+            assert!(m.plan(at + Duration::from_secs(60)).is_empty());
+        }
+        let description = m.services[2].description(wall, now, false);
+        assert!(
+            description.contains("quota_group_unavailable"),
+            "{description}"
+        );
+        assert!(m.services[2]
+            .description(wall, now, true)
+            .contains("所选额度组暂不可用"));
     }
 }

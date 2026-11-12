@@ -11,8 +11,15 @@ Codex Usage keeps authentication failures separate from transient service failur
 | `限流` | `429` | Provider rate limit | Wait for the provider retry window; Codex Usage retries with backoff |
 | `服务` | `5XX` | Provider service failure | Wait and retry; check provider status if it persists |
 | `错误` | `ERR` | Invalid or unsupported response | Enable diagnostics and inspect the log |
+| `--` | `--` | No reading for this window, or the selected Antigravity quota group is not reported by the current source | For Antigravity, open Antigravity so its local quota summary is used, or choose **Auto** in **Monitored services > Antigravity quota group** |
 
-Authentication failures pause provider polling until the credential source changes, preventing repeated login notifications. Transient failures use exponential backoff up to the configured refresh interval.
+Authentication failures pause provider polling until the credential source changes, preventing repeated login notifications. For Antigravity, starting Antigravity also ends that pause, because its local quota summary needs no Google token. Transient failures use exponential backoff up to the configured refresh interval.
+
+## Antigravity shows a different group than its quota panel
+
+While Antigravity is running, the monitor reads the quota summary that Antigravity's own panel shows, from Antigravity's language server on `127.0.0.1`. When Antigravity is closed, it uses Google's online quota service instead, which may report fewer groups for some accounts. With `--diagnose`, the log records which source answered (for example `Antigravity quota from its language server (loopback port …)`) and the reported group layout. The log never records the language server's access token.
+
+This local source is an internal Antigravity interface and may change in Antigravity updates. When it stops answering, the monitor falls back to Google's service.
 
 ## Diagnostic log
 
