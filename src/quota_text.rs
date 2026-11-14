@@ -45,9 +45,18 @@ pub unsafe fn create_reset_font(height: i32) -> HFONT {
     )
 }
 
+/// The number before `%`: one to three digits, or `<1` for a positive value
+/// below 1%.
+fn is_percent_number(text: &str) -> bool {
+    match text.strip_prefix('<') {
+        Some(below) => below == "1",
+        None => !text.is_empty() && text.len() <= 3 && text.bytes().all(|b| b.is_ascii_digit()),
+    }
+}
+
 fn parts(text: &str) -> (&str, &str) {
     if let Some(end) = text.find('%') {
-        if text[..end].chars().all(|c| c.is_ascii_digit()) && end > 0 {
+        if is_percent_number(&text[..end]) {
             return (
                 &text[..=end],
                 text[end + 1..].trim_start_matches([' ', '·']),
@@ -59,7 +68,7 @@ fn parts(text: &str) -> (&str, &str) {
 
 fn percentage_cells(text: &str) -> Option<String> {
     let digits = text.strip_suffix('%')?;
-    if digits.is_empty() || digits.len() > 3 || !digits.chars().all(|c| c.is_ascii_digit()) {
+    if !is_percent_number(digits) {
         return None;
     }
     Some(format!("{digits:>3}%"))
@@ -170,7 +179,18 @@ mod tests {
         assert_eq!(percentage_cells("2%"), Some("  2%".into()));
         assert_eq!(percentage_cells("87%"), Some(" 87%".into()));
         assert_eq!(percentage_cells("100%"), Some("100%".into()));
+        assert_eq!(percentage_cells("<1%"), Some(" <1%".into()));
         assert_eq!(percentage_cells("--"), None);
+        assert_eq!(percentage_cells("<%"), None);
+        assert_eq!(percentage_cells("<10%"), None);
+        assert_eq!(percentage_cells("1000%"), None);
+    }
+
+    #[test]
+    fn below_one_percent_keeps_the_reset_column() {
+        assert_eq!(parts("<1% · 2h 34m"), ("<1%", "2h 34m"));
+        assert_eq!(parts("<1%  01:59重置"), ("<1%", "01:59重置"));
+        assert_eq!(parts("<1%"), ("<1%", ""));
     }
 
     #[test]

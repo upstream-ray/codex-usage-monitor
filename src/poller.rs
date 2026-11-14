@@ -716,19 +716,26 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         Ok(response) => response,
         Err(_) => return Ok(None),
     };
-    let mut data = UsageData::default();
+    Ok(Some(claude_usage_from_response(&response)))
+}
 
-    if let Some(bucket) = &response.five_hour {
-        data.session.percentage = bucket.utilization;
-        data.session.resets_at = parse_iso8601(bucket.resets_at.as_deref());
+/// A window missing from the response stays unavailable (`--`); a reported
+/// window with no reset time (no usage yet) is a real reading.
+fn claude_usage_from_response(response: &UsageResponse) -> UsageData {
+    let section = |bucket: &Option<UsageBucket>| {
+        bucket
+            .as_ref()
+            .map_or_else(UsageSection::default, |bucket| {
+                UsageSection::reported(
+                    bucket.utilization,
+                    parse_iso8601(bucket.resets_at.as_deref()),
+                )
+            })
+    };
+    UsageData {
+        session: section(&response.five_hour),
+        weekly: section(&response.seven_day),
     }
-
-    if let Some(bucket) = &response.seven_day {
-        data.weekly.percentage = bucket.utilization;
-        data.weekly.resets_at = parse_iso8601(bucket.resets_at.as_deref());
-    }
-
-    Ok(Some(data))
 }
 
 fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
@@ -823,6 +830,16 @@ fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
         }
     }
 
+    // A window is reported when its headers (or the rejection claim) say so;
+    // otherwise its zero default is not a reading.
+    for (section, prefix) in [(&mut data.session, "5h"), (&mut data.weekly, "7d")] {
+        section.available = section.percentage > 0.0
+            || section.resets_at.is_some()
+            || response
+                .header(&format!("anthropic-ratelimit-unified-{prefix}-utilization"))
+                .is_some();
+    }
+
     data
 }
 
@@ -913,10 +930,10 @@ fn codex_window_kind(window: &CodexRateLimitWindow) -> Option<UsageWindowKind> {
 }
 
 fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
-    UsageSection {
-        percentage: window.used_percent,
-        resets_at: unix_to_system_time(Some(window.reset_at)),
-    }
+    UsageSection::reported(
+        window.used_percent,
+        unix_to_system_time(Some(window.reset_at)),
+    )
 }
 
 fn antigravity_credential_watch_signature() -> String {
@@ -1096,6 +1113,7 @@ fn antigravity_section_from_quota(quota: AntigravityQuotaInfo) -> Option<UsageSe
     Some(UsageSection {
         percentage: (1.0 - remaining) * 100.0,
         resets_at: parse_iso8601(quota.reset_time.as_deref()),
+        available: true,
     })
 }
 
@@ -1106,6 +1124,7 @@ fn antigravity_section_from_summary_bucket(
     Some(UsageSection {
         percentage: (1.0 - remaining) * 100.0,
         resets_at: parse_iso8601(bucket.reset_time.as_deref()),
+        available: true,
     })
 }
 
@@ -1506,96 +1525,128 @@ fn is_token_expired(expires_at: Option<i64>) -> bool {
     now >= exp
 }
 
-/// Parse an ISO 8601 timestamp string into a SystemTime.
+/// Parses an RFC 3339 / ISO 8601 timestamp, as providers send reset times:
+/// `YYYY-MM-DDTHH:MM:SS[.fraction]` followed by `Z`, `±HH:MM` or `±HHMM`.
+/// The offset is applied, so the result is the absolute instant. A missing
+/// offset is read as UTC, as before. Anything malformed or out of range
+/// (including dates before 1970) is rejected rather than guessed.
 fn parse_iso8601(s: Option<&str>) -> Option<SystemTime> {
-    let s = s?;
-    // Strip timezone offset to get "YYYY-MM-DDTHH:MM:SS" or with fractional seconds
-    // The API returns formats like "2026-03-05T08:00:00.321598+00:00"
-    let datetime_part = s.split('+').next().unwrap_or(s);
-    let datetime_part = datetime_part.split('Z').next().unwrap_or(datetime_part);
+    let s = s?.trim();
+    let (date, time) = s.split_once(['T', 't'])?;
 
-    // Try parsing with and without fractional seconds
-    let formats = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"];
-    for fmt in &formats {
-        if let Ok(secs) = parse_datetime_to_unix(datetime_part, fmt) {
-            return Some(UNIX_EPOCH + Duration::from_secs(secs));
+    // The offset starts at the first `Z`, `+` or `-` of the time part.
+    let (clock, offset_secs) = match time.find(['Z', 'z', '+', '-']) {
+        None => (time, 0),
+        Some(index) => {
+            let (clock, zone) = time.split_at(index);
+            (clock, parse_utc_offset(zone)?)
         }
+    };
+
+    let mut date_parts = date.split('-');
+    let year = parse_fixed_digits(date_parts.next()?, 4)?;
+    let month = parse_fixed_digits(date_parts.next()?, 2)?;
+    let day = parse_fixed_digits(date_parts.next()?, 2)?;
+    if date_parts.next().is_some()
+        || year < 1970
+        || !(1..=12).contains(&month)
+        || day < 1
+        || day > days_in_month(year, month)
+    {
+        return None;
     }
-    None
+
+    // Fractional seconds are accepted and dropped (whole-second precision).
+    let (clock, fraction) = clock.split_once('.').unwrap_or((clock, "0"));
+    if fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut clock_parts = clock.split(':');
+    let hour = parse_fixed_digits(clock_parts.next()?, 2)?;
+    let minute = parse_fixed_digits(clock_parts.next()?, 2)?;
+    let second = parse_fixed_digits(clock_parts.next()?, 2)?;
+    // 60 allows a leap second, read as the next second's start.
+    if clock_parts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    let days = days_since_unix_epoch(year, month, day);
+    let local = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    let utc = local.checked_sub(offset_secs)?;
+    u64::try_from(utc)
+        .ok()
+        .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
 }
 
-/// Minimal datetime parser — avoids pulling in chrono/time crates.
-fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
-    // Extract date and time parts from "YYYY-MM-DDTHH:MM:SS[.frac]"
-    let (date_str, time_str) = s.split_once('T').ok_or(())?;
-    let date_parts: Vec<&str> = date_str.split('-').collect();
-    if date_parts.len() != 3 {
-        return Err(());
+/// `Z`, `±HH:MM` or `±HHMM` as seconds east of UTC.
+fn parse_utc_offset(zone: &str) -> Option<i64> {
+    if zone.eq_ignore_ascii_case("z") {
+        return Some(0);
     }
-
-    let year: u64 = date_parts[0].parse().map_err(|_| ())?;
-    let month: u64 = date_parts[1].parse().map_err(|_| ())?;
-    let day: u64 = date_parts[2].parse().map_err(|_| ())?;
-
-    // Strip fractional seconds
-    let time_base = time_str.split('.').next().unwrap_or(time_str);
-    let time_parts: Vec<&str> = time_base.split(':').collect();
-    if time_parts.len() != 3 {
-        return Err(());
+    let sign = match zone.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let digits = &zone[1..];
+    let (hours, minutes) = match digits.split_once(':') {
+        Some(parts) => parts,
+        None if digits.len() == 4 => digits.split_at(2),
+        None => return None,
+    };
+    let hours = parse_fixed_digits(hours, 2)?;
+    let minutes = parse_fixed_digits(minutes, 2)?;
+    if hours > 23 || minutes > 59 {
+        return None;
     }
-
-    let hour: u64 = time_parts[0].parse().map_err(|_| ())?;
-    let min: u64 = time_parts[1].parse().map_err(|_| ())?;
-    let sec: u64 = time_parts[2].parse().map_err(|_| ())?;
-
-    // Days from year (using a simplified calculation for dates after 1970)
-    let mut days: u64 = 0;
-    for y in 1970..year {
-        days += if is_leap(y) { 366 } else { 365 };
-    }
-
-    let month_days = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    for m in 1..month {
-        days += month_days[m as usize];
-        if m == 2 && is_leap(year) {
-            days += 1;
-        }
-    }
-    days += day - 1;
-
-    Ok(days * 86400 + hour * 3600 + min * 60 + sec)
+    Some(sign * (hours * 3_600 + minutes * 60))
 }
 
-fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+/// A field of exactly `len` ASCII digits.
+fn parse_fixed_digits(text: &str, len: usize) -> Option<i64> {
+    (text.len() == len && text.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| text.parse().ok())
+        .flatten()
 }
 
-/// Codex leaves absent windows as default sections. Its reported windows
-/// include a reset timestamp, including windows with zero usage.
-pub fn format_codex_line(
-    section: &UsageSection,
-    strings: Strings,
-    show_remaining_in_chinese: bool,
-    window: UsageWindowKind,
-) -> String {
-    if section.percentage == 0.0 && section.resets_at.is_none() {
-        return "--".to_string();
+fn is_leap(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if is_leap(year) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
     }
-    format_line(section, strings, show_remaining_in_chinese, window)
 }
 
-/// Format a usage section for the compact taskbar display.
+/// Days from 1970-01-01 to a valid date in 1970..=9999.
+fn days_since_unix_epoch(year: i64, month: i64, day: i64) -> i64 {
+    let years = (1970..year)
+        .map(|y| if is_leap(y) { 366 } else { 365 })
+        .sum::<i64>();
+    let months = (1..month).map(|m| days_in_month(year, m)).sum::<i64>();
+    years + months + day - 1
+}
+
+/// Format a usage section for the compact taskbar display. A window the
+/// provider did not report is `--`, never 0% used or 100% remaining.
 pub fn format_line(
     section: &UsageSection,
     strings: Strings,
     show_remaining_in_chinese: bool,
     window: UsageWindowKind,
 ) -> String {
+    if !section.available {
+        return "--".to_string();
+    }
     if show_remaining_in_chinese {
         return format_simplified_chinese_line(section, window);
     }
 
-    let pct = format!("{:.0}%", section.percentage);
+    let pct = format_percent(section.percentage);
     let cd = format_countdown(section.resets_at, strings);
     if cd.is_empty() {
         pct
@@ -1617,19 +1668,40 @@ fn format_simplified_chinese_values(
     reset: Option<windows::Win32::Foundation::SYSTEMTIME>,
     window: UsageWindowKind,
 ) -> String {
+    let remaining = format_percent(remaining);
     let Some(reset) = reset else {
-        return format!("{remaining:.0}%");
+        return remaining;
     };
     match window {
         UsageWindowKind::Session => {
-            format!(
-                "{remaining:.0}%  {:02}:{:02}重置",
-                reset.wHour, reset.wMinute
-            )
+            format!("{remaining}  {:02}:{:02}重置", reset.wHour, reset.wMinute)
         }
         UsageWindowKind::Weekly => {
-            format!("{remaining:.0}%  {:02}/{:02}重置", reset.wMonth, reset.wDay)
+            format!("{remaining}  {:02}/{:02}重置", reset.wMonth, reset.wDay)
         }
+    }
+}
+
+/// A whole percentage for display that never rounds away the ends of the
+/// scale: a positive value below 1% is `<1%`, and a value above 99% but short
+/// of 100% is `99%`. So `0%` and `100%` only ever mean exactly empty or
+/// exactly full, in both the used and the remaining direction. Everything
+/// else rounds to the nearest whole percent, ties to even, so a used value
+/// and its remainder always show as whole percents that add up to 100
+/// (50.5% used is `50%`, leaving 49.5% shown as `50%`). Calculations use the
+/// unrounded value; this is presentation only.
+pub fn format_percent(value: f64) -> String {
+    let value = if value.is_finite() {
+        value.clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    if value > 0.0 && value < 1.0 {
+        "<1%".to_string()
+    } else if value > 99.0 && value < 100.0 {
+        "99%".to_string()
+    } else {
+        format!("{:.0}%", value.round_ties_even())
     }
 }
 
@@ -1766,7 +1838,7 @@ mod tests {
             crate::localization::LanguageId::English,
         ] {
             assert_eq!(
-                format_codex_line(
+                format_line(
                     &usage.session,
                     language.strings(),
                     language == crate::localization::LanguageId::SimplifiedChinese,
@@ -1819,11 +1891,11 @@ mod tests {
         let usage = codex_usage_from_response(response).unwrap();
         let strings = crate::localization::LanguageId::SimplifiedChinese.strings();
         assert!(
-            format_codex_line(&usage.session, strings, true, UsageWindowKind::Session)
+            format_line(&usage.session, strings, true, UsageWindowKind::Session)
                 .starts_with("100%")
         );
         assert_eq!(
-            format_codex_line(&usage.weekly, strings, true, UsageWindowKind::Weekly),
+            format_line(&usage.weekly, strings, true, UsageWindowKind::Weekly),
             "--"
         );
     }
@@ -1861,10 +1933,7 @@ mod tests {
         let strings = crate::localization::LanguageId::SimplifiedChinese.strings();
         assert_eq!(strings.session_window, "5h");
         assert_eq!(strings.weekly_window, "7d");
-        let section = UsageSection {
-            percentage: 30.0,
-            resets_at: None,
-        };
+        let section = UsageSection::reported(30.0, None);
         assert_eq!(
             format_line(&section, strings, true, UsageWindowKind::Session),
             "70%"
@@ -1943,5 +2012,174 @@ mod tests {
         assert!((usage.session.percentage - 4.17425).abs() < 0.000001);
         assert!(usage.weekly.resets_at.is_some());
         assert!(usage.session.resets_at.is_some());
+    }
+
+    /// 2026-06-13T12:00:00Z.
+    const NOON_UTC: u64 = 1_781_352_000;
+
+    fn at(secs: u64) -> Option<SystemTime> {
+        Some(UNIX_EPOCH + Duration::from_secs(secs))
+    }
+
+    #[test]
+    fn iso8601_applies_utc_offsets_and_accepts_fractions() {
+        for text in [
+            "2026-06-13T12:00:00Z",
+            "2026-06-13T12:00:00.123456Z",
+            "2026-06-13T12:00:00.5+00:00",
+            "2026-06-13T17:30:00+05:30",
+            "2026-06-13T17:30:00+0530",
+            "2026-06-13T06:00:00-06:00",
+            "2026-06-12T23:30:00-12:30",
+            "2026-06-13t12:00:00z",
+            " 2026-06-13T12:00:00Z ",
+            // No offset is read as UTC, as before.
+            "2026-06-13T12:00:00",
+        ] {
+            assert_eq!(parse_iso8601(Some(text)), at(NOON_UTC), "{text}");
+        }
+        assert_eq!(
+            parse_iso8601(Some("2028-02-29T00:00:00Z")),
+            at(1_835_395_200)
+        );
+        assert_eq!(
+            parse_iso8601(Some("1970-01-01T00:00:00Z")),
+            Some(UNIX_EPOCH)
+        );
+    }
+
+    #[test]
+    fn iso8601_rejects_malformed_and_out_of_range_timestamps() {
+        assert_eq!(parse_iso8601(None), None);
+        for text in [
+            "",
+            "garbage",
+            "2026-06-13 12:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-14-01T00:00:00Z",
+            "2026-00-01T00:00:00Z",
+            "2026-06-00T00:00:00Z",
+            "2026-02-29T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2026-6-13T12:00:00Z",
+            "12026-06-13T12:00:00Z",
+            "1969-12-31T23:59:59Z",
+            "1970-01-01T00:00:00+01:00",
+            "2026-06-13T24:00:00Z",
+            "2026-06-13T12:60:00Z",
+            "2026-06-13T12:00:61Z",
+            "2026-06-13T12:00Z",
+            "2026-06-13T12:00:00.Z",
+            "2026-06-13T12:00:00.12aZ",
+            "2026-06-13T12:00:00ZZ",
+            "2026-06-13T12:00:00+24:00",
+            "2026-06-13T12:00:00+05:60",
+            "2026-06-13T12:00:00+5:30",
+            "2026-06-13T12:00:00+05",
+            "2026-06-13T12:00:00+053",
+            "2026-06-13T12:00:00+05:30:00",
+        ] {
+            assert_eq!(parse_iso8601(Some(text)), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn percentages_never_round_to_empty_or_full() {
+        for (value, expected) in [
+            (0.0, "0%"),
+            (1e-9, "<1%"),
+            (0.4, "<1%"),
+            (0.5, "<1%"),
+            (0.99, "<1%"),
+            (1.0, "1%"),
+            (1.5, "2%"),
+            (2.5, "2%"),
+            (49.5, "50%"),
+            (50.5, "50%"),
+            (99.0, "99%"),
+            (99.4, "99%"),
+            (99.5, "99%"),
+            (99.9, "99%"),
+            (100.0, "100%"),
+            (120.0, "100%"),
+            (-3.0, "0%"),
+            (f64::NAN, "0%"),
+        ] {
+            assert_eq!(format_percent(value), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn used_and_remaining_percentages_stay_consistent() {
+        let english = crate::localization::LanguageId::English.strings();
+        let chinese = crate::localization::LanguageId::SimplifiedChinese.strings();
+        for (used, used_text, remaining_text) in [
+            (0.0, "0%", "100%"),
+            (1e-9, "<1%", "99%"),
+            (0.4, "<1%", "99%"),
+            (0.5, "<1%", "99%"),
+            (0.99, "<1%", "99%"),
+            (1.0, "1%", "99%"),
+            (99.4, "99%", "<1%"),
+            (99.9, "99%", "<1%"),
+            (100.0, "100%", "0%"),
+        ] {
+            let section = UsageSection::reported(used, None);
+            assert_eq!(
+                format_line(&section, english, false, UsageWindowKind::Session),
+                used_text,
+                "{used}"
+            );
+            assert_eq!(
+                format_line(&section, chinese, true, UsageWindowKind::Weekly),
+                remaining_text,
+                "{used}"
+            );
+        }
+        // Between the ends, the two whole percents always add up to 100.
+        for quarter in 4..=396 {
+            let used = f64::from(quarter) / 4.0;
+            let shown = |value: f64| -> u32 {
+                format_percent(value).trim_end_matches('%').parse().unwrap()
+            };
+            assert_eq!(
+                shown(used) + shown(remaining_percentage(used)),
+                100,
+                "{used}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_windows_the_response_omits_show_as_unavailable() {
+        let strings = crate::localization::LanguageId::English.strings();
+        let response: UsageResponse = serde_json::from_str(
+            r#"{"five_hour":null,"seven_day":{"utilization":12.5,"resets_at":"2026-06-13T17:30:00.25+05:30"}}"#,
+        )
+        .unwrap();
+        let usage = claude_usage_from_response(&response);
+        assert!(!usage.session.available);
+        assert_eq!(
+            format_line(&usage.session, strings, false, UsageWindowKind::Session),
+            "--"
+        );
+        assert!(usage.weekly.available);
+        assert_eq!(usage.weekly.percentage, 12.5);
+        assert_eq!(usage.weekly.resets_at, at(NOON_UTC));
+
+        // A reported window at 0% with no reset is a real reading, not missing.
+        let response: UsageResponse =
+            serde_json::from_str(r#"{"five_hour":{"utilization":0.0,"resets_at":null}}"#).unwrap();
+        let usage = claude_usage_from_response(&response);
+        assert!(usage.session.available);
+        assert_eq!(
+            format_line(&usage.session, strings, false, UsageWindowKind::Session),
+            "0%"
+        );
+        assert!(!usage.weekly.available);
+        assert_eq!(
+            format_line(&usage.weekly, strings, true, UsageWindowKind::Weekly),
+            "--"
+        );
     }
 }
