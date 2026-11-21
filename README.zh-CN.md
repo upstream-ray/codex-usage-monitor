@@ -113,6 +113,8 @@ codex-usage
 
 显示多个服务时，每个服务都有自己的用量条和对应的文字颜色。Antigravity 优先通过已登录的 Antigravity CLI 读取 **View Usage** 中 **Gemini Models** 的剩余额度。CLI 无法查询时，组件尝试读取 Google 的账户配额摘要。缺失的窗口显示为 `--`。
 
+若要查看 View Usage 中的其他额度组（例如 **Claude and GPT models** 或 **Gemini 4 Argon**），请在**监控服务 > Antigravity 额度组**中选择。**自动**保持显示共享的 Gemini Models 额度组。悬停提示和提醒会注明所选额度组。若当前数据源未提供该额度组，其窗口显示 `--`；不会用其他额度组的数值代替，也不会合并不同额度组。菜单列出应用启动后 Antigravity 返回过的额度组。
+
 Claude 桌面客户端与 Claude Code CLI 使用相互独立的本地登录状态。只登录 Claude 桌面客户端不会启用 Claude Code 监控。检测不到受支持的 Claude Code CLI 凭据时，菜单会以禁用状态显示 **Claude Code（需登录 CLI）**，并自动关闭该服务。
 
 ### 系统托盘图标
