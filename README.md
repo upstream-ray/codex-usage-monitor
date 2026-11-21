@@ -152,6 +152,8 @@ Refresh behavior:
 
 ### Appearance
 
+For a smaller widget, enable **Appearance → Compact layout (Simplified Chinese, one service)** while using Simplified Chinese and monitoring one service. Each visible quota window has a text line above its progress bar. The text shows the period, remaining percentage and reset time; the redundant service logo and “remaining” label are omitted. The widget measures the visible text, uses the wider row when both windows are shown, and sizes both bars and the window to that width. It centers vertically in the taskbar and reduces row spacing and bar height to fit short taskbars. The option is off by default; other languages and multiple-service selections keep the original layout even while it is enabled.
+
 Right-click the widget or tray icon and open **Appearance** to choose a system, high-contrast dark, or high-contrast light palette; continuous or segmented bars; standard or slim bars; and standard or larger text. High-contrast palettes add a solid backdrop and bold text for readability over translucent taskbars. The **Recommended: translucent dark taskbar** action applies high-contrast dark colors, slim continuous rounded bars, and larger text. The widget also fits its height to the selected taskbar, avoiding clipped rows on 40-pixel taskbars. Appearance choices are saved in `settings.json`; existing settings keep their previous appearance until changed.
 
 ## Diagnostics
