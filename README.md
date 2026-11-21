@@ -113,6 +113,8 @@ Use the right-click **Monitored services** menu to choose which independent serv
 
 When multiple services are shown, each service has its own usage bar and matching usage text color. Antigravity reads the **Gemini Models** balances from **View Usage** through the signed-in Antigravity CLI. If the CLI query fails, the widget tries Google's account quota summary. Unavailable windows display `--`.
 
+To watch another View Usage group, such as **Claude and GPT models** or **Gemini 4 Argon**, choose it under **Monitored services > Antigravity quota group**. **Auto** keeps the shared Gemini Models group. The selected group is named in the hover text and alerts. If the current source does not report it, its windows show `--`; another group's values are never shown in its place, and groups are never combined. The menu lists the groups Antigravity has reported since the app started.
+
 Claude Desktop and Claude Code CLI use separate local sessions. Signing in to Claude Desktop does not enable Claude Code monitoring. When no supported Claude Code CLI credentials are available, the menu shows **Claude Code (CLI login required)** as a disabled item and automatically keeps that service off.
 
 ### System Tray Icon

@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -56,6 +57,64 @@ impl PollError {
             Self::RequestFailed => "invalid_response",
         }
     }
+}
+
+/// The Antigravity quota group the user selected (`None` = Auto, the shared
+/// Gemini Models group).
+static ANTIGRAVITY_QUOTA_GROUP: Mutex<Option<String>> = Mutex::new(None);
+/// Group names Antigravity reported during this run, for the menu.
+static ANTIGRAVITY_QUOTA_GROUPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+const MAX_ANTIGRAVITY_GROUPS: usize = 7;
+
+/// Selects the Antigravity quota group to show, by the name View Usage
+/// gives it, or `None` for Auto.
+pub fn set_antigravity_quota_group(group: Option<String>) {
+    *ANTIGRAVITY_QUOTA_GROUP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = group;
+}
+
+/// Group names Antigravity reported during this run, in first-seen order.
+pub fn antigravity_quota_groups() -> Vec<String> {
+    ANTIGRAVITY_QUOTA_GROUPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn selected_antigravity_group() -> Option<String> {
+    ANTIGRAVITY_QUOTA_GROUP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Keeps the group names seen during this run, so the menu still offers a
+/// group while the current source does not report it.
+fn remember_antigravity_groups(groups: &[AntigravityQuotaSummaryGroup]) {
+    let mut known = ANTIGRAVITY_QUOTA_GROUPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for label in groups.iter().filter_map(antigravity_group_label) {
+        if known.len() < MAX_ANTIGRAVITY_GROUPS
+            && !known.iter().any(|k| k.eq_ignore_ascii_case(&label))
+        {
+            known.push(label);
+        }
+    }
+}
+
+/// A provider-supplied group name, trimmed to printable text for display.
+fn antigravity_group_label(group: &AntigravityQuotaSummaryGroup) -> Option<String> {
+    let name: String = group
+        .display_name
+        .as_deref()?
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(40)
+        .collect();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1108,18 +1167,35 @@ fn fetch_antigravity_quota_summary(
 }
 
 fn antigravity_usage_from_summary(response: AntigravityQuotaSummaryResponse) -> Option<UsageData> {
+    remember_antigravity_groups(&response.groups);
+    antigravity_usage_for_group(response, selected_antigravity_group().as_deref())
+}
+
+/// The windows of one View Usage group: the selected group by name, or with
+/// Auto (`None`) the shared Gemini Models group. A selected group the
+/// response does not contain yields `None`, shown as `--`; another group's
+/// values are never shown in its place, and groups are never combined.
+fn antigravity_usage_for_group(
+    response: AntigravityQuotaSummaryResponse,
+    selected: Option<&str>,
+) -> Option<UsageData> {
     // The separate Gemini 4 Argon group has its own weekly balance on some plans.
-    let group = response.groups.into_iter().find(|group| {
-        group
-            .display_name
-            .as_deref()
-            .is_some_and(|name| name.trim().eq_ignore_ascii_case("Gemini Models"))
-            || group.buckets.iter().flatten().any(|bucket| {
-                matches!(
-                    bucket.bucket_id.as_deref(),
-                    Some("gemini-5h" | "gemini-weekly")
-                )
-            })
+    let group = response.groups.into_iter().find(|group| match selected {
+        Some(selected) => {
+            antigravity_group_label(group).is_some_and(|label| label.eq_ignore_ascii_case(selected))
+        }
+        None => {
+            group
+                .display_name
+                .as_deref()
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case("Gemini Models"))
+                || group.buckets.iter().flatten().any(|bucket| {
+                    matches!(
+                        bucket.bucket_id.as_deref(),
+                        Some("gemini-5h" | "gemini-weekly")
+                    )
+                })
+        }
     })?;
 
     let mut data = UsageData::default();
@@ -2000,5 +2076,106 @@ mod tests {
             format_antigravity_line(&usage.weekly, strings, true, UsageWindowKind::Weekly),
             "100%"
         );
+    }
+
+    /// View Usage as the Antigravity CLI reports it: three groups.
+    fn view_usage() -> AntigravityQuotaSummaryResponse {
+        serde_json::from_str(
+            r#"{"groups": [
+                {"name": "Gemini 4 Argon", "buckets": [
+                    {"id": "gemini-argon-wtu-weekly", "window": "weekly", "remaining_fraction": 0.84375,
+                     "reset_time": "2026-11-26T00:00:00Z"}
+                ]},
+                {"name": "Claude and GPT models", "buckets": [
+                    {"id": "3p-5h", "window": "5h", "remaining_fraction": 0.5,
+                     "reset_time": "2026-11-21T15:00:00Z"},
+                    {"id": "3p-weekly", "window": "weekly", "remaining_fraction": 0.961,
+                     "reset_time": "2026-11-27T00:00:00Z"}
+                ]},
+                {"name": "Gemini Models", "buckets": [
+                    {"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.9865,
+                     "reset_time": "2026-11-28T08:48:16Z"},
+                    {"id": "gemini-5h", "window": "5h", "remaining_fraction": 1,
+                     "reset_time": "2026-11-21T13:48:16Z"}
+                ]}
+            ]}"#,
+        )
+        .unwrap()
+    }
+
+    fn near(actual: f64, expected: f64) -> bool {
+        (actual - expected).abs() < 1e-6
+    }
+
+    #[test]
+    fn auto_keeps_showing_the_shared_gemini_group() {
+        let usage = antigravity_usage_for_group(view_usage(), None).unwrap();
+        assert!(near(usage.session.percentage, 0.0));
+        assert!(near(usage.weekly.percentage, 1.35));
+    }
+
+    #[test]
+    fn a_selected_group_shows_only_its_own_windows() {
+        let claude =
+            antigravity_usage_for_group(view_usage(), Some("Claude and GPT models")).unwrap();
+        assert!(near(claude.session.percentage, 50.0));
+        assert!(near(claude.weekly.percentage, 3.9));
+        assert_eq!(
+            claude.session.resets_at,
+            parse_iso8601(Some("2026-11-21T15:00:00Z"))
+        );
+
+        // Names match case-insensitively; Argon has no 5-hour window.
+        let argon = antigravity_usage_for_group(view_usage(), Some("gemini 4 ARGON")).unwrap();
+        let strings = crate::localization::LanguageId::English.strings();
+        assert_eq!(
+            format_antigravity_line(&argon.session, strings, false, UsageWindowKind::Session),
+            "--"
+        );
+        assert!(
+            format_antigravity_line(&argon.weekly, strings, false, UsageWindowKind::Weekly)
+                .starts_with("84%")
+        );
+    }
+
+    #[test]
+    fn a_selected_group_that_is_not_reported_never_shows_another_group() {
+        // Google's account summary can carry only the third-party group.
+        let summary: AntigravityQuotaSummaryResponse = serde_json::from_str(
+            r#"{"groups": [{"displayName": "Claude and GPT models", "buckets": [
+                {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0.5}
+            ]}]}"#,
+        )
+        .unwrap();
+        assert!(antigravity_usage_for_group(summary, Some("Gemini 4 Argon")).is_none());
+        assert!(antigravity_usage_for_group(view_usage(), Some("Gemini Ultra")).is_none());
+    }
+
+    #[test]
+    fn group_names_are_printable_bounded_and_remembered_once() {
+        let group = |name: &str| AntigravityQuotaSummaryGroup {
+            display_name: Some(name.to_string()),
+            buckets: None,
+        };
+        assert_eq!(
+            antigravity_group_label(&group("  Gemini Models\u{7}\n")).as_deref(),
+            Some("Gemini Models")
+        );
+        assert_eq!(antigravity_group_label(&group("   ")), None);
+        assert_eq!(
+            antigravity_group_label(&group(&"x".repeat(500))).map(|name| name.len()),
+            Some(40)
+        );
+
+        remember_antigravity_groups(&[group("Gemini Models"), group("GEMINI MODELS")]);
+        let known = antigravity_quota_groups();
+        assert_eq!(
+            known
+                .iter()
+                .filter(|name| name.eq_ignore_ascii_case("Gemini Models"))
+                .count(),
+            1
+        );
+        assert!(known.len() <= MAX_ANTIGRAVITY_GROUPS);
     }
 }
