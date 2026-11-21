@@ -5,8 +5,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconFromResourceEx, DrawIconEx, DI_NORMAL, HICON, LR_DEFAULTCOLOR,
 };
 
-use crate::native_interop::Color;
-
 pub const SIZE: i32 = 16;
 pub const RIGHT_MARGIN: i32 = 5;
 
@@ -14,10 +12,6 @@ pub const RIGHT_MARGIN: i32 = 5;
 pub enum Provider {
     Claude,
     Codex,
-}
-
-pub fn codex_color(is_dark: bool) -> Color {
-    Color::from_hex(if is_dark { "#34D399" } else { "#0F8F70" })
 }
 
 pub fn draw(hdc: HDC, x: i32, y: i32, size: i32, provider: Provider) {
