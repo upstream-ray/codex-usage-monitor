@@ -357,14 +357,6 @@ fn page_titles(language: LanguageId) -> [&'static str; 5] {
 
 fn rows(page: Page, s: &AppState) -> Vec<Row> {
     let strings = s.language.strings();
-    let chinese = s.language == LanguageId::SimplifiedChinese;
-    let t = |zh: &'static str, en: &'static str| -> &'static str {
-        if chinese {
-            zh
-        } else {
-            en
-        }
-    };
     match page {
         Page::General => {
             let mut values = vec![(IDM_LANG_SYSTEM, strings.system_default)];
@@ -382,7 +374,7 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                 .map(|(index, taskbar)| {
                     let device = native_interop::taskbar_monitor_device(taskbar);
                     OptionItem {
-                        label: display_label(t("显示器", "Display"), index, device.as_deref()),
+                        label: display_label(strings.display_label, index, device.as_deref()),
                         action: Some(Action::Display(taskbar.hwnd)),
                         swatch: None,
                     }
@@ -398,53 +390,34 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                     IDM_START_WITH_WINDOWS,
                     is_startup_enabled(),
                 )
-                .hint(info(t(
-                    "登录 Windows 后自动运行",
-                    "Run automatically after you sign in to Windows",
-                ))),
-                section(t("任务栏组件", "Taskbar widget")),
+                .hint(info(strings.start_with_windows_hint)),
+                section(strings.taskbar_widget_section),
                 check(
                     strings.show_widget,
                     tray_icon::IDM_TOGGLE_WIDGET,
                     s.widget_visible,
                 )
-                .hint(info(t(
-                    "在任务栏上显示各服务的额度",
-                    "Show each service's quota on the taskbar",
-                ))),
-                check(
-                    t("固定在任务栏最左侧", "Pin to the left edge of the taskbar"),
-                    IDM_ANCHOR_LEFT,
-                    s.anchor_left,
-                )
-                .hint(info(t(
-                    "关闭时组件位于通知区域旁，可以拖动调整位置",
-                    "When off, the widget sits next to the notification area and can be dragged",
-                ))),
+                .hint(info(strings.show_widget_hint)),
+                check(strings.anchor_left, IDM_ANCHOR_LEFT, s.anchor_left)
+                    .hint(info(strings.anchor_left_hint)),
             ];
             if !taskbars.is_empty() {
                 let several = taskbars.len() > 1;
                 result.push(Row::Choice {
-                    label: t("显示器", "Display").into(),
+                    label: strings.display_label.into(),
                     items: displays,
                     selected: selected_display.unwrap_or(0),
                     enabled: several,
                     hint: info(if several {
-                        t(
-                            "组件显示在这个显示器的任务栏上",
-                            "The taskbar that shows the widget",
-                        )
+                        strings.display_hint
                     } else {
-                        t("只检测到一个任务栏", "Only one taskbar was found")
+                        strings.single_taskbar_hint
                     }),
                 });
             }
             result.push(action(
-                t("组件位置", "Widget position"),
-                info(t(
-                    "把组件移回任务栏上的默认位置",
-                    "Move the widget back to its default place on the taskbar",
-                )),
+                strings.widget_position,
+                info(strings.widget_position_hint),
                 vec![OptionItem::command(
                     strings.reset_position,
                     IDM_RESET_POSITION,
@@ -459,9 +432,7 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
             let provider = |name: &str, id, monitored, error| {
                 let hint = match service_status(monitored, error, s.language) {
                     Some(status) => Some(Hint::Warning(status.into())),
-                    None if monitored && count == 1 => {
-                        info(t("至少保留一项服务", "At least one service must stay on"))
-                    }
+                    None if monitored && count == 1 => info(strings.keep_one_service_hint),
                     None => None,
                 };
                 limited_check(name, id, monitored, !monitored || count > 1).hint(hint)
@@ -496,12 +467,7 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                     swatch: None,
                 })
                 .collect();
-            let (quota, used, remaining) = match s.language {
-                LanguageId::SimplifiedChinese => ("额度数值", "已用", "剩余"),
-                LanguageId::Italian => ("Visualizzazione quota", "Utilizzata", "Rimanente"),
-                _ => ("Quota value", "Used", "Remaining"),
-            };
-            let one_window = info(t("至少显示一种额度", "At least one quota must be shown"));
+            let one_window = info(strings.keep_one_quota_hint);
             vec![
                 section(strings.models),
                 provider(
@@ -523,16 +489,13 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                     antigravity.error,
                 ),
                 Row::Choice {
-                    label: t("Antigravity 额度组", "Antigravity quota group").into(),
+                    label: strings.antigravity_quota_group.into(),
                     items: group_items,
                     selected: selected_group,
                     enabled: s.show_antigravity,
-                    hint: info(t(
-                        "组件显示所选额度组的用量",
-                        "The widget shows the selected group",
-                    )),
+                    hint: info(strings.antigravity_quota_group_hint),
                 },
-                section(t("刷新", "Refresh")),
+                section(strings.refresh_section),
                 choice(
                     strings.update_frequency,
                     &[
@@ -549,17 +512,14 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                     },
                 ),
                 check(
-                    t("额度紧张时加快刷新", "Refresh faster when quota is low"),
+                    strings.adaptive_refresh,
                     IDM_ADAPTIVE_REFRESH,
                     s.adaptive_refresh,
                 )
-                .hint(info(t(
-                    "剩余 20% 或更少时每分钟刷新一次",
-                    "Refresh every minute when 20% or less remains",
-                ))),
-                section(t("显示内容", "Display")),
+                .hint(info(strings.adaptive_refresh_hint)),
+                section(strings.display_section),
                 limited_check(
-                    t("显示 5 小时额度", "Show 5-hour quota"),
+                    strings.show_session_quota,
                     IDM_SHOW_SESSION_WINDOW,
                     s.show_session_window,
                     s.show_weekly_window,
@@ -570,7 +530,7 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                     one_window.clone()
                 }),
                 limited_check(
-                    t("显示每周额度", "Show weekly quota"),
+                    strings.show_weekly_quota,
                     IDM_SHOW_WEEKLY_WINDOW,
                     s.show_weekly_window,
                     s.show_session_window,
@@ -581,8 +541,11 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                     one_window
                 }),
                 choice(
-                    quota,
-                    &[(IDM_QUOTA_REMAINING, remaining), (IDM_QUOTA_USED, used)],
+                    strings.quota_value,
+                    &[
+                        (IDM_QUOTA_REMAINING, strings.quota_remaining),
+                        (IDM_QUOTA_USED, strings.quota_used),
+                    ],
                     if s.quota_display_mode == QuotaDisplayMode::Used {
                         IDM_QUOTA_USED
                     } else {
@@ -595,9 +558,12 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
             let a = s.appearance;
             let dark = a.is_dark(s.is_dark);
             let library = s.color_presets.entries();
-            let mut colors = vec![OptionItem::placeholder(t("自定义", "Custom"))];
+            let mut colors = vec![OptionItem::placeholder(strings.custom_option)];
             colors.extend(ColorPreset::ALL.iter().enumerate().map(|(index, preset)| {
-                OptionItem::command(preset.label(chinese), IDM_CODEX_PRESET_FIRST + index as u16)
+                OptionItem::command(
+                    preset.label(s.language == LanguageId::SimplifiedChinese),
+                    IDM_CODEX_PRESET_FIRST + index as u16,
+                )
             }));
             colors.extend(library.iter().enumerate().map(|(index, preset)| {
                 OptionItem::command(&preset.name, IDM_USER_PRESET_FIRST + index as u16)
@@ -613,7 +579,7 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                         .map(|index| index + ColorPreset::ALL.len() + 1)
                 })
                 .unwrap_or(0);
-            let mut deletions = vec![OptionItem::placeholder(t("选择预设…", "Select preset…"))];
+            let mut deletions = vec![OptionItem::placeholder(strings.select_preset)];
             deletions.extend(library.iter().enumerate().map(|(index, preset)| {
                 OptionItem::command(&preset.name, IDM_DELETE_PRESET_FIRST + index as u16)
             }));
@@ -621,13 +587,13 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                 OptionItem::command(label, id).with_swatch(a.codex_colors.color(role, dark))
             };
             vec![
-                section(t("组件样式", "Widget style")),
+                section(strings.widget_style_section),
                 choice(
-                    t("背景样式", "Background style"),
+                    strings.background_style,
                     &[
-                        (IDM_PALETTE_SYSTEM, t("跟随系统", "Follow system")),
-                        (IDM_PALETTE_DARK, t("高对比深色", "High contrast dark")),
-                        (IDM_PALETTE_LIGHT, t("高对比浅色", "High contrast light")),
+                        (IDM_PALETTE_SYSTEM, strings.palette_system),
+                        (IDM_PALETTE_DARK, strings.palette_high_contrast_dark),
+                        (IDM_PALETTE_LIGHT, strings.palette_high_contrast_light),
                     ],
                     match a.palette {
                         Palette::System => IDM_PALETTE_SYSTEM,
@@ -636,14 +602,11 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                     },
                 ),
                 choice(
-                    t("进度条样式", "Bar style"),
+                    strings.bar_style,
                     &[
-                        (IDM_BAR_CONTINUOUS, t("连续圆角", "Continuous rounded")),
-                        (IDM_BAR_SEGMENTED, t("分段", "Segmented")),
-                        (
-                            IDM_BAR_CLASSIC,
-                            t("经典分段（矩形）", "Classic segmented (tiles)"),
-                        ),
+                        (IDM_BAR_CONTINUOUS, strings.bar_continuous),
+                        (IDM_BAR_SEGMENTED, strings.bar_segmented),
+                        (IDM_BAR_CLASSIC, strings.bar_classic_segmented),
                     ],
                     match a.bar_style {
                         BarStyle::Continuous => IDM_BAR_CONTINUOUS,
@@ -652,10 +615,10 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                     },
                 ),
                 choice(
-                    t("进度条粗细", "Bar thickness"),
+                    strings.bar_thickness,
                     &[
-                        (IDM_BAR_STANDARD, t("标准", "Standard")),
-                        (IDM_BAR_SLIM, t("细", "Slim")),
+                        (IDM_BAR_STANDARD, strings.bar_standard),
+                        (IDM_BAR_SLIM, strings.bar_slim),
                     ],
                     match a.bar_thickness {
                         BarThickness::Standard => IDM_BAR_STANDARD,
@@ -663,10 +626,10 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                     },
                 ),
                 choice(
-                    t("文字大小", "Text size"),
+                    strings.text_size,
                     &[
-                        (IDM_FONT_STANDARD, t("标准", "Standard")),
-                        (IDM_FONT_LARGE, t("较大", "Larger")),
+                        (IDM_FONT_STANDARD, strings.text_standard),
+                        (IDM_FONT_LARGE, strings.text_larger),
                     ],
                     match a.font_size {
                         FontSize::Standard => IDM_FONT_STANDARD,
@@ -674,167 +637,134 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                     },
                 ),
                 check(
-                    t("显示服务图标", "Show provider logos"),
+                    strings.show_provider_logos,
                     IDM_PROVIDER_LOGOS,
                     !a.hide_provider_logos,
                 ),
-                check(
-                    t("紧凑布局", "Compact layout"),
-                    IDM_COMPACT_LAYOUT,
-                    a.compact_layout,
-                )
-                .hint(info(t(
-                    "仅在简体中文且只监控一项服务时生效",
-                    "Applies with Simplified Chinese and a single service",
-                ))),
-                section(t("Codex 配色", "Codex colors")),
+                check(strings.compact_layout, IDM_COMPACT_LAYOUT, a.compact_layout)
+                    .hint(info(strings.compact_layout_hint)),
+                section(strings.codex_colors_section),
                 Row::Choice {
-                    label: t("配色方案", "Color scheme").into(),
+                    label: strings.color_scheme.into(),
                     items: colors,
                     selected,
                     enabled: true,
                     hint: None,
                 },
                 action(
-                    t("自定义颜色", "Custom colors"),
-                    info(t(
-                        "分别设置图标、进度条和百分比的颜色",
-                        "Pick the icon, bar and percentage colors",
-                    )),
+                    strings.custom_colors,
+                    info(strings.custom_colors_hint),
                     vec![
-                        swatch(t("图标", "Icon"), IDM_CODEX_ICON_COLOR, ColorRole::Icon),
-                        swatch(t("进度条", "Bar"), IDM_CODEX_BAR_COLOR, ColorRole::Bar),
+                        swatch(strings.color_icon, IDM_CODEX_ICON_COLOR, ColorRole::Icon),
+                        swatch(strings.color_bar, IDM_CODEX_BAR_COLOR, ColorRole::Bar),
                         swatch(
-                            t("百分比", "Percentage"),
+                            strings.color_percentage,
                             IDM_CODEX_PERCENT_COLOR,
                             ColorRole::Percentage,
                         ),
                     ],
                 ),
                 action(
-                    t("保存为预设", "Save as preset"),
-                    info(t(
-                        "把当前配色保存为自定义预设",
-                        "Keep the current colors as a custom preset",
-                    )),
+                    strings.save_as_preset,
+                    info(strings.save_as_preset_hint),
                     vec![OptionItem::command(
-                        t("保存…", "Save…"),
+                        strings.save_preset_button,
                         IDM_SAVE_COLOR_PRESET,
                     )],
                 ),
                 Row::Choice {
-                    label: t("删除自定义预设", "Delete custom preset").into(),
+                    label: strings.delete_custom_preset.into(),
                     items: deletions,
                     selected: 0,
                     enabled: !library.is_empty(),
                     hint: info(if library.is_empty() {
-                        t("还没有自定义预设", "No custom presets yet")
+                        strings.no_custom_presets_hint
                     } else {
-                        t("删除前会再确认一次", "You will be asked to confirm")
+                        strings.delete_preset_confirm_hint
                     }),
                 },
-                section(t("重置", "Reset")),
+                section(strings.reset_section),
                 action(
-                    t("快速外观", "Quick looks"),
-                    info(t(
-                        "套用半透明深色预设，或恢复全部默认外观",
-                        "Apply the translucent dark preset or restore every default",
-                    )),
+                    strings.quick_looks,
+                    info(strings.quick_looks_hint),
                     vec![
-                        OptionItem::command(
-                            t("半透明深色", "Translucent dark"),
-                            IDM_APPEARANCE_RECOMMENDED,
-                        ),
-                        OptionItem::command(
-                            t("恢复默认", "Restore defaults"),
-                            IDM_APPEARANCE_RESET,
-                        ),
+                        OptionItem::command(strings.translucent_dark, IDM_APPEARANCE_RECOMMENDED),
+                        OptionItem::command(strings.restore_defaults, IDM_APPEARANCE_RESET),
                     ],
                 ),
             ]
         }
-        Page::Alerts => vec![
-            choice(
-                t("低额度提醒", "Low-quota alert"),
-                &[
-                    (IDM_ALERT_OFF, t("关闭", "Off")),
-                    (IDM_ALERT_10, t("剩余 10%", "10% remaining")),
-                    (IDM_ALERT_20, t("剩余 20%", "20% remaining")),
-                    (IDM_ALERT_30, t("剩余 30%", "30% remaining")),
-                ],
-                match s.alert_threshold_percent {
-                    10 => IDM_ALERT_10,
-                    20 => IDM_ALERT_20,
-                    30 => IDM_ALERT_30,
-                    _ => IDM_ALERT_OFF,
-                },
-            )
-            .hint(info(t(
-                "剩余额度降到所选比例时发送通知",
-                "Notify when the remaining quota drops to this level",
-            ))),
-            check(
-                t("额度重置时通知", "Notify on reset"),
-                IDM_ALERT_RESET,
-                s.notify_on_reset,
-            )
-            .hint(info(t(
-                "额度周期重置后发送通知",
-                "Notify when a quota window resets",
-            ))),
-        ],
+        Page::Alerts => {
+            let alert_10 = strings
+                .alert_remaining
+                .replace("{percent}", &10.to_string());
+            let alert_20 = strings
+                .alert_remaining
+                .replace("{percent}", &20.to_string());
+            let alert_30 = strings
+                .alert_remaining
+                .replace("{percent}", &30.to_string());
+            vec![
+                choice(
+                    strings.low_quota_alert,
+                    &[
+                        (IDM_ALERT_OFF, strings.alert_off),
+                        (IDM_ALERT_10, &alert_10),
+                        (IDM_ALERT_20, &alert_20),
+                        (IDM_ALERT_30, &alert_30),
+                    ],
+                    match s.alert_threshold_percent {
+                        10 => IDM_ALERT_10,
+                        20 => IDM_ALERT_20,
+                        30 => IDM_ALERT_30,
+                        _ => IDM_ALERT_OFF,
+                    },
+                )
+                .hint(info(strings.low_quota_alert_hint)),
+                check(strings.notify_on_reset, IDM_ALERT_RESET, s.notify_on_reset)
+                    .hint(info(strings.notify_on_reset_hint)),
+            ]
+        }
         Page::Privacy => {
             let policy = crate::privacy::policy();
             let updates = crate::privacy::updates_enabled();
             let port = mcp_port(s.mcp_port);
-            let mcp_hint = mcp_settings_hint(chinese, s.mcp_unavailable, port);
+            let mcp_hint = mcp_settings_hint(s.language, s.mcp_unavailable, port);
             let mut result = vec![
-                section(t("隐私", "Privacy")),
+                section(strings.privacy_section),
                 limited_check(
-                    t("被动监控", "Passive monitoring"),
+                    strings.passive_monitoring,
                     IDM_PASSIVE_MONITORING,
                     crate::privacy::passive_monitoring(),
                     !policy.force_passive_monitoring,
                 )
-                .hint(info(t(
-                    "只读取已有的用量数据，不调用 CLI，也不发送模型请求",
-                    "Only read existing usage data; never run the CLI or send model requests",
-                ))),
-                check(
-                    t("本地 MCP 服务", "Local MCP server"),
-                    IDM_MCP_SERVER,
-                    s.mcp_enabled,
-                )
-                .hint(Some(if s.mcp_unavailable {
-                    Hint::Warning(mcp_hint)
-                } else {
-                    Hint::Info(mcp_hint)
-                })),
+                .hint(info(strings.passive_monitoring_hint)),
+                check(strings.local_mcp_server, IDM_MCP_SERVER, s.mcp_enabled).hint(Some(
+                    if s.mcp_unavailable {
+                        Hint::Warning(mcp_hint)
+                    } else {
+                        Hint::Info(mcp_hint)
+                    },
+                )),
             ];
             if policy.force_passive_monitoring || policy.disable_updates {
-                result.push(Row::Note(Hint::Info(
-                    t(
-                        "部分选项由设备策略管理。",
-                        "Some options are managed by device policy.",
-                    )
-                    .into(),
-                )));
+                result.push(Row::Note(Hint::Info(strings.managed_by_policy.into())));
             }
-            result.push(section(t("更新", "Updates")));
+            result.push(section(strings.updates));
             result.push(limited_check(
-                t("允许检查并安装更新", "Allow update checks and installation"),
+                strings.allow_updates,
                 IDM_UPDATES_ENABLED,
                 updates,
                 !policy.disable_updates,
             ));
-            result.push(version_row(s, chinese, updates));
+            result.push(version_row(s, updates));
             result
         }
     }
 }
 
 /// The installed version, the update status, and the next update action.
-fn version_row(s: &AppState, chinese: bool, updates: bool) -> Row {
+fn version_row(s: &AppState, updates: bool) -> Row {
     let strings = s.language.strings();
     let label = format!("Codex Usage v{}", env!("CARGO_PKG_VERSION"));
     let check = || {
@@ -844,12 +774,7 @@ fn version_row(s: &AppState, chinese: bool, updates: bool) -> Row {
         )]
     };
     if !updates {
-        let off = if chinese {
-            "更新检查已关闭"
-        } else {
-            "Update checks are off"
-        };
-        return action(label, info(off), Vec::new());
+        return action(label, info(strings.update_checks_off), Vec::new());
     }
     let (hint, buttons) = match &s.update_status {
         UpdateStatus::Idle => (None, check()),
@@ -867,11 +792,9 @@ fn version_row(s: &AppState, chinese: bool, updates: bool) -> Row {
                     release.latest_version
                 ),
             };
-            let available = if chinese {
-                format!("有新版本 v{}", release.latest_version)
-            } else {
-                format!("Version {} is available", release.latest_version)
-            };
+            let available = strings
+                .version_available
+                .replace("{version}", &release.latest_version.to_string());
             (
                 Some(Hint::Warning(available)),
                 vec![OptionItem::command(button, IDM_VERSION_ACTION)],

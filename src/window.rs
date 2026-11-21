@@ -2490,13 +2490,14 @@ fn apply_mcp_setting() {
     }
 }
 
-fn mcp_settings_hint(chinese: bool, unavailable: bool, port: u16) -> String {
-    match (chinese, unavailable) {
-        (false, false) => format!("Lets AI agents read usage data (read-only, port {port})"),
-        (false, true) => format!("Port {port} is unavailable"),
-        (true, false) => format!("供 AI 代理只读查询用量（端口 {port}）"),
-        (true, true) => format!("端口 {port} 不可用"),
-    }
+fn mcp_settings_hint(language: LanguageId, unavailable: bool, port: u16) -> String {
+    let strings = language.strings();
+    let template = if unavailable {
+        strings.mcp_port_unavailable
+    } else {
+        strings.mcp_server_hint
+    };
+    template.replace("{port}", &port.to_string())
 }
 
 fn mcp_snapshot() -> mcp_server::Snapshot {
@@ -5691,7 +5692,7 @@ mod tests {
         // Privileged or zero ports fall back to the default.
         assert_eq!(mcp_port(Some(80)), mcp_server::DEFAULT_PORT);
         assert_eq!(mcp_port(Some(0)), mcp_server::DEFAULT_PORT);
-        assert!(mcp_settings_hint(false, true, 47000).contains("47000"));
+        assert!(mcp_settings_hint(LanguageId::English, true, 47000).contains("47000"));
     }
     #[test]
     fn hiding_provider_logos_reclaims_their_columns() {
