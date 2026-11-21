@@ -785,17 +785,23 @@ fn append_quota_alert(
     let key = format!("{prefix}{reset_key}");
     notified.retain(|existing| !existing.starts_with(&prefix) || existing == &key);
 
-    let remaining = poller::remaining_percentage(section.percentage).round() as u8;
-    if remaining > threshold || !notified.insert(key) {
+    if !section.reported {
         return;
     }
+    // Compare the unrounded value: 10.4% remaining is above a 10% threshold
+    // even though it displays as 10%.
+    let remaining_value = poller::remaining_percentage(section.percentage);
+    if remaining_value > f64::from(threshold) || !notified.insert(key) {
+        return;
+    }
+    let remaining = poller::format_percent(remaining_value);
 
     let reset = format_precise_reset_time(section.resets_at);
     let (title, message) = if language == LanguageId::SimplifiedChinese {
         (
             format!("{provider_label} 额度提醒"),
             format!(
-                "{window_label}额度仅剩 {remaining}%，重置时间：{}",
+                "{window_label}额度仅剩 {remaining}，重置时间：{}",
                 reset.unwrap_or_else(|| "未知".to_string())
             ),
         )
@@ -803,7 +809,7 @@ fn append_quota_alert(
         (
             format!("{provider_label} quota alert"),
             format!(
-                "{window_label} quota has {remaining}% remaining. Reset: {}",
+                "{window_label} quota has {remaining} remaining. Reset: {}",
                 reset.unwrap_or_else(|| "unknown".to_string())
             ),
         )
@@ -1081,24 +1087,139 @@ fn effective_poll_interval(state: &AppState) -> u32 {
         .delay_ms(Instant::now(), state.poll_interval_ms)
 }
 
+/// How long a window's last reading stays on screen, marked stale (`*`)
+/// and without a countdown, after its reset passed: time for the refresh
+/// that the scheduler already starts at the reset (and its bounded retries)
+/// to bring the new window's reading. Afterwards the window shows `--`.
+const RESET_ROLLOVER_GRACE: Duration = Duration::from_secs(300);
+
+/// A window's last reading relative to its reset time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowReset {
+    /// No reset has passed since the reading was taken. This includes a
+    /// reading taken after the reset that still reports it (the provider's
+    /// own answer, not an old observation).
+    Current,
+    /// The reset passed after the reading, less than the grace ago.
+    Rollover,
+    /// The reset passed after the reading, longer ago: the old value no
+    /// longer describes any current window.
+    Passed,
+}
+
+fn window_reset(
+    resets_at: Option<SystemTime>,
+    observed_at: Option<SystemTime>,
+    now: SystemTime,
+) -> WindowReset {
+    match (resets_at, observed_at) {
+        (Some(reset), Some(observed)) if observed < reset && reset <= now => {
+            if now.duration_since(reset).unwrap_or_default() < RESET_ROLLOVER_GRACE {
+                WindowReset::Rollover
+            } else {
+                WindowReset::Passed
+            }
+        }
+        _ => WindowReset::Current,
+    }
+}
+
+/// A provider's line formatter: [`poller::format_line`], or
+/// [`poller::format_antigravity_line`] for Antigravity's remaining quota.
+type LineFormat =
+    fn(&crate::models::UsageSection, Strings, bool, poller::UsageWindowKind) -> String;
+
+/// The taskbar text for one window. A reading from before a reset that has
+/// since passed is never shown as the new window's value: it is kept stale
+/// briefly, then replaced by `--` until a new reading arrives.
+fn window_text(
+    format: LineFormat,
+    section: &crate::models::UsageSection,
+    observed_at: Option<SystemTime>,
+    now: SystemTime,
+    strings: Strings,
+    show_remaining: bool,
+    window: poller::UsageWindowKind,
+) -> String {
+    match window_reset(section.resets_at, observed_at, now) {
+        WindowReset::Current => format(section, strings, show_remaining, window),
+        WindowReset::Rollover => {
+            let previous = crate::models::UsageSection {
+                resets_at: None,
+                ..section.clone()
+            };
+            let mut text = format(&previous, strings, show_remaining, window);
+            quota_refresh::mark_stale(&mut text, true);
+            text
+        }
+        WindowReset::Passed => "--".to_string(),
+    }
+}
+
+/// Tooltip lines explaining `--` and rollover values of a provider's windows.
+fn window_notes(
+    usage: &crate::models::UsageData,
+    observed_at: Option<SystemTime>,
+    now: SystemTime,
+    chinese: bool,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    for (section, weekly) in [(&usage.session, false), (&usage.weekly, true)] {
+        if !section.reported {
+            notes.push(quota_tooltip::message(chinese, weekly).to_string());
+            continue;
+        }
+        if window_reset(section.resets_at, observed_at, now) == WindowReset::Current {
+            continue;
+        }
+        let at = format_precise_reset_time(section.resets_at).unwrap_or_default();
+        notes.push(match (chinese, weekly) {
+            (true, false) => format!("5 小时限额已于 {at} 重置（晚于上次读数），正在等待新读数。"),
+            (true, true) => format!("每周限额已于 {at} 重置（晚于上次读数），正在等待新读数。"),
+            (false, false) => format!(
+                "The 5-hour window reset at {at}, after the last reading. Waiting for a new reading."
+            ),
+            (false, true) => format!(
+                "The weekly window reset at {at}, after the last reading. Waiting for a new reading."
+            ),
+        });
+    }
+    notes
+}
+
 fn refresh_usage_texts(state: &mut AppState) {
     let strings = state.language.strings();
     let show_remaining = state.language == LanguageId::SimplifiedChinese;
     let Some(data) = state.data.as_ref() else {
         return;
     };
+    let now = SystemTime::now();
+    let observed: [Option<SystemTime>; 3] =
+        std::array::from_fn(|id| state.monitor.services[id].history.last_success);
+    let text = |format, section, id: usize, window| {
+        window_text(
+            format,
+            section,
+            observed[id],
+            now,
+            strings,
+            show_remaining,
+            window,
+        )
+    };
+    let format: LineFormat = poller::format_line;
 
     if let Some(claude_code) = data.claude_code.as_ref() {
-        state.session_text = poller::format_line(
+        state.session_text = text(
+            format,
             &claude_code.session,
-            strings,
-            show_remaining,
+            0,
             poller::UsageWindowKind::Session,
         );
-        state.weekly_text = poller::format_line(
+        state.weekly_text = text(
+            format,
             &claude_code.weekly,
-            strings,
-            show_remaining,
+            0,
             poller::UsageWindowKind::Weekly,
         );
     } else if state.show_claude_code {
@@ -1111,18 +1232,9 @@ fn refresh_usage_texts(state: &mut AppState) {
     }
 
     if let Some(codex) = data.codex.as_ref() {
-        state.codex_session_text = poller::format_codex_line(
-            &codex.session,
-            strings,
-            show_remaining,
-            poller::UsageWindowKind::Session,
-        );
-        state.codex_weekly_text = poller::format_codex_line(
-            &codex.weekly,
-            strings,
-            show_remaining,
-            poller::UsageWindowKind::Weekly,
-        );
+        state.codex_session_text =
+            text(format, &codex.session, 1, poller::UsageWindowKind::Session);
+        state.codex_weekly_text = text(format, &codex.weekly, 1, poller::UsageWindowKind::Weekly);
     } else if state.show_codex {
         let label = state.monitor.services[1]
             .error
@@ -1137,16 +1249,17 @@ fn refresh_usage_texts(state: &mut AppState) {
         .as_ref()
         .filter(|_| state.monitor.services[2].error.is_none())
     {
-        state.antigravity_session_text = poller::format_antigravity_line(
+        let format: LineFormat = poller::format_antigravity_line;
+        state.antigravity_session_text = text(
+            format,
             &antigravity.session,
-            strings,
-            show_remaining,
+            2,
             poller::UsageWindowKind::Session,
         );
-        state.antigravity_weekly_text = poller::format_antigravity_line(
+        state.antigravity_weekly_text = text(
+            format,
             &antigravity.weekly,
-            strings,
-            show_remaining,
+            2,
             poller::UsageWindowKind::Weekly,
         );
     } else if state.show_antigravity {
@@ -2130,7 +2243,7 @@ pub fn run() {
     }
 }
 
-/// Keep missing-window explanations aligned with the Codex quota cells.
+/// Keep missing-window and post-reset explanations aligned with the quota cells.
 fn update_quota_tooltips() {
     let (hwnd, regions) = {
         let state = lock_state();
@@ -2145,27 +2258,14 @@ fn update_quota_tooltips() {
                 + sc(DIVIDER_RIGHT_MARGIN)
                 + label_width
                 + sc(LABEL_RIGHT_MARGIN);
-            for (id, visible, name, session, weekly) in [
-                (
-                    0,
-                    s.show_claude_code,
-                    "Claude Code",
-                    &s.session_text,
-                    &s.weekly_text,
-                ),
-                (
-                    1,
-                    s.show_codex,
-                    "Codex",
-                    &s.codex_session_text,
-                    &s.codex_weekly_text,
-                ),
+            for (id, visible, name, session) in [
+                (0, s.show_claude_code, "Claude Code", &s.session_text),
+                (1, s.show_codex, "Codex", &s.codex_session_text),
                 (
                     2,
                     s.show_antigravity,
                     "Antigravity",
                     &s.antigravity_session_text,
-                    &s.antigravity_weekly_text,
                 ),
             ] {
                 if !visible {
@@ -2181,12 +2281,11 @@ fn update_quota_tooltips() {
                         "\nThis provider did not return quota in the latest update."
                     });
                 }
-                if name == "Codex" && s.monitor.services[id].data.is_some() {
-                    for (missing, is_weekly) in [(session == "--", false), (weekly == "--", true)] {
-                        if missing {
-                            text.push('\n');
-                            text.push_str(quota_tooltip::message(chinese, is_weekly));
-                        }
+                if let Some(data) = &s.monitor.services[id].data {
+                    let observed_at = s.monitor.services[id].history.last_success;
+                    for note in window_notes(data, observed_at, SystemTime::now(), chinese) {
+                        text.push('\n');
+                        text.push_str(&note);
                     }
                 }
                 regions.push((
@@ -5044,11 +5143,7 @@ mod tests {
         let mut alerts = Vec::new();
         let mut notified = BTreeSet::new();
         let first_reset = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
-        let first = crate::models::UsageSection {
-            percentage: 85.0,
-            resets_at: Some(first_reset),
-            reported: true,
-        };
+        let first = crate::models::UsageSection::reported(85.0, Some(first_reset));
 
         append_quota_alert(
             &mut alerts,
@@ -5077,11 +5172,10 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].message.contains("仅剩 15%"));
 
-        let next = crate::models::UsageSection {
-            percentage: 90.0,
-            resets_at: Some(first_reset + Duration::from_secs(18_000)),
-            reported: true,
-        };
+        let next = crate::models::UsageSection::reported(
+            90.0,
+            Some(first_reset + Duration::from_secs(18_000)),
+        );
         append_quota_alert(
             &mut alerts,
             &mut notified,
@@ -5096,5 +5190,199 @@ mod tests {
         );
         assert_eq!(alerts.len(), 2);
         assert_eq!(notified.len(), 1);
+    }
+
+    fn alerts_for(section: &crate::models::UsageSection, threshold: u8) -> Vec<QuotaAlert> {
+        let mut alerts = Vec::new();
+        append_quota_alert(
+            &mut alerts,
+            &mut BTreeSet::new(),
+            threshold,
+            LanguageId::English,
+            tray_icon::TrayIconKind::Codex,
+            "codex",
+            "Codex",
+            "session",
+            "5h",
+            section,
+        );
+        alerts
+    }
+
+    #[test]
+    fn low_quota_alert_compares_the_unrounded_remainder() {
+        let reset = Some(UNIX_EPOCH + Duration::from_secs(2_000_000_000));
+        // 10.4% remaining displays as 10% but is still above a 10% threshold.
+        let above = crate::models::UsageSection::reported(89.6, reset);
+        assert!(alerts_for(&above, 10).is_empty());
+        let below = crate::models::UsageSection::reported(90.4, reset);
+        let alerts = alerts_for(&below, 10);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("has 10% remaining"));
+        // Nearly empty is never reported as 0% remaining.
+        let nearly_empty = crate::models::UsageSection::reported(99.6, reset);
+        assert!(alerts_for(&nearly_empty, 10)[0]
+            .message
+            .contains("has <1% remaining"));
+        // A window the provider did not report never alerts.
+        let missing = crate::models::UsageSection {
+            percentage: 100.0,
+            ..Default::default()
+        };
+        assert!(alerts_for(&missing, 10).is_empty());
+    }
+
+    const RESET: u64 = 2_000_000_000;
+
+    fn t(offset: i64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(RESET.checked_add_signed(offset).unwrap())
+    }
+
+    #[test]
+    fn a_reset_after_the_last_reading_retires_the_old_value() {
+        let reset = Some(t(0));
+        // Reading before the reset, reset still ahead: current.
+        assert_eq!(
+            window_reset(reset, Some(t(-60)), t(-1)),
+            WindowReset::Current
+        );
+        // Reset passed after the reading: briefly stale, then unknown.
+        assert_eq!(
+            window_reset(reset, Some(t(-60)), t(0)),
+            WindowReset::Rollover
+        );
+        assert_eq!(
+            window_reset(reset, Some(t(-60)), t(299)),
+            WindowReset::Rollover
+        );
+        assert_eq!(
+            window_reset(reset, Some(t(-60)), t(300)),
+            WindowReset::Passed
+        );
+        // A reading taken after the reset is the provider's own answer.
+        assert_eq!(
+            window_reset(reset, Some(t(5)), t(900)),
+            WindowReset::Current
+        );
+        // No reset time, or no reading time: nothing to compare.
+        assert_eq!(
+            window_reset(None, Some(t(-60)), t(900)),
+            WindowReset::Current
+        );
+        assert_eq!(window_reset(reset, None, t(900)), WindowReset::Current);
+    }
+
+    #[test]
+    fn rollover_shows_the_old_value_stale_and_never_as_the_new_window() {
+        let english = LanguageId::English.strings();
+        let chinese = LanguageId::SimplifiedChinese.strings();
+        let old = crate::models::UsageSection::reported(42.0, Some(t(0)));
+        let session = poller::UsageWindowKind::Session;
+        assert_eq!(
+            window_text(
+                poller::format_line,
+                &old,
+                Some(t(-60)),
+                t(10),
+                english,
+                false,
+                session
+            ),
+            "42% *"
+        );
+        assert_eq!(
+            window_text(
+                poller::format_line,
+                &old,
+                Some(t(-60)),
+                t(10),
+                chinese,
+                true,
+                session
+            ),
+            "58% *"
+        );
+        assert_eq!(
+            window_text(
+                poller::format_line,
+                &old,
+                Some(t(-60)),
+                t(301),
+                english,
+                false,
+                session
+            ),
+            "--"
+        );
+        // The new reading replaces it as soon as it arrives.
+        let fresh = crate::models::UsageSection::reported(3.0, None);
+        assert_eq!(
+            window_text(
+                poller::format_line,
+                &fresh,
+                Some(t(20)),
+                t(30),
+                english,
+                false,
+                session
+            ),
+            "3%"
+        );
+        // A missing window stays `--` regardless of timing.
+        let missing = crate::models::UsageSection::default();
+        assert_eq!(
+            window_text(
+                poller::format_line,
+                &missing,
+                Some(t(-60)),
+                t(-1),
+                english,
+                false,
+                session
+            ),
+            "--"
+        );
+    }
+
+    #[test]
+    fn each_provider_is_judged_by_its_own_last_reading() {
+        let english = LanguageId::English.strings();
+        let window = poller::UsageWindowKind::Weekly;
+        let section = crate::models::UsageSection::reported(70.0, Some(t(0)));
+        // Same reset, same moment: only the provider whose reading predates
+        // the reset is retired.
+        let refreshed = window_text(
+            poller::format_line,
+            &section,
+            Some(t(30)),
+            t(400),
+            english,
+            false,
+            window,
+        );
+        let behind = window_text(
+            poller::format_line,
+            &section,
+            Some(t(-30)),
+            t(400),
+            english,
+            false,
+            window,
+        );
+        assert!(refreshed.starts_with("70%"));
+        assert_eq!(behind, "--");
+    }
+
+    #[test]
+    fn tooltip_explains_missing_and_post_reset_windows() {
+        let usage = crate::models::UsageData {
+            session: crate::models::UsageSection::default(),
+            weekly: crate::models::UsageSection::reported(70.0, Some(t(0))),
+        };
+        let notes = window_notes(&usage, Some(t(-60)), t(10), false);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0], quota_tooltip::message(false, false));
+        assert!(notes[1].starts_with("The weekly window reset at "));
+        assert!(window_notes(&usage, Some(t(-60)), t(-10), true).len() == 1);
     }
 }

@@ -137,11 +137,13 @@ Each enabled service keeps its own data, last successful update, error, and retr
 
 | Display | Meaning |
 | --- | --- |
-| `--` and an empty bar | The service did not report this quota window. For example, some Codex accounts only have a weekly limit. |
+| `--` and an empty bar | The service did not report this quota window. For example, some Codex accounts only have a weekly limit. It also appears when a window reset more than 5 minutes ago and no reading of the new window has arrived yet. |
 | `*` after the reset text | The latest refresh failed or the data is old. The numbers are from the last successful refresh. |
+| `*` with no reset text | The window reset after the last reading. The old number stays for up to 5 minutes while the new window is fetched. |
+| `<1%` | More than 0% but less than 1%. `0%` and `100%` only appear for exactly empty or full windows. |
 | `!`, `NET`, `429`, `5XX`, or `ERR` (Chinese: `!`, `网络`, `限流`, `服务`, `错误`) | The service has not returned data yet since the app started, and the label shows why. |
 
-Hover over a service column to see when it last updated successfully, when it refreshes or retries next, and the latest error. Missing Codex windows also get a short explanation.
+Hover over a service column to see when it last updated successfully, when it refreshes or retries next, and the latest error. Missing windows and windows that reset after the last reading also get a short explanation.
 
 Refresh behavior:
 
