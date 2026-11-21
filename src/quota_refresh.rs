@@ -212,12 +212,13 @@ mod tests {
             session: UsageSection {
                 percentage: session,
                 resets_at: None,
+                reported: true,
             },
             weekly: UsageSection {
                 percentage: weekly,
                 resets_at: None,
+                reported: true,
             },
-            quota_group: None,
         }
     }
     #[test]

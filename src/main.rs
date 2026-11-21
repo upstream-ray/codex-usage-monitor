@@ -1,6 +1,5 @@
 #![windows_subsystem = "windows"]
 
-mod antigravity_local;
 mod diagnose;
 mod localization;
 mod models;

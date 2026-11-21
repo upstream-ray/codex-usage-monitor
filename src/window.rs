@@ -80,7 +80,6 @@ struct AppState {
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
-    antigravity_quota_group: Option<String>,
     show_session_window: bool,
     show_weekly_window: bool,
     alert_threshold_percent: u8,
@@ -148,9 +147,6 @@ const IDM_LANG_SIMPLIFIED_CHINESE: u16 = 51;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
-const IDM_ANTIGRAVITY_GROUP_AUTO: u16 = 63;
-const IDM_ANTIGRAVITY_GROUP_FIRST: u16 = 64;
-const IDM_ANTIGRAVITY_GROUP_LAST: u16 = 70;
 const IDM_SHOW_SESSION_WINDOW: u16 = 71;
 const IDM_SHOW_WEEKLY_WINDOW: u16 = 72;
 const IDM_ALERT_OFF: u16 = 80;
@@ -454,10 +450,6 @@ struct SettingsFile {
     show_codex: bool,
     #[serde(default = "default_show_antigravity")]
     show_antigravity: bool,
-    /// The Antigravity quota group to show, as Antigravity names it. Absent
-    /// means Auto (Gemini Models first).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    antigravity_quota_group: Option<String>,
     #[serde(default = "default_show_usage_window")]
     show_session_window: bool,
     #[serde(default = "default_show_usage_window")]
@@ -484,7 +476,6 @@ impl Default for SettingsFile {
             show_claude_code: false,
             show_codex: true,
             show_antigravity: false,
-            antigravity_quota_group: None,
             show_session_window: true,
             show_weekly_window: true,
             alert_threshold_percent: 0,
@@ -590,19 +581,6 @@ fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
     }
     settings.notified_quota_windows.sort();
     settings.notified_quota_windows.dedup();
-    settings.antigravity_quota_group = settings
-        .antigravity_quota_group
-        .as_deref()
-        .map(|group| {
-            group
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(40)
-                .collect::<String>()
-                .trim()
-                .to_string()
-        })
-        .filter(|group| !group.is_empty());
     settings
 }
 
@@ -631,7 +609,6 @@ fn save_state_settings() {
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
-            antigravity_quota_group: s.antigravity_quota_group.clone(),
             show_session_window: s.show_session_window,
             show_weekly_window: s.show_weekly_window,
             alert_threshold_percent: s.alert_threshold_percent,
@@ -653,17 +630,6 @@ fn format_local_system_time(local: SYSTEMTIME) -> String {
         "{:04}-{:02}-{:02} {:02}:{:02}",
         local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute
     )
-}
-
-/// "Antigravity" plus the quota group being shown, when one is named.
-fn antigravity_service_name(strings: Strings, data: Option<&AppUsageData>) -> String {
-    match data
-        .and_then(|data| data.antigravity.as_ref())
-        .and_then(|usage| usage.quota_group.as_deref())
-    {
-        Some(group) => format!("{} ({group})", strings.antigravity_model),
-        None => strings.antigravity_model.to_string(),
-    }
 }
 
 fn service_tooltip(
@@ -750,7 +716,7 @@ fn collect_low_quota_alerts(state: &mut AppState, data: &AppUsageData) -> Vec<Qu
                 state.language,
                 tray_icon::TrayIconKind::Antigravity,
                 "antigravity",
-                &antigravity_service_name(strings, Some(data)),
+                strings.antigravity_model,
                 usage,
                 strings,
             );
@@ -875,7 +841,7 @@ fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
             }
             if s.show_antigravity {
                 services.push(service_tooltip(
-                    &antigravity_service_name(strings, s.data.as_ref()),
+                    strings.antigravity_model,
                     &s.antigravity_session_text,
                     &s.antigravity_weekly_text,
                     s.show_session_window,
@@ -1166,28 +1132,26 @@ fn refresh_usage_texts(state: &mut AppState) {
         state.codex_weekly_text = label.to_string();
     }
 
-    if let Some(antigravity) = data.antigravity.as_ref() {
-        // A window the quota group does not report (Gemini 4 Argon has no
-        // 5-hour limit) shows `--`, like Codex, never 0% used.
-        state.antigravity_session_text = poller::format_codex_line(
+    if let Some(antigravity) = data
+        .antigravity
+        .as_ref()
+        .filter(|_| state.monitor.services[2].error.is_none())
+    {
+        state.antigravity_session_text = poller::format_antigravity_line(
             &antigravity.session,
             strings,
             show_remaining,
             poller::UsageWindowKind::Session,
         );
-        state.antigravity_weekly_text = poller::format_codex_line(
+        state.antigravity_weekly_text = poller::format_antigravity_line(
             &antigravity.weekly,
             strings,
             show_remaining,
             poller::UsageWindowKind::Weekly,
         );
     } else if state.show_antigravity {
-        let label = state.monitor.services[2]
-            .error
-            .map(|e| poll_error_display_label(e, state.language))
-            .unwrap_or("...");
-        state.antigravity_session_text = label.to_string();
-        state.antigravity_weekly_text = label.to_string();
+        state.antigravity_session_text = "--".to_string();
+        state.antigravity_weekly_text = "--".to_string();
     }
     for (id, session, weekly) in [
         (0, &mut state.session_text, &mut state.weekly_text),
@@ -1969,7 +1933,6 @@ pub fn run() {
 
         let claude_code_available = poller::claude_code_credentials_available();
         let settings = load_settings(claude_code_available);
-        poller::set_antigravity_quota_group(settings.antigravity_quota_group.clone());
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
@@ -2048,7 +2011,6 @@ pub fn run() {
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
-                antigravity_quota_group: settings.antigravity_quota_group.clone(),
                 show_session_window: settings.show_session_window,
                 show_weekly_window: settings.show_weekly_window,
                 alert_threshold_percent: settings.alert_threshold_percent,
@@ -2211,14 +2173,7 @@ fn update_quota_tooltips() {
                 }
                 let description =
                     s.monitor.services[id].description(SystemTime::now(), Instant::now(), chinese);
-                let group = (id == 2)
-                    .then(|| s.monitor.services[id].data.as_ref())
-                    .flatten()
-                    .and_then(|data| data.quota_group.as_deref());
-                let mut text = match group {
-                    Some(group) => format!("{name} ({group})\n{description}"),
-                    None => format!("{name}\n{description}"),
-                };
+                let mut text = format!("{name}\n{description}");
                 if s.monitor.services[id].error.is_some() && session == "!" {
                     text.push_str(if chinese {
                         "\n本服务本次未返回额度。"
@@ -2226,14 +2181,7 @@ fn update_quota_tooltips() {
                         "\nThis provider did not return quota in the latest update."
                     });
                 }
-                if s.monitor.services[id].error == Some(poller::PollError::QuotaGroupUnavailable) {
-                    text.push_str(if chinese {
-                        "\n当前数据源未提供所选额度组；不会显示其他额度组的数值。"
-                    } else {
-                        "\nThe current source does not report the selected quota group. Another group's values are never shown in its place."
-                    });
-                }
-                if (id == 1 || id == 2) && s.monitor.services[id].data.is_some() {
+                if name == "Codex" && s.monitor.services[id].data.is_some() {
                     for (missing, is_weekly) in [(session == "--", false), (weekly == "--", true)] {
                         if missing {
                             text.push('\n');
@@ -2499,8 +2447,8 @@ fn paint_content(
         let weekly_pct = usage_percent_for_display(language, weekly_pct);
         let codex_session_pct = usage_percent_for_display(language, codex_session_pct);
         let codex_weekly_pct = usage_percent_for_display(language, codex_weekly_pct);
-        let antigravity_session_pct = usage_percent_for_display(language, antigravity_session_pct);
-        let antigravity_weekly_pct = usage_percent_for_display(language, antigravity_weekly_pct);
+        let antigravity_session_pct = poller::remaining_percentage(antigravity_session_pct);
+        let antigravity_weekly_pct = poller::remaining_percentage(antigravity_weekly_pct);
         let (label_width, text_width) = usage_layout_widths(language, appearance);
 
         let client_rect = RECT {
@@ -2681,8 +2629,6 @@ fn poll_error_display_label(error: poller::PollError, language: LanguageId) -> &
                 "ERR"
             }
         }
-        // The selected group has no reading: unavailable, not 0% or 100%.
-        poller::PollError::QuotaGroupUnavailable => "--",
     }
 }
 
@@ -3727,47 +3673,6 @@ unsafe extern "system" fn wnd_proc(
                     let sh = SendHwnd::from_hwnd(hwnd);
                     request_poll(sh, true);
                 }
-                IDM_ANTIGRAVITY_GROUP_AUTO
-                | IDM_ANTIGRAVITY_GROUP_FIRST..=IDM_ANTIGRAVITY_GROUP_LAST => {
-                    let changed = {
-                        let mut state = lock_state();
-                        state.as_mut().is_some_and(|s| {
-                            let choice = if id == IDM_ANTIGRAVITY_GROUP_AUTO {
-                                Some(None)
-                            } else {
-                                antigravity_group_choices(s.antigravity_quota_group.as_deref())
-                                    .get(usize::from(id - IDM_ANTIGRAVITY_GROUP_FIRST))
-                                    .map(|group| Some(group.clone()))
-                            };
-                            let Some(choice) =
-                                choice.filter(|choice| *choice != s.antigravity_quota_group)
-                            else {
-                                return false;
-                            };
-                            diagnose::log(format!(
-                                "Antigravity quota group set to {}",
-                                choice.as_deref().unwrap_or("Auto")
-                            ));
-                            poller::set_antigravity_quota_group(choice.clone());
-                            s.antigravity_quota_group = choice;
-                            // Never show the previous group's values under the new choice.
-                            s.monitor.reselect(2, Instant::now());
-                            s.data = Some(s.monitor.cached());
-                            s.antigravity_session_percent = 0.0;
-                            s.antigravity_weekly_percent = 0.0;
-                            s.antigravity_session_text = "...".to_string();
-                            s.antigravity_weekly_text = "...".to_string();
-                            true
-                        })
-                    };
-                    if changed {
-                        save_state_settings();
-                        render_layered();
-                        sync_tray_icons(hwnd);
-                        // Only Antigravity is due, so no other provider is polled.
-                        start_poll(SendHwnd::from_hwnd(hwnd), true);
-                    }
-                }
                 IDM_LANG_SYSTEM
                 | IDM_LANG_ENGLISH
                 | IDM_LANG_DUTCH
@@ -3862,67 +3767,6 @@ unsafe fn append_appearance_submenu(parent: HMENU, child: HMENU, label: &str) {
         MF_POPUP,
         child.0 as usize,
         PCWSTR::from_raw(wide.as_ptr()),
-    );
-}
-
-/// Groups offered in the Antigravity quota group menu: those Antigravity
-/// reported during this run, plus the saved choice when not seen yet.
-fn antigravity_group_choices(current: Option<&str>) -> Vec<String> {
-    let mut groups = poller::antigravity_quota_groups();
-    if let Some(current) = current {
-        if !groups.iter().any(|g| g.eq_ignore_ascii_case(current)) {
-            groups.push(current.to_string());
-        }
-    }
-    groups.truncate(usize::from(
-        IDM_ANTIGRAVITY_GROUP_LAST - IDM_ANTIGRAVITY_GROUP_FIRST + 1,
-    ));
-    groups
-}
-
-/// Monitored services > Antigravity quota group: Auto, then the groups.
-unsafe fn append_antigravity_group_menu(models_menu: HMENU, language: LanguageId) {
-    let chinese = language == LanguageId::SimplifiedChinese;
-    let current = lock_state()
-        .as_ref()
-        .and_then(|s| s.antigravity_quota_group.clone());
-    let Ok(menu) = CreatePopupMenu() else {
-        return;
-    };
-    append_appearance_choice(
-        menu,
-        IDM_ANTIGRAVITY_GROUP_AUTO,
-        current.is_none(),
-        if chinese {
-            "自动（优先 Gemini 模型）"
-        } else {
-            "Auto (Gemini Models first)"
-        },
-    );
-    let groups = antigravity_group_choices(current.as_deref());
-    if !groups.is_empty() {
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    }
-    for (index, group) in groups.iter().enumerate() {
-        let checked = current
-            .as_deref()
-            .is_some_and(|current| current.eq_ignore_ascii_case(group));
-        // `&` would otherwise become a menu mnemonic.
-        append_appearance_choice(
-            menu,
-            IDM_ANTIGRAVITY_GROUP_FIRST + index as u16,
-            checked,
-            &group.replace('&', "&&"),
-        );
-    }
-    append_appearance_submenu(
-        models_menu,
-        menu,
-        if chinese {
-            "Antigravity 额度组"
-        } else {
-            "Antigravity quota group"
-        },
     );
 }
 
@@ -4086,7 +3930,6 @@ fn show_context_menu(hwnd: HWND) {
             IDM_MODEL_ANTIGRAVITY as usize,
             PCWSTR::from_raw(antigravity_model.as_ptr()),
         );
-        append_antigravity_group_menu(models_menu, language);
 
         let models_label = native_interop::wide_str(strings.models);
         let _ = AppendMenuW(
@@ -5009,104 +4852,6 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_quota_group_is_optional_and_round_trips() {
-        // Older settings have no group: Auto, and nothing new is written.
-        let old: SettingsFile = serde_json::from_str(&test_settings_json("en")).unwrap();
-        assert_eq!(old.antigravity_quota_group, None);
-        let json = serde_json::to_string(&normalize_settings(old)).unwrap();
-        assert!(!json.contains("antigravity_quota_group"), "{json}");
-
-        let chosen = SettingsFile {
-            antigravity_quota_group: Some("Gemini 4 Argon".to_string()),
-            ..SettingsFile::default()
-        };
-        let json = serde_json::to_string(&chosen).unwrap();
-        let restored = normalize_settings(serde_json::from_str(&json).unwrap());
-        assert_eq!(
-            restored.antigravity_quota_group.as_deref(),
-            Some("Gemini 4 Argon")
-        );
-
-        // A hand-edited value is trimmed to printable text; blank means Auto.
-        for (saved, expected) in [
-            ("  Gemini Models\u{7}\n", Some("Gemini Models")),
-            ("   ", None),
-            ("", None),
-        ] {
-            let settings = normalize_settings(SettingsFile {
-                antigravity_quota_group: Some(saved.to_string()),
-                ..SettingsFile::default()
-            });
-            assert_eq!(settings.antigravity_quota_group.as_deref(), expected);
-        }
-        let long = normalize_settings(SettingsFile {
-            antigravity_quota_group: Some("x".repeat(500)),
-            ..SettingsFile::default()
-        });
-        assert_eq!(long.antigravity_quota_group.map(|g| g.len()), Some(40));
-    }
-
-    #[test]
-    fn antigravity_group_menu_keeps_the_saved_choice_and_fits_its_ids() {
-        let choices = antigravity_group_choices(Some("A group not reported yet"));
-        assert!(choices.iter().any(|g| g == "A group not reported yet"));
-        assert!(
-            choices.len()
-                <= usize::from(IDM_ANTIGRAVITY_GROUP_LAST - IDM_ANTIGRAVITY_GROUP_FIRST + 1)
-        );
-        assert!(IDM_ANTIGRAVITY_GROUP_AUTO > IDM_MODEL_ANTIGRAVITY);
-        assert!(IDM_ANTIGRAVITY_GROUP_LAST < IDM_SHOW_SESSION_WINDOW);
-    }
-
-    #[test]
-    fn antigravity_rows_name_the_group_and_show_missing_windows_as_unavailable() {
-        let strings = LanguageId::English.strings();
-        let argon = crate::models::UsageData {
-            weekly: crate::models::UsageSection {
-                percentage: 15.5,
-                resets_at: Some(SystemTime::now() + Duration::from_secs(86_400)),
-            },
-            quota_group: Some("Gemini 4 Argon".to_string()),
-            ..Default::default()
-        };
-        let data = AppUsageData {
-            antigravity: Some(argon.clone()),
-            ..Default::default()
-        };
-        assert_eq!(
-            antigravity_service_name(strings, Some(&data)),
-            "Antigravity (Gemini 4 Argon)"
-        );
-        assert_eq!(antigravity_service_name(strings, None), "Antigravity");
-
-        // No 5-hour window: `--` and an empty bar, in both display modes.
-        for show_remaining in [false, true] {
-            let session = poller::format_codex_line(
-                &argon.session,
-                strings,
-                show_remaining,
-                poller::UsageWindowKind::Session,
-            );
-            assert_eq!(session, "--");
-            assert_eq!(usage_bar_fill_percentage(100.0, &session), 0.0);
-            let weekly = poller::format_codex_line(
-                &argon.weekly,
-                strings,
-                show_remaining,
-                poller::UsageWindowKind::Weekly,
-            );
-            assert!(weekly.contains('%'), "{weekly}");
-        }
-        assert_eq!(
-            poll_error_display_label(
-                poller::PollError::QuotaGroupUnavailable,
-                LanguageId::English
-            ),
-            "--"
-        );
-    }
-
-    #[test]
     fn chosen_monitor_device_survives_settings_round_trip() {
         let settings = SettingsFile {
             monitor_device: Some(r"\\.\DISPLAY2".to_string()),
@@ -5302,6 +5047,7 @@ mod tests {
         let first = crate::models::UsageSection {
             percentage: 85.0,
             resets_at: Some(first_reset),
+            reported: true,
         };
 
         append_quota_alert(
@@ -5334,6 +5080,7 @@ mod tests {
         let next = crate::models::UsageSection {
             percentage: 90.0,
             resets_at: Some(first_reset + Duration::from_secs(18_000)),
+            reported: true,
         };
         append_quota_alert(
             &mut alerts,
