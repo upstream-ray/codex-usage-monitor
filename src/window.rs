@@ -1132,31 +1132,26 @@ fn refresh_usage_texts(state: &mut AppState) {
         state.codex_weekly_text = label.to_string();
     }
 
-    if let Some(antigravity) = data.antigravity.as_ref() {
-        state.antigravity_session_text = poller::format_line(
+    if let Some(antigravity) = data
+        .antigravity
+        .as_ref()
+        .filter(|_| state.monitor.services[2].error.is_none())
+    {
+        state.antigravity_session_text = poller::format_antigravity_line(
             &antigravity.session,
             strings,
             show_remaining,
             poller::UsageWindowKind::Session,
         );
-        state.antigravity_weekly_text =
-            if antigravity.weekly.resets_at.is_none() && antigravity.weekly.percentage == 0.0 {
-                "--".to_string()
-            } else {
-                poller::format_line(
-                    &antigravity.weekly,
-                    strings,
-                    show_remaining,
-                    poller::UsageWindowKind::Weekly,
-                )
-            };
+        state.antigravity_weekly_text = poller::format_antigravity_line(
+            &antigravity.weekly,
+            strings,
+            show_remaining,
+            poller::UsageWindowKind::Weekly,
+        );
     } else if state.show_antigravity {
-        let label = state.monitor.services[2]
-            .error
-            .map(|e| poll_error_display_label(e, state.language))
-            .unwrap_or("...");
-        state.antigravity_session_text = label.to_string();
-        state.antigravity_weekly_text = label.to_string();
+        state.antigravity_session_text = "--".to_string();
+        state.antigravity_weekly_text = "--".to_string();
     }
     for (id, session, weekly) in [
         (0, &mut state.session_text, &mut state.weekly_text),
@@ -2452,8 +2447,8 @@ fn paint_content(
         let weekly_pct = usage_percent_for_display(language, weekly_pct);
         let codex_session_pct = usage_percent_for_display(language, codex_session_pct);
         let codex_weekly_pct = usage_percent_for_display(language, codex_weekly_pct);
-        let antigravity_session_pct = usage_percent_for_display(language, antigravity_session_pct);
-        let antigravity_weekly_pct = usage_percent_for_display(language, antigravity_weekly_pct);
+        let antigravity_session_pct = poller::remaining_percentage(antigravity_session_pct);
+        let antigravity_weekly_pct = poller::remaining_percentage(antigravity_weekly_pct);
         let (label_width, text_width) = usage_layout_widths(language, appearance);
 
         let client_rect = RECT {
@@ -5052,6 +5047,7 @@ mod tests {
         let first = crate::models::UsageSection {
             percentage: 85.0,
             resets_at: Some(first_reset),
+            reported: true,
         };
 
         append_quota_alert(
@@ -5084,6 +5080,7 @@ mod tests {
         let next = crate::models::UsageSection {
             percentage: 90.0,
             resets_at: Some(first_reset + Duration::from_secs(18_000)),
+            reported: true,
         };
         append_quota_alert(
             &mut alerts,
