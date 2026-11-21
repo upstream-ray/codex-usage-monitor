@@ -111,7 +111,7 @@ Use the right-click **Monitored services** menu to choose which independent serv
 - **Claude Code** can be enabled alongside Codex or shown by itself when Claude Code CLI is installed and authenticated
 - **Antigravity** can be enabled alongside the other providers or shown by itself as its own service column
 
-When multiple services are shown, each service has its own usage bar and matching usage text color. Antigravity prefers Google's Gemini quota summary when available and falls back to model quota data when needed.
+When multiple services are shown, each service has its own usage bar and matching usage text color. Antigravity reads the **Gemini Models** balances from **View Usage** through the signed-in Antigravity CLI. If the CLI query fails, the widget tries Google's account quota summary. Unavailable windows display `--`.
 
 Claude Desktop and Claude Code CLI use separate local sessions. Signing in to Claude Desktop does not enable Claude Code monitoring. When no supported Claude Code CLI credentials are available, the menu shows **Claude Code (CLI login required)** as a disabled item and automatically keeps that service off.
 
@@ -197,7 +197,7 @@ What the app reads:
 - If `CLAUDE_CONFIG_DIR` is set, the Claude Code credentials file in that directory
 - If needed, the same credentials file inside an installed WSL distro
 - If Codex is enabled, your local Codex credentials from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`
-- If Antigravity is enabled, your local Antigravity OAuth token from Windows Credential Manager target `gemini:antigravity`
+- If Antigravity is enabled, the Antigravity CLI `/usage` output. If the CLI query fails, the local Antigravity OAuth token from Windows Credential Manager target `gemini:antigravity`
 
 What the app sends over the network:
 

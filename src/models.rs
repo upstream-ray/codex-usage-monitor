@@ -4,6 +4,7 @@ use std::time::SystemTime;
 pub struct UsageSection {
     pub percentage: f64,
     pub resets_at: Option<SystemTime>,
+    pub reported: bool,
 }
 
 #[derive(Clone, Debug, Default)]
