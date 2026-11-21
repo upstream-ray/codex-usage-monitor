@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 
 /// One quota window as the provider reported it. `Default` is a window the
-/// provider did not report (`available == false`), shown as `--`; a reported
+/// provider did not report (`reported == false`), shown as `--`; a reported
 /// window with 0% used and no reset time is a real reading.
 #[derive(Clone, Debug, Default)]
 pub struct UsageSection {
@@ -9,7 +9,7 @@ pub struct UsageSection {
     pub percentage: f64,
     pub resets_at: Option<SystemTime>,
     /// Whether the provider reported this window at all.
-    pub available: bool,
+    pub reported: bool,
 }
 
 impl UsageSection {
@@ -18,7 +18,7 @@ impl UsageSection {
         Self {
             percentage,
             resets_at,
-            available: true,
+            reported: true,
         }
     }
 }

@@ -111,7 +111,7 @@ codex-usage
 - **Claude Code** 在已安装并登录 Claude Code CLI 时，可与 Codex 同时显示或单独显示
 - **Antigravity** 可与其他提供商同时显示，也可作为独立服务列单独显示
 
-显示多个服务时，每个服务都有自己的用量条和对应的文字颜色。Antigravity 会优先使用 Google 的 Gemini 配额摘要，必要时回退到模型配额数据。
+显示多个服务时，每个服务都有自己的用量条和对应的文字颜色。Antigravity 优先通过已登录的 Antigravity CLI 读取 **View Usage** 中 **Gemini Models** 的剩余额度。CLI 无法查询时，组件尝试读取 Google 的账户配额摘要。缺失的窗口显示为 `--`。
 
 Claude 桌面客户端与 Claude Code CLI 使用相互独立的本地登录状态。只登录 Claude 桌面客户端不会启用 Claude Code 监控。检测不到受支持的 Claude Code CLI 凭据时，菜单会以禁用状态显示 **Claude Code（需登录 CLI）**，并自动关闭该服务。
 
@@ -206,7 +206,7 @@ Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Co
 - 如果设置了 `CLAUDE_CONFIG_DIR`，读取该目录中的 Claude Code 凭据文件
 - 必要时，已安装 WSL 发行版中的同一凭据文件
 - 启用 Codex 时，读取 `$CODEX_HOME/auth.json` 或 `~/.codex/auth.json` 中的本地 Codex 凭据
-- 启用 Antigravity 时，读取 Windows 凭据管理器中目标为 `gemini:antigravity` 的本地 OAuth 令牌
+- 启用 Antigravity 时，读取 Antigravity CLI 的 `/usage` 输出。CLI 无法查询时，读取 Windows 凭据管理器中目标为 `gemini:antigravity` 的本地 OAuth 令牌
 
 应用通过网络发送的请求：
 
