@@ -327,6 +327,9 @@ impl Monitor {
     }
 }
 impl Service {
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
     pub fn stale(&self, now: SystemTime) -> bool {
         self.error.is_some() || self.history.is_stale(now)
     }

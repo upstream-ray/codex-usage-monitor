@@ -2,6 +2,7 @@
 
 mod diagnose;
 mod localization;
+mod mcp_server;
 mod models;
 mod native_interop;
 mod poller;
