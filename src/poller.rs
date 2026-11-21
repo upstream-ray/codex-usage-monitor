@@ -11,7 +11,7 @@ use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
 use crate::localization::Strings;
-use crate::models::{UsageData, UsageSection};
+use crate::models::{QuotaDisplayMode, UsageData, UsageSection};
 use crate::native_interop;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -189,19 +189,13 @@ extern "system" {
     fn CredFree(buffer: *mut c_void);
 }
 
-pub fn poll_provider(id: usize) -> Result<UsageData, PollError> {
+pub fn poll_provider(id: usize, antigravity_group: Option<&str>) -> Result<UsageData, PollError> {
     match id {
         0 => poll_claude_code(),
         1 => poll_codex(),
-        2 => poll_antigravity(),
+        2 => poll_antigravity(antigravity_group),
         _ => Err(PollError::RequestFailed),
     }
-}
-
-/// Whether Claude Code CLI credentials are available from a supported source.
-/// Claude Desktop authentication is intentionally not treated as CLI access.
-pub fn claude_code_credentials_available() -> bool {
-    read_first_credentials().is_some()
 }
 
 fn poll_claude_code() -> Result<UsageData, PollError> {
@@ -219,7 +213,21 @@ fn poll_claude_code() -> Result<UsageData, PollError> {
 }
 
 fn poll_codex() -> Result<UsageData, PollError> {
-    let creds = match read_codex_credentials() {
+    poll_codex_with(
+        read_codex_credentials,
+        fetch_codex_usage,
+        crate::privacy::passive_monitoring,
+        cli_refresh_codex_token,
+    )
+}
+
+fn poll_codex_with(
+    mut read_credentials: impl FnMut() -> Option<CodexTokenData>,
+    mut fetch_usage: impl FnMut(&str, Option<&str>) -> Result<UsageData, PollError>,
+    passive: impl Fn() -> bool,
+    refresh: impl FnOnce(),
+) -> Result<UsageData, PollError> {
+    let creds = match read_credentials() {
         Some(creds) => creds,
         None => {
             diagnose::log("Codex usage poll failed: no Codex credentials found");
@@ -227,20 +235,20 @@ fn poll_codex() -> Result<UsageData, PollError> {
         }
     };
 
-    match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
+    match fetch_usage(&creds.access_token, creds.account_id.as_deref()) {
         Ok(data) => Ok(data),
-        Err(PollError::AuthRequired) => {
-            cli_refresh_codex_token();
-            let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
-            fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())
+        Err(PollError::AuthRequired) if !passive() => {
+            refresh();
+            let refreshed = read_credentials().ok_or(PollError::TokenExpired)?;
+            fetch_usage(&refreshed.access_token, refreshed.account_id.as_deref())
         }
         Err(error) => Err(error),
     }
 }
 
-fn poll_antigravity() -> Result<UsageData, PollError> {
+fn poll_antigravity(group: Option<&str>) -> Result<UsageData, PollError> {
     if let Some(path) = antigravity_cli_path() {
-        if let Some(usage) = fetch_antigravity_cli_usage(path) {
+        if let Some(usage) = fetch_antigravity_cli_usage(path, group) {
             return Ok(usage);
         }
         diagnose::log("Antigravity CLI quota lookup failed; trying the account quota summary");
@@ -254,19 +262,41 @@ fn poll_antigravity() -> Result<UsageData, PollError> {
         }
     };
 
-    fetch_antigravity_usage(&creds.access_token)
+    fetch_antigravity_usage(&creds.access_token, group)
 }
 
-fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError> {
+fn refresh_or_fallback(creds: Credentials) -> Result<Credentials, PollError> {
+    refresh_or_fallback_with(
+        creds,
+        crate::privacy::passive_monitoring,
+        cli_refresh_token,
+        read_credentials_from_source,
+        read_next_credentials_after,
+    )
+}
+
+fn refresh_or_fallback_with(
+    mut creds: Credentials,
+    passive: impl Fn() -> bool,
+    refresh: impl Fn(&CredentialSource),
+    read_credentials: impl Fn(&CredentialSource) -> Option<Credentials>,
+    next_credentials: impl Fn(&CredentialSource) -> Option<Credentials>,
+) -> Result<Credentials, PollError> {
     loop {
         if !is_token_expired(creds.expires_at) {
             return Ok(creds);
         }
 
-        let source = creds.source.clone();
-        cli_refresh_token(&source);
+        // A monitoring request must not start a model task to refresh a login.
+        // Return an auth error so the scheduler waits for updated credentials.
+        if passive() {
+            return Err(PollError::TokenExpired);
+        }
 
-        match read_credentials_from_source(&source) {
+        let source = creds.source.clone();
+        refresh(&source);
+
+        match read_credentials(&source) {
             Some(refreshed) if !is_token_expired(refreshed.expires_at) => return Ok(refreshed),
             Some(_) => diagnose::log(format!(
                 "credentials from {source:?} still expired after refresh attempt"
@@ -276,7 +306,7 @@ fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError>
             )),
         }
 
-        match read_next_credentials_after(&source) {
+        match next_credentials(&source) {
             Some(next) => creds = next,
             None => return Err(PollError::TokenExpired),
         }
@@ -286,6 +316,9 @@ fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError>
 /// Invoke the Claude CLI with a minimal prompt to force its internal
 /// OAuth token refresh.
 fn cli_refresh_token(source: &CredentialSource) {
+    if crate::privacy::passive_monitoring() {
+        return;
+    }
     match source {
         CredentialSource::Windows(_) => cli_refresh_windows_token(),
         CredentialSource::Wsl { distro } => cli_refresh_wsl_token(distro),
@@ -293,6 +326,9 @@ fn cli_refresh_token(source: &CredentialSource) {
 }
 
 fn cli_refresh_windows_token() {
+    if crate::privacy::passive_monitoring() {
+        return;
+    }
     let claude_path = resolve_windows_claude_path();
     let is_cmd = claude_path.to_lowercase().ends_with(".cmd");
     diagnose::log(format!(
@@ -317,6 +353,9 @@ fn cli_refresh_windows_token() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
+    if crate::privacy::passive_monitoring() {
+        return;
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(error) => {
@@ -343,6 +382,9 @@ fn cli_refresh_windows_token() {
 }
 
 fn cli_refresh_wsl_token(distro: &str) {
+    if crate::privacy::passive_monitoring() {
+        return;
+    }
     diagnose::log(format!(
         "attempting WSL Claude token refresh in distro {distro}"
     ));
@@ -360,6 +402,9 @@ fn cli_refresh_wsl_token(distro: &str) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
+    if crate::privacy::passive_monitoring() {
+        return;
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(error) => {
@@ -372,6 +417,9 @@ fn cli_refresh_wsl_token(distro: &str) {
 }
 
 fn cli_refresh_codex_token() {
+    if crate::privacy::passive_monitoring() {
+        return;
+    }
     let codex_path = resolve_windows_codex_path();
     let is_cmd = codex_path.to_lowercase().ends_with(".cmd");
     let is_ps1 = codex_path.to_lowercase().ends_with(".ps1");
@@ -404,6 +452,9 @@ fn cli_refresh_codex_token() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
+    if crate::privacy::passive_monitoring() {
+        return;
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(error) => {
@@ -547,6 +598,8 @@ fn resolve_windows_codex_path() -> String {
 fn build_agent() -> Result<ureq::Agent, PollError> {
     let tls = native_tls::TlsConnector::new().map_err(|_| PollError::RequestFailed)?;
     Ok(ureq::AgentBuilder::new()
+        .https_only(true)
+        .redirects(0)
         .timeout(Duration::from_secs(30))
         .tls_connector(std::sync::Arc::new(tls))
         .build())
@@ -679,12 +732,29 @@ fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
 }
 
 fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
+    fetch_claude_usage_with(
+        crate::privacy::passive_monitoring,
+        || try_usage_endpoint(token),
+        || fetch_usage_via_messages(token),
+    )
+}
+
+fn fetch_claude_usage_with(
+    passive: impl Fn() -> bool,
+    usage_endpoint: impl FnOnce() -> Result<Option<UsageData>, PollError>,
+    messages_fallback: impl FnOnce() -> Result<UsageData, PollError>,
+) -> Result<UsageData, PollError> {
     // Try the dedicated usage endpoint first
-    match try_usage_endpoint(token)? {
+    match usage_endpoint()? {
         Some(data) => {
+            // Keep partial quota data as reported. Generating a message merely
+            // to fill a reset timestamp is not passive monitoring.
+            if passive() {
+                return Ok(data);
+            }
             // If reset timers are missing, fill them in from the Messages API
             if data.session.resets_at.is_none() || data.weekly.resets_at.is_none() {
-                if let Ok(fallback) = fetch_usage_via_messages(token) {
+                if let Ok(fallback) = messages_fallback() {
                     let mut merged = data;
                     if merged.session.resets_at.is_none() {
                         merged.session.resets_at = fallback.session.resets_at;
@@ -700,8 +770,12 @@ fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
         None => {}
     }
 
+    if passive() {
+        return Err(PollError::RequestFailed);
+    }
+
     // Fall back to Messages API with rate limit headers
-    let result = fetch_usage_via_messages(token);
+    let result = messages_fallback();
     if result.is_err() {
         diagnose::log("usage endpoint and Messages API fallback both failed");
     }
@@ -725,6 +799,9 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
             return Err(PollError::AuthRequired);
         }
         Err(error @ ureq::Error::Status(429, _)) => return Err(classify_ureq_error(&error)),
+        Err(error) if crate::privacy::passive_monitoring() => {
+            return Err(classify_ureq_error(&error))
+        }
         Err(_) => return Ok(None),
     };
 
@@ -732,21 +809,23 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         Ok(response) => response,
         Err(_) => return Ok(None),
     };
-    let mut data = UsageData::default();
+    Ok(Some(claude_usage_from_response(response)))
+}
 
-    if let Some(bucket) = &response.five_hour {
-        data.session.percentage = bucket.utilization;
-        data.session.resets_at = parse_iso8601(bucket.resets_at.as_deref());
-        data.session.reported = true;
+fn claude_usage_from_response(response: UsageResponse) -> UsageData {
+    let section = |bucket: Option<UsageBucket>| {
+        bucket.map_or_else(UsageSection::default, |bucket| {
+            UsageSection::reported(
+                bucket.utilization,
+                parse_iso8601(bucket.resets_at.as_deref()),
+            )
+        })
+    };
+    UsageData {
+        session: section(response.five_hour),
+        weekly: section(response.seven_day),
+        ..Default::default()
     }
-
-    if let Some(bucket) = &response.seven_day {
-        data.weekly.percentage = bucket.utilization;
-        data.weekly.resets_at = parse_iso8601(bucket.resets_at.as_deref());
-        data.weekly.reported = true;
-    }
-
-    Ok(Some(data))
 }
 
 fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
@@ -754,6 +833,9 @@ fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
     let mut last_error = PollError::RequestFailed;
 
     for model in MODEL_FALLBACK_CHAIN {
+        if crate::privacy::passive_monitoring() {
+            return Err(PollError::RequestFailed);
+        }
         let body = serde_json::json!({
             "model": model,
             "max_tokens": 1,
@@ -807,51 +889,53 @@ fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
 }
 
 fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
-    let mut data = UsageData::default();
+    let utilization = |name| {
+        response
+            .header(name)
+            .and_then(|value| value.parse::<f64>().ok())
+            .map(|value| value * 100.0)
+            .filter(|value| value.is_finite())
+    };
+    let mut session = utilization("anthropic-ratelimit-unified-5h-utilization");
+    let mut weekly = utilization("anthropic-ratelimit-unified-7d-utilization");
+    let mut session_reset = get_header_i64(response, "anthropic-ratelimit-unified-5h-reset");
+    let mut weekly_reset = get_header_i64(response, "anthropic-ratelimit-unified-7d-reset");
 
-    data.session.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-5h-utilization") * 100.0;
-    data.session.resets_at = unix_to_system_time(get_header_i64(
-        response,
-        "anthropic-ratelimit-unified-5h-reset",
-    ));
-
-    data.weekly.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-7d-utilization") * 100.0;
-    data.weekly.resets_at = unix_to_system_time(get_header_i64(
-        response,
-        "anthropic-ratelimit-unified-7d-reset",
-    ));
-
-    let overall_reset = get_header_i64(response, "anthropic-ratelimit-unified-reset");
-
-    if data.session.percentage == 0.0 && data.weekly.percentage == 0.0 {
+    if session.unwrap_or_default() == 0.0 && weekly.unwrap_or_default() == 0.0 {
+        let overall_reset = get_header_i64(response, "anthropic-ratelimit-unified-reset");
         let status = response.header("anthropic-ratelimit-unified-status");
-        if status == Some("rejected") {
-            let claim = response.header("anthropic-ratelimit-unified-representative-claim");
-            match claim {
-                Some("five_hour") => data.session.percentage = 100.0,
-                Some("seven_day") => data.weekly.percentage = 100.0,
-                _ => {}
+        let claim = response.header("anthropic-ratelimit-unified-representative-claim");
+        match (status, claim) {
+            (Some("rejected"), Some("five_hour")) => {
+                session = Some(100.0);
+                session_reset = session_reset.or(overall_reset);
             }
-        }
-
-        if data.session.resets_at.is_none() && overall_reset.is_some() {
-            data.session.resets_at = unix_to_system_time(overall_reset);
+            (Some("rejected"), Some("seven_day")) => {
+                weekly = Some(100.0);
+                weekly_reset = weekly_reset.or(overall_reset);
+            }
+            _ => session_reset = session_reset.or(overall_reset),
         }
     }
 
-    data.session.reported = data.session.resets_at.is_some()
-        || response
-            .header("anthropic-ratelimit-unified-5h-utilization")
-            .is_some()
-        || data.session.percentage != 0.0;
-    data.weekly.reported = data.weekly.resets_at.is_some()
-        || response
-            .header("anthropic-ratelimit-unified-7d-utilization")
-            .is_some()
-        || data.weekly.percentage != 0.0;
-    data
+    // A reset can supplement another source's reading. A percentage must
+    // still come from an actual utilization or rejection claim.
+    let section = |used, reset| {
+        let resets_at = unix_to_system_time(reset);
+        match used {
+            Some(used) => UsageSection::reported(used, resets_at),
+            None => {
+                let mut section = UsageSection::default();
+                section.resets_at = resets_at;
+                section
+            }
+        }
+    };
+    UsageData {
+        session: section(session, session_reset),
+        weekly: section(weekly, weekly_reset),
+        ..Default::default()
+    }
 }
 
 fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData, PollError> {
@@ -941,11 +1025,10 @@ fn codex_window_kind(window: &CodexRateLimitWindow) -> Option<UsageWindowKind> {
 }
 
 fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
-    UsageSection {
-        percentage: window.used_percent,
-        resets_at: unix_to_system_time(Some(window.reset_at)),
-        reported: true,
-    }
+    UsageSection::reported(
+        window.used_percent,
+        unix_to_system_time(Some(window.reset_at)),
+    )
 }
 
 fn antigravity_cli_path() -> Option<PathBuf> {
@@ -962,7 +1045,7 @@ fn antigravity_cli_path() -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-fn fetch_antigravity_cli_usage(path: PathBuf) -> Option<UsageData> {
+fn fetch_antigravity_cli_usage(path: PathBuf, group: Option<&str>) -> Option<UsageData> {
     let mut command = Command::new(&path);
     command
         .current_dir(path.parent()?)
@@ -982,15 +1065,15 @@ fn fetch_antigravity_cli_usage(path: PathBuf) -> Option<UsageData> {
     if !output.status.success() {
         return None;
     }
-    parse_antigravity_cli_usage(&output.stdout)
+    parse_antigravity_cli_usage(&output.stdout, group)
 }
 
-fn parse_antigravity_cli_usage(stdout: &[u8]) -> Option<UsageData> {
+fn parse_antigravity_cli_usage(stdout: &[u8], group: Option<&str>) -> Option<UsageData> {
     let result: AntigravityCliUsage = serde_json::from_slice(stdout).ok()?;
     if result.status != "SUCCESS" || result.command.name != "usage" {
         return None;
     }
-    Some(antigravity_usage_from_summary(result.command.data).unwrap_or_default())
+    Some(select_antigravity_group(result.command.data, group))
 }
 
 fn antigravity_credential_watch_signature() -> String {
@@ -1008,30 +1091,33 @@ fn antigravity_credential_watch_signature() -> String {
     )
 }
 
-fn fetch_antigravity_usage(token: &str) -> Result<UsageData, PollError> {
-    let mut saw_summary = false;
+fn fetch_antigravity_usage(token: &str, group: Option<&str>) -> Result<UsageData, PollError> {
+    let mut missing = None::<UsageData>;
     let mut auth_error = false;
     let mut last_error = PollError::RequestFailed;
 
     for base_url in ANTIGRAVITY_ENDPOINTS {
         let summary = fetch_antigravity_project(base_url, token).and_then(|project| {
-            fetch_antigravity_quota_summary(base_url, token, project.as_deref())
+            fetch_antigravity_quota_summary(base_url, token, project.as_deref(), group)
         });
         match summary {
-            Ok(Some(data)) => return Ok(data),
-            Ok(None) => saw_summary = true,
+            Ok(data) if data.session.has_reading() || data.weekly.has_reading() => return Ok(data),
+            Ok(data) => {
+                let saved = missing.get_or_insert_with(UsageData::default);
+                saved.antigravity_groups.extend(data.antigravity_groups);
+                saved.antigravity_groups.sort_unstable();
+                saved.antigravity_groups.dedup();
+            }
             Err(PollError::AuthRequired) => auth_error = true,
             Err(error) => last_error = error,
         }
     }
 
-    if saw_summary {
-        Ok(UsageData::default())
-    } else if auth_error {
-        Err(PollError::AuthRequired)
+    missing.ok_or(if auth_error {
+        PollError::AuthRequired
     } else {
-        Err(last_error)
-    }
+        last_error
+    })
 }
 
 fn fetch_antigravity_project(base_url: &str, token: &str) -> Result<Option<String>, PollError> {
@@ -1072,7 +1158,8 @@ fn fetch_antigravity_quota_summary(
     base_url: &str,
     token: &str,
     project: Option<&str>,
-) -> Result<Option<UsageData>, PollError> {
+    group: Option<&str>,
+) -> Result<UsageData, PollError> {
     let agent = build_agent()?;
     let body = match project {
         Some(project) => serde_json::json!({ "project": project }),
@@ -1104,25 +1191,57 @@ fn fetch_antigravity_quota_summary(
         }
     };
 
-    Ok(antigravity_usage_from_summary(response))
+    Ok(select_antigravity_group(response, group))
 }
 
-fn antigravity_usage_from_summary(response: AntigravityQuotaSummaryResponse) -> Option<UsageData> {
-    // The separate Gemini 4 Argon group has its own weekly balance on some plans.
+pub const GEMINI_QUOTA_GROUP: &str = "Gemini Models";
+
+pub fn quota_group_name(name: &str) -> Option<String> {
+    let name: String = name
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(80)
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+fn select_antigravity_group(
+    response: AntigravityQuotaSummaryResponse,
+    selected: Option<&str>,
+) -> UsageData {
+    let mut data = UsageData::default();
+    for name in response
+        .groups
+        .iter()
+        .filter_map(|group| group.display_name.as_deref().and_then(quota_group_name))
+    {
+        if !data
+            .antigravity_groups
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&name))
+        {
+            data.antigravity_groups.push(name);
+        }
+    }
     let group = response.groups.into_iter().find(|group| {
-        group
+        let matches_label = group
             .display_name
             .as_deref()
-            .is_some_and(|name| name.trim().eq_ignore_ascii_case("Gemini Models"))
-            || group.buckets.iter().flatten().any(|bucket| {
-                matches!(
-                    bucket.bucket_id.as_deref(),
-                    Some("gemini-5h" | "gemini-weekly")
-                )
-            })
-    })?;
-
-    let mut data = UsageData::default();
+            .and_then(quota_group_name)
+            .is_some_and(|name| name.eq_ignore_ascii_case(selected.unwrap_or(GEMINI_QUOTA_GROUP)));
+        matches_label
+            || (selected.is_none()
+                && group.buckets.iter().flatten().any(|bucket| {
+                    matches!(
+                        bucket.bucket_id.as_deref(),
+                        Some("gemini-5h" | "gemini-weekly")
+                    )
+                }))
+    });
+    let Some(group) = group else {
+        return data;
+    };
     for bucket in group.buckets.into_iter().flatten() {
         let Some(remaining) = bucket
             .remaining_fraction
@@ -1130,25 +1249,23 @@ fn antigravity_usage_from_summary(response: AntigravityQuotaSummaryResponse) -> 
         else {
             continue;
         };
-        let section = UsageSection {
-            percentage: (1.0 - remaining) * 100.0,
-            resets_at: parse_iso8601(bucket.reset_time.as_deref()),
-            reported: true,
-        };
+        let section = UsageSection::reported(
+            (1.0 - remaining) * 100.0,
+            parse_iso8601(bucket.reset_time.as_deref()),
+        );
         match bucket.window.as_deref() {
             Some(window) if window.eq_ignore_ascii_case("5h") => data.session = section,
             Some(window) if window.eq_ignore_ascii_case("weekly") => data.weekly = section,
             _ => {}
         }
     }
-    Some(data)
+    data
 }
 
-fn get_header_f64(response: &ureq::Response, name: &str) -> f64 {
-    response
-        .header(name)
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0)
+#[cfg(test)]
+fn antigravity_usage_from_summary(response: AntigravityQuotaSummaryResponse) -> Option<UsageData> {
+    let data = select_antigravity_group(response, None);
+    (data.session.has_reading() || data.weekly.has_reading()).then_some(data)
 }
 
 fn get_header_i64(response: &ureq::Response, name: &str) -> Option<i64> {
@@ -1160,7 +1277,7 @@ fn unix_to_system_time(unix_secs: Option<i64>) -> Option<SystemTime> {
     if secs < 0 {
         return None;
     }
-    Some(UNIX_EPOCH + Duration::from_secs(secs as u64))
+    UNIX_EPOCH.checked_add(Duration::from_secs(secs as u64))
 }
 
 struct Credentials {
@@ -1454,115 +1571,157 @@ fn is_token_expired(expires_at: Option<i64>) -> bool {
     now >= exp
 }
 
-/// Parse an ISO 8601 timestamp string into a SystemTime.
+/// Parse a reset timestamp and apply its UTC offset.
 fn parse_iso8601(s: Option<&str>) -> Option<SystemTime> {
-    let s = s?;
-    // Strip timezone offset to get "YYYY-MM-DDTHH:MM:SS" or with fractional seconds
-    // The API returns formats like "2026-03-05T08:00:00.321598+00:00"
-    let datetime_part = s.split('+').next().unwrap_or(s);
-    let datetime_part = datetime_part.split('Z').next().unwrap_or(datetime_part);
+    let s = s?.trim();
+    let (date, time) = s.split_once(['T', 't'])?;
 
-    // Try parsing with and without fractional seconds
-    let formats = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"];
-    for fmt in &formats {
-        if let Ok(secs) = parse_datetime_to_unix(datetime_part, fmt) {
-            return Some(UNIX_EPOCH + Duration::from_secs(secs));
+    // The offset starts at the first `Z`, `+` or `-` of the time part.
+    let (clock, offset_secs) = match time.find(['Z', 'z', '+', '-']) {
+        None => (time, 0),
+        Some(index) => {
+            let (clock, zone) = time.split_at(index);
+            (clock, parse_utc_offset(zone)?)
         }
+    };
+
+    let mut date_parts = date.split('-');
+    let year = parse_fixed_digits(date_parts.next()?, 4)?;
+    let month = parse_fixed_digits(date_parts.next()?, 2)?;
+    let day = parse_fixed_digits(date_parts.next()?, 2)?;
+    if date_parts.next().is_some()
+        || year < 1970
+        || !(1..=12).contains(&month)
+        || day < 1
+        || day > days_in_month(year, month)
+    {
+        return None;
     }
-    None
+
+    // Fractional seconds are accepted and dropped (whole-second precision).
+    let (clock, fraction) = clock.split_once('.').unwrap_or((clock, "0"));
+    if fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut clock_parts = clock.split(':');
+    let hour = parse_fixed_digits(clock_parts.next()?, 2)?;
+    let minute = parse_fixed_digits(clock_parts.next()?, 2)?;
+    let second = parse_fixed_digits(clock_parts.next()?, 2)?;
+    // 60 allows a leap second, read as the next second's start.
+    if clock_parts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    let days = days_since_unix_epoch(year, month, day);
+    let local = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    let utc = local.checked_sub(offset_secs)?;
+    u64::try_from(utc)
+        .ok()
+        .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
 }
 
-/// Minimal datetime parser — avoids pulling in chrono/time crates.
-fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
-    // Extract date and time parts from "YYYY-MM-DDTHH:MM:SS[.frac]"
-    let (date_str, time_str) = s.split_once('T').ok_or(())?;
-    let date_parts: Vec<&str> = date_str.split('-').collect();
-    if date_parts.len() != 3 {
-        return Err(());
+/// `Z`, `±HH:MM` or `±HHMM` as seconds east of UTC.
+fn parse_utc_offset(zone: &str) -> Option<i64> {
+    if zone.eq_ignore_ascii_case("z") {
+        return Some(0);
     }
-
-    let year: u64 = date_parts[0].parse().map_err(|_| ())?;
-    let month: u64 = date_parts[1].parse().map_err(|_| ())?;
-    let day: u64 = date_parts[2].parse().map_err(|_| ())?;
-
-    // Strip fractional seconds
-    let time_base = time_str.split('.').next().unwrap_or(time_str);
-    let time_parts: Vec<&str> = time_base.split(':').collect();
-    if time_parts.len() != 3 {
-        return Err(());
+    let sign = match zone.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let digits = &zone[1..];
+    let (hours, minutes) = match digits.split_once(':') {
+        Some(parts) => parts,
+        None if digits.len() == 4 => digits.split_at(2),
+        None => return None,
+    };
+    let hours = parse_fixed_digits(hours, 2)?;
+    let minutes = parse_fixed_digits(minutes, 2)?;
+    if hours > 23 || minutes > 59 {
+        return None;
     }
-
-    let hour: u64 = time_parts[0].parse().map_err(|_| ())?;
-    let min: u64 = time_parts[1].parse().map_err(|_| ())?;
-    let sec: u64 = time_parts[2].parse().map_err(|_| ())?;
-
-    // Days from year (using a simplified calculation for dates after 1970)
-    let mut days: u64 = 0;
-    for y in 1970..year {
-        days += if is_leap(y) { 366 } else { 365 };
-    }
-
-    let month_days = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    for m in 1..month {
-        days += month_days[m as usize];
-        if m == 2 && is_leap(year) {
-            days += 1;
-        }
-    }
-    days += day - 1;
-
-    Ok(days * 86400 + hour * 3600 + min * 60 + sec)
+    Some(sign * (hours * 3_600 + minutes * 60))
 }
 
-fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+/// A field of exactly `len` ASCII digits.
+fn parse_fixed_digits(text: &str, len: usize) -> Option<i64> {
+    (text.len() == len && text.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| text.parse().ok())
+        .flatten()
 }
 
-/// Codex leaves absent windows as default sections. Its reported windows
-/// include a reset timestamp, including windows with zero usage.
-pub fn format_codex_line(
-    section: &UsageSection,
-    strings: Strings,
-    show_remaining_in_chinese: bool,
-    window: UsageWindowKind,
-) -> String {
-    if section.percentage == 0.0 && section.resets_at.is_none() {
-        return "--".to_string();
+fn is_leap(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if is_leap(year) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
     }
-    format_line(section, strings, show_remaining_in_chinese, window)
 }
 
+/// Days from 1970-01-01 to a valid date in 1970..=9999.
+fn days_since_unix_epoch(year: i64, month: i64, day: i64) -> i64 {
+    let years = (1970..year)
+        .map(|y| if is_leap(y) { 366 } else { 365 })
+        .sum::<i64>();
+    let months = (1..month).map(|m| days_in_month(year, m)).sum::<i64>();
+    years + months + day - 1
+}
+
+#[cfg(test)]
 pub fn format_antigravity_line(
     section: &UsageSection,
     strings: Strings,
-    show_local_reset: bool,
+    local_reset: bool,
     window: UsageWindowKind,
 ) -> String {
-    if !section.reported {
-        return "--".to_string();
-    }
-    if show_local_reset {
-        return format_simplified_chinese_line(section, window);
-    }
-    format_percent_with_countdown(
-        remaining_percentage(section.percentage),
-        section.resets_at,
+    format_quota_line(
+        section,
         strings,
+        local_reset,
+        QuotaDisplayMode::Remaining,
+        window,
     )
 }
 
-/// Format a usage section for the compact taskbar display.
+#[cfg(test)]
 pub fn format_line(
     section: &UsageSection,
     strings: Strings,
-    show_remaining_in_chinese: bool,
+    local_reset: bool,
     window: UsageWindowKind,
 ) -> String {
-    if show_remaining_in_chinese {
-        return format_simplified_chinese_line(section, window);
-    }
+    let mode = if local_reset {
+        QuotaDisplayMode::Remaining
+    } else {
+        QuotaDisplayMode::Used
+    };
+    format_quota_line(section, strings, local_reset, mode, window)
+}
 
-    format_percent_with_countdown(section.percentage, section.resets_at, strings)
+pub fn format_quota_line(
+    section: &UsageSection,
+    strings: Strings,
+    local_reset: bool,
+    mode: QuotaDisplayMode,
+    window: UsageWindowKind,
+) -> String {
+    if !section.has_reading() {
+        return "--".to_string();
+    }
+    let percentage = mode.percentage(section.percentage);
+    if local_reset {
+        let reset = section
+            .resets_at
+            .and_then(native_interop::system_time_to_local);
+        return format_simplified_chinese_values(percentage, reset, window);
+    }
+    format_percent_with_countdown(percentage, section.resets_at, strings)
 }
 
 fn format_percent_with_countdown(
@@ -1570,7 +1729,7 @@ fn format_percent_with_countdown(
     resets_at: Option<SystemTime>,
     strings: Strings,
 ) -> String {
-    let pct = format!("{percentage:.0}%");
+    let pct = format_percent(percentage);
     let cd = format_countdown(resets_at, strings);
     if cd.is_empty() {
         pct
@@ -1579,32 +1738,37 @@ fn format_percent_with_countdown(
     }
 }
 
-fn format_simplified_chinese_line(section: &UsageSection, window: UsageWindowKind) -> String {
-    let remaining = remaining_percentage(section.percentage);
-    let reset = section
-        .resets_at
-        .and_then(native_interop::system_time_to_local);
-    format_simplified_chinese_values(remaining, reset, window)
-}
-
 fn format_simplified_chinese_values(
     remaining: f64,
     reset: Option<windows::Win32::Foundation::SYSTEMTIME>,
     window: UsageWindowKind,
 ) -> String {
+    let remaining = format_percent(remaining);
     let Some(reset) = reset else {
-        return format!("{remaining:.0}%");
+        return remaining;
     };
     match window {
         UsageWindowKind::Session => {
-            format!(
-                "{remaining:.0}%  {:02}:{:02}重置",
-                reset.wHour, reset.wMinute
-            )
+            format!("{remaining}  {:02}:{:02}重置", reset.wHour, reset.wMinute)
         }
         UsageWindowKind::Weekly => {
-            format!("{remaining:.0}%  {:02}/{:02}重置", reset.wMonth, reset.wDay)
+            format!("{remaining}  {:02}/{:02}重置", reset.wMonth, reset.wDay)
         }
+    }
+}
+
+pub fn format_percent(value: f64) -> String {
+    let value = if value.is_finite() {
+        value.clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    if value > 0.0 && value < 1.0 {
+        "<1%".to_string()
+    } else if value > 99.0 && value < 100.0 {
+        "99%".to_string()
+    } else {
+        format!("{:.0}%", value.round_ties_even())
     }
 }
 
@@ -1741,7 +1905,7 @@ mod tests {
             crate::localization::LanguageId::English,
         ] {
             assert_eq!(
-                format_codex_line(
+                format_line(
                     &usage.session,
                     language.strings(),
                     language == crate::localization::LanguageId::SimplifiedChinese,
@@ -1794,11 +1958,11 @@ mod tests {
         let usage = codex_usage_from_response(response).unwrap();
         let strings = crate::localization::LanguageId::SimplifiedChinese.strings();
         assert!(
-            format_codex_line(&usage.session, strings, true, UsageWindowKind::Session)
+            format_line(&usage.session, strings, true, UsageWindowKind::Session)
                 .starts_with("100%")
         );
         assert_eq!(
-            format_codex_line(&usage.weekly, strings, true, UsageWindowKind::Weekly),
+            format_line(&usage.weekly, strings, true, UsageWindowKind::Weekly),
             "--"
         );
     }
@@ -1832,15 +1996,116 @@ mod tests {
     }
 
     #[test]
+    fn reset_timestamps_apply_offsets_and_validate_the_calendar() {
+        let utc = parse_iso8601(Some("2026-11-21T12:00:00Z")).unwrap();
+        for value in [
+            "2026-11-21T17:30:00+05:30",
+            "2026-11-21T06:00:00.123-0600",
+            "2026-11-21T12:00:00",
+        ] {
+            assert_eq!(parse_iso8601(Some(value)), Some(utc), "{value}");
+        }
+        assert_eq!(
+            parse_iso8601(Some("2026-11-21T23:30:00-12:30")),
+            parse_iso8601(Some("2026-11-22T12:00:00Z")),
+        );
+        for value in [
+            "2026-13-01T12:00:00Z",
+            "2026-00-01T12:00:00Z",
+            "2026-11-00T12:00:00Z",
+            "2026-02-29T12:00:00Z",
+            "2026-04-31T12:00:00Z",
+            "2026-11-21T24:00:00Z",
+            "2026-11-21T12:00:00+00:99",
+            "2026-11-21T12:00:00.Z",
+        ] {
+            assert_eq!(parse_iso8601(Some(value)), None, "{value}");
+        }
+        assert!(parse_iso8601(Some("2024-02-29T12:00:00Z")).is_some());
+        assert!(unix_to_system_time(Some(i64::MAX)).is_none());
+    }
+
+    #[test]
+    fn quota_percentages_keep_exact_endpoints_distinct() {
+        for (value, expected) in [
+            (0.0, "0%"),
+            (0.4, "<1%"),
+            (0.99, "<1%"),
+            (1.0, "1%"),
+            (49.5, "50%"),
+            (50.5, "50%"),
+            (99.6, "99%"),
+            (100.0, "100%"),
+        ] {
+            assert_eq!(format_percent(value), expected);
+        }
+    }
+
+    #[test]
+    fn a_reported_zero_and_an_absent_claude_window_have_distinct_labels() {
+        let response = serde_json::from_str(r#"{"five_hour":{"utilization":0}}"#).unwrap();
+        let usage = claude_usage_from_response(response);
+        let strings = crate::localization::LanguageId::English.strings();
+        assert_eq!(
+            format_line(&usage.session, strings, false, UsageWindowKind::Session),
+            "0%"
+        );
+        assert_eq!(
+            format_line(&usage.weekly, strings, false, UsageWindowKind::Weekly),
+            "--"
+        );
+        let strings = crate::localization::LanguageId::SimplifiedChinese.strings();
+        assert_eq!(
+            format_line(&usage.session, strings, true, UsageWindowKind::Session),
+            "100%"
+        );
+        assert_eq!(
+            format_line(&usage.weekly, strings, true, UsageWindowKind::Weekly),
+            "--"
+        );
+    }
+
+    #[test]
+    fn claude_header_fallback_requires_a_reading_or_explicit_rejection() {
+        let response: ureq::Response = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "anthropic-ratelimit-unified-5h-utilization: 0\r\n",
+            "anthropic-ratelimit-unified-7d-utilization: unknown\r\n",
+            "anthropic-ratelimit-unified-7d-reset: 2000000000\r\n",
+            "\r\n",
+        )
+        .parse()
+        .unwrap();
+        let data = parse_rate_limit_headers(&response);
+        assert!(data.session.has_reading());
+        assert!(!data.weekly.has_reading());
+        assert!(data.weekly.resets_at.is_some());
+
+        let response: ureq::Response = concat!(
+            "HTTP/1.1 429 Too Many Requests\r\n",
+            "anthropic-ratelimit-unified-status: rejected\r\n",
+            "anthropic-ratelimit-unified-representative-claim: seven_day\r\n",
+            "anthropic-ratelimit-unified-reset: 2000000000\r\n",
+            "\r\n",
+        )
+        .parse()
+        .unwrap();
+        let data = parse_rate_limit_headers(&response);
+        assert!(!data.session.has_reading());
+        assert!(data.weekly.has_reading());
+        assert_eq!(data.weekly.percentage, 100.0);
+        assert_eq!(
+            data.weekly.resets_at,
+            unix_to_system_time(Some(2_000_000_000))
+        );
+    }
+
+    #[test]
     fn simplified_chinese_line_labels_remaining_usage() {
         let strings = crate::localization::LanguageId::SimplifiedChinese.strings();
         assert_eq!(strings.session_window, "5h");
         assert_eq!(strings.weekly_window, "7d");
-        let section = UsageSection {
-            percentage: 30.0,
-            resets_at: None,
-            reported: true,
-        };
+        let section = UsageSection::reported(30.0, None);
         assert_eq!(
             format_line(&section, strings, true, UsageWindowKind::Session),
             "70%"
@@ -1942,6 +2207,7 @@ mod tests {
                 ]}
             ]}}
         }"#,
+            None,
         )
         .expect("valid usage result");
 
@@ -2000,5 +2266,124 @@ mod tests {
             format_antigravity_line(&usage.weekly, strings, true, UsageWindowKind::Weekly),
             "100%"
         );
+    }
+    #[test]
+    fn passive_codex_auth_failures_do_not_launch_refresh_or_retry() {
+        for status in [401, 403] {
+            let mut credential_reads = 0;
+            let mut quota_requests = 0;
+            let result = poll_codex_with(
+                || {
+                    credential_reads += 1;
+                    Some(CodexTokenData {
+                        access_token: "fixture-token".into(),
+                        account_id: Some("fixture-account".into()),
+                    })
+                },
+                |token, account| {
+                    quota_requests += 1;
+                    assert_eq!(token, "fixture-token");
+                    assert_eq!(account, Some("fixture-account"));
+                    let response: ureq::Response =
+                        format!("HTTP/1.1 {status} Unauthorized\r\n\r\n")
+                            .parse()
+                            .unwrap();
+                    Err(classify_ureq_error(&ureq::Error::Status(status, response)))
+                },
+                || true,
+                || panic!("a passive poll must not launch the Codex CLI"),
+            );
+            assert_eq!(result.unwrap_err(), PollError::AuthRequired);
+            assert_eq!(credential_reads, 1);
+            assert_eq!(quota_requests, 1);
+        }
+    }
+
+    #[test]
+    fn passive_claude_preserves_quota_without_generating_reset_timestamps() {
+        let reset = UNIX_EPOCH + Duration::from_secs(1_900_000_000);
+        let usage = fetch_claude_usage_with(
+            || true,
+            || {
+                Ok(Some(UsageData {
+                    session: UsageSection::reported(12.0, None),
+                    weekly: UsageSection::reported(34.0, Some(reset)),
+                    ..Default::default()
+                }))
+            },
+            || panic!("missing reset timestamps must not trigger model requests"),
+        )
+        .unwrap();
+        assert_eq!(usage.session.percentage, 12.0);
+        assert_eq!(usage.session.resets_at, None);
+        assert_eq!(usage.weekly.percentage, 34.0);
+        assert_eq!(usage.weekly.resets_at, Some(reset));
+    }
+
+    #[test]
+    fn passive_claude_unavailable_or_unauthorized_usage_never_calls_messages_api() {
+        for (response, expected) in [
+            (Ok(None), PollError::RequestFailed),
+            (Err(classify_http_status(401)), PollError::AuthRequired),
+            (Err(classify_http_status(403)), PollError::AuthRequired),
+        ] {
+            let result = fetch_claude_usage_with(
+                || true,
+                || response,
+                || panic!("a failed passive quota request must not generate a message"),
+            );
+            assert_eq!(result.unwrap_err(), expected);
+        }
+    }
+    #[test]
+    fn saved_display_direction_is_independent_of_language() {
+        use crate::localization::LanguageId;
+        let section = UsageSection::reported(85.0, None);
+        for language in [
+            LanguageId::English,
+            LanguageId::Italian,
+            LanguageId::SimplifiedChinese,
+        ] {
+            let local = language == LanguageId::SimplifiedChinese;
+            assert_eq!(
+                format_quota_line(
+                    &section,
+                    language.strings(),
+                    local,
+                    QuotaDisplayMode::Remaining,
+                    UsageWindowKind::Session
+                ),
+                "15%"
+            );
+            assert_eq!(
+                format_quota_line(
+                    &section,
+                    language.strings(),
+                    local,
+                    QuotaDisplayMode::Used,
+                    UsageWindowKind::Session
+                ),
+                "85%"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_antigravity_group_has_its_own_windows_and_never_substitutes_another_group() {
+        let json = r#"{"groups":[
+            {"name":"Gemini Models","buckets":[{"window":"5h","remaining_fraction":0.5}]},
+            {"name":"Gemini 4 Argon","buckets":[{"window":"weekly","remaining_fraction":0.84}]}
+        ]}"#;
+        let summary = || serde_json::from_str(json).unwrap();
+        let argon = select_antigravity_group(summary(), Some("Gemini 4 Argon"));
+        assert!(!argon.session.has_reading());
+        assert!((argon.weekly.percentage - 16.0).abs() < 0.0001);
+        let absent = select_antigravity_group(summary(), Some("Claude and GPT models"));
+        assert!(!absent.session.has_reading());
+        assert!(!absent.weekly.has_reading());
+        assert_eq!(absent.antigravity_groups.len(), 2);
+        assert!(select_antigravity_group(summary(), None)
+            .session
+            .has_reading());
     }
 }

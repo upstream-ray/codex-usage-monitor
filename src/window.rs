@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,9 +17,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::codex_colors::{CodexColors, ColorPreset, ColorRole};
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
-use crate::models::AppUsageData;
+use crate::mcp_server;
+use crate::models::{AppUsageData, QuotaDisplayMode};
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_FRESHNESS, TIMER_POLL, TIMER_TASKBAR_RETRY,
     TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
@@ -35,6 +37,10 @@ use crate::settings_store;
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
+use crate::user_presets::{UserPresets, MAX_USER_PRESETS};
+
+#[path = "settings_window.rs"]
+mod settings_window;
 
 /// Wrapper to make HWND sendable across threads (safe for PostMessage usage)
 #[derive(Clone, Copy)]
@@ -62,6 +68,8 @@ struct AppState {
     language_override: Option<LanguageId>,
     language: LanguageId,
     appearance: Appearance,
+    quota_display_mode: QuotaDisplayMode,
+    color_presets: UserPresets,
     install_channel: InstallChannel,
 
     session_percent: f64,
@@ -76,14 +84,20 @@ struct AppState {
     antigravity_session_text: String,
     antigravity_weekly_percent: f64,
     antigravity_weekly_text: String,
-    claude_code_available: bool,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    antigravity_quota_group: Option<String>,
+    antigravity_groups: Vec<String>,
     show_session_window: bool,
     show_weekly_window: bool,
     alert_threshold_percent: u8,
     notified_quota_windows: BTreeSet<String>,
+    notify_on_reset: bool,
+    reset_observations: crate::reset_alerts::ResetObservations,
+    mcp_enabled: bool,
+    mcp_port: Option<u16>,
+    mcp_unavailable: bool,
 
     data: Option<AppUsageData>,
 
@@ -129,6 +143,7 @@ const IDM_FREQ_15MIN: u16 = 12;
 const IDM_FREQ_1HOUR: u16 = 13;
 const IDM_ADAPTIVE_REFRESH: u16 = 14;
 const IDM_START_WITH_WINDOWS: u16 = 20;
+const IDM_SETTINGS: u16 = 21;
 const IDM_RESET_POSITION: u16 = 30;
 const IDM_ANCHOR_LEFT: u16 = 34;
 const IDM_VERSION_ACTION: u16 = 31;
@@ -144,6 +159,14 @@ const IDM_LANG_TRADITIONAL_CHINESE: u16 = 48;
 const IDM_LANG_RUSSIAN: u16 = 49;
 const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 50;
 const IDM_LANG_SIMPLIFIED_CHINESE: u16 = 51;
+const IDM_LANG_ITALIAN: u16 = 52;
+const IDM_QUOTA_USED: u16 = 53;
+const IDM_QUOTA_REMAINING: u16 = 54;
+const IDM_PASSIVE_MONITORING: u16 = 55;
+const IDM_UPDATES_ENABLED: u16 = 56;
+const IDM_MCP_SERVER: u16 = 35;
+const MAX_QUOTA_GROUPS: usize = 32;
+const IDM_ALERT_RESET: u16 = 84;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
@@ -164,11 +187,23 @@ const IDM_FONT_STANDARD: u16 = 97;
 const IDM_FONT_LARGE: u16 = 98;
 const IDM_APPEARANCE_RECOMMENDED: u16 = 99;
 const IDM_APPEARANCE_RESET: u16 = 100;
-const IDM_MONITOR_FIRST: u16 = 200;
-const MAX_MONITOR_MENU_ITEMS: usize = 100;
+const IDM_BAR_CLASSIC: u16 = 101;
+const IDM_CODEX_ICON_COLOR: u16 = 102;
+const IDM_CODEX_BAR_COLOR: u16 = 103;
+const IDM_CODEX_PERCENT_COLOR: u16 = 104;
+const IDM_CODEX_PRESET_FIRST: u16 = 110;
+const IDM_CODEX_PRESET_LAST: u16 = 115;
+const IDM_SAVE_COLOR_PRESET: u16 = 118;
+const IDM_USER_PRESET_FIRST: u16 = 400;
+const IDM_USER_PRESET_LAST: u16 = IDM_USER_PRESET_FIRST + MAX_USER_PRESETS as u16 - 1;
+const IDM_DELETE_PRESET_FIRST: u16 = 500;
+const IDM_DELETE_PRESET_LAST: u16 = IDM_DELETE_PRESET_FIRST + MAX_USER_PRESETS as u16 - 1;
+const IDM_COMPACT_LAYOUT: u16 = 120;
+const IDM_PROVIDER_LOGOS: u16 = 121;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
+const WM_APP_TASKBARS_CHANGED: u32 = WM_APP + 6;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 /// How often the watchdog thread polls for an explorer.exe restart (which
@@ -179,6 +214,7 @@ static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None)
 
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
+static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Scale a base pixel value (designed at 96 DPI) to the current DPI.
 fn sc(px: i32) -> i32 {
@@ -235,6 +271,10 @@ fn relaunch_self() {
         std::thread::sleep(Duration::from_secs(RELAUNCH_BACKOFF_SECS));
     }
 
+    if EXIT_REQUESTED.load(Ordering::Relaxed) {
+        return;
+    }
+
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => {
@@ -260,33 +300,58 @@ fn relaunch_self() {
     }
 }
 
-/// Detect explorer.exe restarts and recover from them.
-///
-/// Once explorer destroys the taskbar, our embedded child window is destroyed
-/// and the UI message loop is dead, so recovery cannot happen in-process. This
-/// dedicated thread (independent of the dead message loop) polls the taskbar
-/// handle and, when it changes, relaunches the widget as a fresh process.
+/// Recover after Explorer replaces the taskbar or destroys our embedded window.
 fn spawn_taskbar_watchdog() {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
-        let stored = {
+        if EXIT_REQUESTED.load(Ordering::Relaxed) {
+            return;
+        }
+        let attachment = {
             let state = lock_state();
-            state.as_ref().and_then(|s| s.taskbar_hwnd)
+            state.as_ref().and_then(|s| {
+                s.taskbar_hwnd
+                    .map(|taskbar| (taskbar, s.hwnd, s.monitor_device.clone()))
+            })
         };
-        // Only relevant once we have embedded into a taskbar at least once.
-        let Some(old) = stored else {
+        let Some((old, widget, preferred)) = attachment else {
             continue;
         };
         let taskbars = native_interop::find_taskbars();
-        if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
-            let new = taskbars[0].hwnd;
+        let widget_alive = unsafe { IsWindow(widget.to_hwnd()).as_bool() };
+        let taskbar_present = taskbars.iter().any(|taskbar| taskbar.hwnd == old);
+        if needs_taskbar_relaunch(widget_alive, taskbar_present, !taskbars.is_empty()) {
             diagnose::log(format!(
-                "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
-                old.0, new.0
+                "watchdog: widget_alive={widget_alive} taskbar old={:?} new={:?} -> relaunching",
+                old.0, taskbars[0].hwnd.0
             ));
             relaunch_self();
+        } else if let Some(preferred) = preferred {
+            if taskbars.iter().any(|taskbar| {
+                taskbar.hwnd != old
+                    && native_interop::taskbar_monitor_device(taskbar).as_deref()
+                        == Some(&preferred)
+            }) {
+                // An embedded child may not receive the display-change broadcast.
+                unsafe {
+                    let _ = PostMessageW(
+                        widget.to_hwnd(),
+                        WM_APP_TASKBARS_CHANGED,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
         }
     });
+}
+
+fn needs_taskbar_relaunch(
+    widget_alive: bool,
+    taskbar_present: bool,
+    taskbar_available: bool,
+) -> bool {
+    taskbar_available && (!widget_alive || !taskbar_present)
 }
 
 fn load_embedded_app_icons() -> (HICON, HICON) {
@@ -355,6 +420,7 @@ enum BarStyle {
     #[default]
     Continuous,
     Segmented,
+    ClassicSegmented,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,6 +446,9 @@ struct Appearance {
     bar_style: BarStyle,
     bar_thickness: BarThickness,
     font_size: FontSize,
+    codex_colors: CodexColors,
+    compact_layout: bool,
+    hide_provider_logos: bool,
 }
 
 impl Appearance {
@@ -389,6 +458,9 @@ impl Appearance {
             bar_style: BarStyle::Continuous,
             bar_thickness: BarThickness::Slim,
             font_size: FontSize::Large,
+            codex_colors: CodexColors::default(),
+            compact_layout: false,
+            hide_provider_logos: false,
         }
     }
     fn is_dark(self, system_is_dark: bool) -> bool {
@@ -440,6 +512,10 @@ struct SettingsFile {
     language: Option<String>,
     #[serde(default)]
     appearance: Appearance,
+    #[serde(default)]
+    color_presets: UserPresets,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_display_mode: Option<QuotaDisplayMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_update_check_unix: Option<u64>,
     #[serde(default = "default_widget_visible")]
@@ -450,6 +526,8 @@ struct SettingsFile {
     show_codex: bool,
     #[serde(default = "default_show_antigravity")]
     show_antigravity: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    antigravity_quota_group: Option<String>,
     #[serde(default = "default_show_usage_window")]
     show_session_window: bool,
     #[serde(default = "default_show_usage_window")]
@@ -458,6 +536,18 @@ struct SettingsFile {
     alert_threshold_percent: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     notified_quota_windows: Vec<String>,
+    #[serde(default = "crate::privacy::default_passive_monitoring")]
+    passive_monitoring: bool,
+    #[serde(default = "crate::privacy::default_updates_enabled")]
+    updates_enabled: bool,
+    #[serde(default)]
+    notify_on_reset: bool,
+    #[serde(default)]
+    reset_observations: crate::reset_alerts::ResetObservations,
+    #[serde(default)]
+    mcp_server_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mcp_port: Option<u16>,
 }
 
 impl Default for SettingsFile {
@@ -471,15 +561,24 @@ impl Default for SettingsFile {
             adaptive_refresh: true,
             language: None,
             appearance: Appearance::default(),
+            quota_display_mode: Some(QuotaDisplayMode::Remaining),
+            color_presets: UserPresets::default(),
             last_update_check_unix: None,
             widget_visible: true,
             show_claude_code: false,
             show_codex: true,
             show_antigravity: false,
+            antigravity_quota_group: None,
             show_session_window: true,
             show_weekly_window: true,
             alert_threshold_percent: 0,
             notified_quota_windows: Vec::new(),
+            passive_monitoring: true,
+            updates_enabled: true,
+            notify_on_reset: false,
+            reset_observations: Default::default(),
+            mcp_server_enabled: false,
+            mcp_port: None,
         }
     }
 }
@@ -512,15 +611,38 @@ fn default_show_usage_window() -> bool {
     true
 }
 
-fn load_settings(claude_code_available: bool) -> SettingsFile {
+fn load_settings() -> SettingsFile {
     let current_path = settings_path();
     let legacy_path = legacy_settings_path();
     let (settings, migrated) = load_settings_from_paths(&current_path, &legacy_path)
-        .unwrap_or_else(|| (SettingsFile::default(), false));
-    let settings = normalize_settings(settings);
-    let (settings, claude_auto_disabled) =
-        apply_claude_code_availability(settings, claude_code_available);
-    if migrated || claude_auto_disabled {
+        .unwrap_or_else(|| {
+            let privacy = crate::privacy::preferences();
+            (
+                SettingsFile {
+                    passive_monitoring: privacy.passive_monitoring,
+                    updates_enabled: privacy.updates_enabled,
+                    ..SettingsFile::default()
+                },
+                false,
+            )
+        });
+    let mut settings = normalize_settings(settings);
+    let legacy_display = settings.quota_display_mode.is_none();
+    if legacy_display {
+        let language = localization::resolve_language(
+            settings.language.as_deref().and_then(LanguageId::from_code),
+        );
+        settings.quota_display_mode = Some(if language == LanguageId::SimplifiedChinese {
+            QuotaDisplayMode::Remaining
+        } else {
+            QuotaDisplayMode::Used
+        });
+    }
+    crate::privacy::set_preferences(crate::privacy::Preferences {
+        passive_monitoring: settings.passive_monitoring,
+        updates_enabled: settings.updates_enabled,
+    });
+    if migrated || legacy_display {
         save_settings(&settings);
         if migrated {
             diagnose::log(format!(
@@ -529,25 +651,8 @@ fn load_settings(claude_code_available: bool) -> SettingsFile {
                 current_path.display()
             ));
         }
-        if claude_auto_disabled {
-            diagnose::log(
-                "disabled Claude Code monitoring because no CLI credentials are available",
-            );
-        }
     }
     settings
-}
-
-fn apply_claude_code_availability(
-    mut settings: SettingsFile,
-    claude_code_available: bool,
-) -> (SettingsFile, bool) {
-    let disabled = settings.show_claude_code && !claude_code_available;
-    if disabled {
-        settings.show_claude_code = false;
-        settings = normalize_settings(settings);
-    }
-    (settings, disabled)
 }
 
 fn load_settings_from_paths(
@@ -579,6 +684,11 @@ fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
     if !matches!(settings.alert_threshold_percent, 0 | 10 | 20 | 30) {
         settings.alert_threshold_percent = 0;
     }
+    settings.antigravity_quota_group = settings
+        .antigravity_quota_group
+        .as_deref()
+        .and_then(poller::quota_group_name)
+        .filter(|name| !name.eq_ignore_ascii_case(poller::GEMINI_QUOTA_GROUP));
     settings.notified_quota_windows.sort();
     settings.notified_quota_windows.dedup();
     settings
@@ -593,6 +703,7 @@ fn save_settings(settings: &SettingsFile) {
 fn save_state_settings() {
     let result = settings_store::save(&settings_path(), || {
         let state = lock_state();
+        let privacy = crate::privacy::preferences();
         state.as_ref().map(|s| SettingsFile {
             tray_offset: s.tray_offset,
             anchor_left: s.anchor_left,
@@ -604,17 +715,27 @@ fn save_state_settings() {
                 .language_override
                 .map(|language| language.code().to_string()),
             appearance: s.appearance,
+            quota_display_mode: Some(s.quota_display_mode),
+            color_presets: s.color_presets.clone(),
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
+            antigravity_quota_group: s.antigravity_quota_group.clone(),
             show_session_window: s.show_session_window,
             show_weekly_window: s.show_weekly_window,
             alert_threshold_percent: s.alert_threshold_percent,
             notified_quota_windows: s.notified_quota_windows.iter().cloned().collect(),
+            passive_monitoring: privacy.passive_monitoring,
+            updates_enabled: privacy.updates_enabled,
+            notify_on_reset: s.notify_on_reset,
+            reset_observations: s.reset_observations.clone(),
+            mcp_server_enabled: s.mcp_enabled,
+            mcp_port: s.mcp_port,
         })
     });
+    settings_window::note_save_result(result.is_ok());
     if let Err(error) = result {
         diagnose::log_error("unable to save settings", error);
     }
@@ -647,20 +768,6 @@ fn service_tooltip(
         parts.push(format!("7d {weekly_text}"));
     }
     format!("{service}: {}", parts.join(" | "))
-}
-
-fn claude_code_menu_label(
-    strings: Strings,
-    language: LanguageId,
-    claude_code_available: bool,
-) -> String {
-    if claude_code_available {
-        strings.claude_code_model.to_string()
-    } else if language == LanguageId::SimplifiedChinese {
-        "Claude Code（需登录 CLI）".to_string()
-    } else {
-        "Claude Code (CLI login required)".to_string()
-    }
 }
 
 struct QuotaAlert {
@@ -776,26 +883,32 @@ fn append_quota_alert(
     window_label: &str,
     section: &crate::models::UsageSection,
 ) {
+    if !section.has_reading() {
+        return;
+    }
     let prefix = format!("{provider_key}:{window_key}:");
-    let reset_key = section
+    let reset_epoch = section
         .resets_at
         .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map(|value| value.as_secs().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let key = format!("{prefix}{reset_key}");
-    notified.retain(|existing| !existing.starts_with(&prefix) || existing == &key);
-
-    let remaining = poller::remaining_percentage(section.percentage).round() as u8;
-    if remaining > threshold || !notified.insert(key) {
+        .map(|value| value.as_secs());
+    let remaining = poller::remaining_percentage(section.percentage);
+    if !crate::quota_alerts::should_notify(
+        notified,
+        &prefix,
+        reset_epoch,
+        remaining,
+        f64::from(threshold),
+    ) {
         return;
     }
 
+    let remaining = poller::format_percent(remaining);
     let reset = format_precise_reset_time(section.resets_at);
     let (title, message) = if language == LanguageId::SimplifiedChinese {
         (
             format!("{provider_label} 额度提醒"),
             format!(
-                "{window_label}额度仅剩 {remaining}%，重置时间：{}",
+                "{window_label}额度仅剩 {remaining}，重置时间：{}",
                 reset.unwrap_or_else(|| "未知".to_string())
             ),
         )
@@ -803,7 +916,7 @@ fn append_quota_alert(
         (
             format!("{provider_label} quota alert"),
             format!(
-                "{window_label} quota has {remaining}% remaining. Reset: {}",
+                "{window_label} quota has {remaining} remaining. Reset: {}",
                 reset.unwrap_or_else(|| "unknown".to_string())
             ),
         )
@@ -813,6 +926,14 @@ fn append_quota_alert(
         title,
         message,
     });
+}
+
+fn antigravity_label(state: &AppState) -> String {
+    let group = state
+        .antigravity_quota_group
+        .as_deref()
+        .unwrap_or(poller::GEMINI_QUOTA_GROUP);
+    format!("Antigravity ({group})")
 }
 
 fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
@@ -841,7 +962,7 @@ fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
             }
             if s.show_antigravity {
                 services.push(service_tooltip(
-                    strings.antigravity_model,
+                    &antigravity_label(s),
                     &s.antigravity_session_text,
                     &s.antigravity_weekly_text,
                     s.show_session_window,
@@ -898,23 +1019,18 @@ fn toggle_widget_visibility(hwnd: HWND) {
     }
 }
 
-fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
-    let taskbars = native_interop::find_taskbars();
-    if taskbars.is_empty() {
-        diagnose::log("taskbar not found; using fallback popup window");
+fn attach_to_taskbar(hwnd: HWND, taskbar: native_interop::TaskbarWindow, index: usize) -> bool {
+    if !native_interop::embed_in_taskbar(hwnd, taskbar.hwnd) {
+        diagnose::log(format!(
+            "unable to attach widget to taskbar index={index} hwnd={:?}",
+            taskbar.hwnd
+        ));
         return false;
     }
 
-    let index = requested_index.min(taskbars.len().saturating_sub(1));
-    let taskbar = taskbars[index];
     diagnose::log(format!(
-        "taskbar selected index={index} count={} hwnd={:?} rect=({}, {}, {}, {})",
-        taskbars.len(),
-        taskbar.hwnd,
-        taskbar.rect.left,
-        taskbar.rect.top,
-        taskbar.rect.right,
-        taskbar.rect.bottom
+        "taskbar selected index={index} hwnd={:?} rect=({}, {}, {}, {})",
+        taskbar.hwnd, taskbar.rect.left, taskbar.rect.top, taskbar.rect.right, taskbar.rect.bottom
     ));
 
     let old_hook = {
@@ -924,8 +1040,6 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
     if let Some(hook) = old_hook {
         native_interop::unhook_win_event(hook);
     }
-
-    native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
 
     let tray_notify = native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd");
     if tray_notify.is_some() {
@@ -976,20 +1090,24 @@ fn preferred_taskbar_index(
     }
 }
 
-fn refresh_taskbar_selection(hwnd: HWND) {
+fn refresh_taskbar_selection(hwnd: HWND) -> bool {
     let taskbars = native_interop::find_taskbars();
     if taskbars.is_empty() {
-        return;
+        return false;
     }
     let (preferred, legacy_index, current) = {
         let state = lock_state();
-        let Some(s) = state.as_ref() else { return };
+        let Some(s) = state.as_ref() else {
+            return false;
+        };
+        if s.dragging {
+            return false;
+        }
         (s.monitor_device.clone(), s.taskbar_index, s.taskbar_hwnd)
     };
     let index = preferred_taskbar_index(&taskbars, preferred.as_deref(), legacy_index);
-    if current != Some(taskbars[index].hwnd) {
-        attach_to_taskbar(hwnd, index);
-    }
+    let taskbar = taskbars[index];
+    current != Some(taskbar.hwnd) && attach_to_taskbar(hwnd, taskbar, index)
 }
 
 fn taskbar_at_point(pt: POINT) -> Option<(usize, native_interop::TaskbarWindow)> {
@@ -1052,6 +1170,12 @@ fn auto_update_check_due(last_update_check_unix: Option<u64>) -> bool {
 }
 
 fn schedule_auto_update_check(hwnd: HWND) {
+    if !crate::privacy::updates_enabled() {
+        unsafe {
+            let _ = KillTimer(hwnd, TIMER_UPDATE_CHECK);
+        }
+        return;
+    }
     let delay_ms = {
         let state = lock_state();
         let Some(s) = state.as_ref() else {
@@ -1081,95 +1205,160 @@ fn effective_poll_interval(state: &AppState) -> u32 {
         .delay_ms(Instant::now(), state.poll_interval_ms)
 }
 
-fn refresh_usage_texts(state: &mut AppState) {
+const RESET_ROLLOVER_GRACE: Duration = Duration::from_secs(300);
+
+/// A window's last reading relative to its reset time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowReset {
+    /// No reset has passed since the reading was taken. This includes a
+    /// reading taken after the reset that still reports it (the provider's
+    /// own answer, not an old observation).
+    Current,
+    /// The reset passed after the reading, less than the grace ago.
+    Rollover,
+    /// The reset passed after the reading, longer ago: the old value no
+    /// longer describes any current window.
+    Passed,
+}
+
+fn window_reset(
+    resets_at: Option<SystemTime>,
+    observed_at: Option<SystemTime>,
+    now: SystemTime,
+) -> WindowReset {
+    match (resets_at, observed_at) {
+        (Some(reset), Some(observed)) if observed < reset && reset <= now => {
+            if now.duration_since(reset).unwrap_or_default() < RESET_ROLLOVER_GRACE {
+                WindowReset::Rollover
+            } else {
+                WindowReset::Passed
+            }
+        }
+        _ => WindowReset::Current,
+    }
+}
+
+fn window_text(
+    section: &crate::models::UsageSection,
+    observed_at: Option<SystemTime>,
+    now: SystemTime,
+    format: impl FnOnce(&crate::models::UsageSection) -> String,
+) -> String {
+    match window_reset(section.resets_at, observed_at, now) {
+        WindowReset::Current => format(section),
+        WindowReset::Rollover => {
+            let mut previous = section.clone();
+            previous.resets_at = None;
+            let mut text = format(&previous);
+            quota_refresh::mark_stale(&mut text, true);
+            text
+        }
+        WindowReset::Passed => "--".to_string(),
+    }
+}
+
+/// Tooltip lines explaining `--` and rollover values of a provider's windows.
+fn window_notes(
+    usage: &crate::models::UsageData,
+    observed_at: Option<SystemTime>,
+    now: SystemTime,
+    chinese: bool,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    for (section, weekly) in [(&usage.session, false), (&usage.weekly, true)] {
+        if !section.has_reading() {
+            notes.push(quota_tooltip::message(chinese, weekly).to_string());
+            continue;
+        }
+        if window_reset(section.resets_at, observed_at, now) == WindowReset::Current {
+            continue;
+        }
+        let at = format_precise_reset_time(section.resets_at).unwrap_or_default();
+        notes.push(match (chinese, weekly) {
+            (true, false) => format!("5 小时限额已于 {at} 重置（晚于上次读数），正在等待新读数。"),
+            (true, true) => format!("每周限额已于 {at} 重置（晚于上次读数），正在等待新读数。"),
+            (false, false) => format!(
+                "The 5-hour window reset at {at}, after the last reading. Waiting for a new reading."
+            ),
+            (false, true) => format!(
+                "The weekly window reset at {at}, after the last reading. Waiting for a new reading."
+            ),
+        });
+    }
+    notes
+}
+
+fn refresh_usage_texts(state: &mut AppState) -> bool {
     let strings = state.language.strings();
-    let show_remaining = state.language == LanguageId::SimplifiedChinese;
+    let show_local_reset = state.language == LanguageId::SimplifiedChinese;
     let Some(data) = state.data.as_ref() else {
-        return;
+        return false;
     };
-
-    if let Some(claude_code) = data.claude_code.as_ref() {
-        state.session_text = poller::format_line(
-            &claude_code.session,
-            strings,
-            show_remaining,
-            poller::UsageWindowKind::Session,
-        );
-        state.weekly_text = poller::format_line(
-            &claude_code.weekly,
-            strings,
-            show_remaining,
-            poller::UsageWindowKind::Weekly,
-        );
-    } else if state.show_claude_code {
-        let label = state.monitor.services[0]
-            .error
-            .map(|e| poll_error_display_label(e, state.language))
-            .unwrap_or("...");
-        state.session_text = label.to_string();
-        state.weekly_text = label.to_string();
-    }
-
-    if let Some(codex) = data.codex.as_ref() {
-        state.codex_session_text = poller::format_codex_line(
-            &codex.session,
-            strings,
-            show_remaining,
-            poller::UsageWindowKind::Session,
-        );
-        state.codex_weekly_text = poller::format_codex_line(
-            &codex.weekly,
-            strings,
-            show_remaining,
-            poller::UsageWindowKind::Weekly,
-        );
-    } else if state.show_codex {
-        let label = state.monitor.services[1]
-            .error
-            .map(|e| poll_error_display_label(e, state.language))
-            .unwrap_or("...");
-        state.codex_session_text = label.to_string();
-        state.codex_weekly_text = label.to_string();
-    }
-
-    if let Some(antigravity) = data
-        .antigravity
-        .as_ref()
-        .filter(|_| state.monitor.services[2].error.is_none())
-    {
-        state.antigravity_session_text = poller::format_antigravity_line(
-            &antigravity.session,
-            strings,
-            show_remaining,
-            poller::UsageWindowKind::Session,
-        );
-        state.antigravity_weekly_text = poller::format_antigravity_line(
-            &antigravity.weekly,
-            strings,
-            show_remaining,
-            poller::UsageWindowKind::Weekly,
-        );
-    } else if state.show_antigravity {
-        state.antigravity_session_text = "--".to_string();
-        state.antigravity_weekly_text = "--".to_string();
-    }
-    for (id, session, weekly) in [
-        (0, &mut state.session_text, &mut state.weekly_text),
+    let mut changed = false;
+    let now = SystemTime::now();
+    for (id, visible, usage, session, weekly) in [
+        (
+            0,
+            state.show_claude_code,
+            data.claude_code.as_ref(),
+            &mut state.session_text,
+            &mut state.weekly_text,
+        ),
         (
             1,
+            state.show_codex,
+            data.codex.as_ref(),
             &mut state.codex_session_text,
             &mut state.codex_weekly_text,
         ),
         (
             2,
+            state.show_antigravity,
+            data.antigravity.as_ref(),
             &mut state.antigravity_session_text,
             &mut state.antigravity_weekly_text,
         ),
     ] {
-        let stale = state.monitor.services[id].stale(SystemTime::now());
-        quota_refresh::mark_stale(session, stale);
-        quota_refresh::mark_stale(weekly, stale);
+        if !visible {
+            continue;
+        }
+        let service = &state.monitor.services[id];
+        let antigravity = id == 2;
+        if let Some(usage) = usage.filter(|_| !antigravity || service.error.is_none()) {
+            let observed_at = service.history.last_success;
+            let stale = service.stale(now);
+            for (output, section, window) in [
+                (session, &usage.session, poller::UsageWindowKind::Session),
+                (weekly, &usage.weekly, poller::UsageWindowKind::Weekly),
+            ] {
+                let mut text = window_text(section, observed_at, now, |section| {
+                    poller::format_quota_line(
+                        section,
+                        strings,
+                        show_local_reset,
+                        state.quota_display_mode,
+                        window,
+                    )
+                });
+                quota_refresh::mark_stale(&mut text, stale);
+                changed |= *output != text;
+                *output = text;
+            }
+        } else {
+            let label = if antigravity {
+                "--"
+            } else {
+                service
+                    .error
+                    .map(|error| poll_error_display_label(error, state.language))
+                    .unwrap_or("...")
+            };
+            changed |= session != label || weekly != label;
+            *session = label.to_string();
+            *weekly = label.to_string();
+        }
     }
+    changed
 }
 
 fn set_window_title(hwnd: HWND, strings: Strings) {
@@ -1222,6 +1411,23 @@ fn show_update_prompt(hwnd: HWND, strings: Strings, release: &ReleaseDescriptor)
     }
 }
 
+fn language_command(language: LanguageId) -> u16 {
+    match language {
+        LanguageId::English => IDM_LANG_ENGLISH,
+        LanguageId::Dutch => IDM_LANG_DUTCH,
+        LanguageId::Spanish => IDM_LANG_SPANISH,
+        LanguageId::French => IDM_LANG_FRENCH,
+        LanguageId::German => IDM_LANG_GERMAN,
+        LanguageId::Italian => IDM_LANG_ITALIAN,
+        LanguageId::Japanese => IDM_LANG_JAPANESE,
+        LanguageId::Korean => IDM_LANG_KOREAN,
+        LanguageId::SimplifiedChinese => IDM_LANG_SIMPLIFIED_CHINESE,
+        LanguageId::TraditionalChinese => IDM_LANG_TRADITIONAL_CHINESE,
+        LanguageId::Russian => IDM_LANG_RUSSIAN,
+        LanguageId::PortugueseBrazil => IDM_LANG_PORTUGUESE_BRAZIL,
+    }
+}
+
 fn apply_language_to_state(state: &mut AppState, language_override: Option<LanguageId>) {
     state.language_override = language_override;
     state.language = localization::resolve_language(language_override);
@@ -1255,6 +1461,9 @@ fn version_action_label(
     status: &UpdateStatus,
 ) -> String {
     let current = env!("CARGO_PKG_VERSION");
+    if !crate::privacy::updates_enabled() {
+        return format!("v{current}");
+    }
     match status {
         UpdateStatus::Idle => format!("v{current} - {}", strings.check_for_updates),
         UpdateStatus::Checking => format!("v{current} - {}", strings.checking_for_updates),
@@ -1277,6 +1486,9 @@ fn version_action_label(
 }
 
 fn begin_update_check(hwnd: HWND, interactive: bool) {
+    if !crate::privacy::updates_enabled() {
+        return;
+    }
     let send_hwnd = SendHwnd::from_hwnd(hwnd);
     let (strings, install_channel) = {
         let mut state = lock_state();
@@ -1363,6 +1575,9 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
 }
 
 fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
+    if !crate::privacy::updates_enabled() {
+        return;
+    }
     let send_hwnd = SendHwnd::from_hwnd(hwnd);
     let strings = {
         let mut state = lock_state();
@@ -1410,6 +1625,9 @@ fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
 }
 
 fn begin_winget_update(hwnd: HWND) {
+    if !crate::privacy::updates_enabled() {
+        return;
+    }
     let strings = {
         let state = lock_state();
         state.as_ref().map(|s| s.language.strings())
@@ -1604,7 +1822,8 @@ fn set_startup_enabled(enable: bool) {
 
 // Dimensions matching the C# version
 const SEGMENT_W: i32 = 10;
-const SEGMENT_H: i32 = 13;
+const COMPACT_SEGMENT_W: i32 = 8;
+const SEGMENT_H: i32 = 9;
 const ROW_HEIGHT: i32 = 18;
 const SEGMENT_GAP: i32 = 1;
 const SEGMENT_COUNT: i32 = 10;
@@ -1617,13 +1836,142 @@ const BAR_RIGHT_MARGIN: i32 = 4;
 const TEXT_WIDTH: i32 = 110;
 const SIMPLIFIED_CHINESE_LABEL_WIDTH: i32 = 20;
 const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 138;
-const MODEL_RIGHT_MARGIN: i32 = 3;
-const RIGHT_MARGIN: i32 = 1;
+const MODEL_RIGHT_MARGIN: i32 = 9;
+const RIGHT_MARGIN: i32 = 4;
 const WIDGET_HEIGHT: i32 = 46;
+
+fn preferred_widget_height_for(
+    active_models: i32,
+    language: LanguageId,
+    show_session: bool,
+    show_weekly: bool,
+    appearance: Appearance,
+) -> i32 {
+    if uses_compact_layout(active_models, language, appearance) {
+        if show_session && show_weekly {
+            64
+        } else {
+            32
+        }
+    } else {
+        WIDGET_HEIGHT
+    }
+}
+
+fn preferred_widget_height_for_state(state: &AppState) -> i32 {
+    sc(preferred_widget_height_for(
+        active_model_count(
+            state.show_claude_code,
+            state.show_codex,
+            state.show_antigravity,
+        ),
+        state.language,
+        state.show_session_window,
+        state.show_weekly_window,
+        state.appearance,
+    ))
+}
+
+fn preferred_widget_height() -> i32 {
+    lock_state()
+        .as_ref()
+        .map(preferred_widget_height_for_state)
+        .unwrap_or(sc(WIDGET_HEIGHT))
+}
+
+fn uses_compact_layout(active_models: i32, language: LanguageId, appearance: Appearance) -> bool {
+    appearance.compact_layout && active_models == 1 && language == LanguageId::SimplifiedChinese
+}
+
+/// Measure the widest display values so quota changes do not move the widget.
+fn compact_widget_width(appearance: Appearance) -> i32 {
+    compact_measured_width(
+        appearance,
+        "100% 23:59重置 *",
+        "100% 12/31重置 *",
+        true,
+        true,
+    )
+}
+fn compact_measured_width(
+    appearance: Appearance,
+    session: &str,
+    weekly: &str,
+    show_session: bool,
+    show_weekly: bool,
+) -> i32 {
+    unsafe {
+        let dc = GetDC(HWND::default());
+        if dc.is_invalid() {
+            return sc(200);
+        }
+        let font = create_widget_font(appearance);
+        let reset_font = quota_text::create_reset_font(sc(appearance.font_px() - 1));
+        let old = SelectObject(dc, font);
+        let measure = |font: HFONT, value: &str| {
+            SelectObject(dc, font);
+            let wide: Vec<u16> = value.encode_utf16().collect();
+            let mut size = SIZE::default();
+            if !wide.is_empty() {
+                let _ = GetTextExtentPoint32W(dc, &wide, &mut size);
+            }
+            size.cx
+        };
+        let mut content_width = 0;
+        for (visible, label, value) in [(show_session, "5h", session), (show_weekly, "7d", weekly)]
+        {
+            if !visible {
+                continue;
+            }
+            let (percentage, reset) = quota_text::parts(value);
+            let mut row_width = measure(font, label) + sc(8) + measure(font, percentage);
+            if !reset.is_empty() {
+                row_width += sc(8) + measure(reset_font, &reset.replace("重置", " 重置"));
+            }
+            content_width = content_width.max(row_width);
+        }
+        SelectObject(dc, old);
+        let _ = DeleteObject(font);
+        let _ = DeleteObject(reset_font);
+        ReleaseDC(HWND::default(), dc);
+        sc(24) + content_width
+    }
+}
+
+/// Available height controls vertical spacing; both quota windows remain inside
+/// short taskbars instead of drawing a 64 px design into a clipped window.
+fn compact_row_geometry(height: i32, rows: i32) -> (i32, i32, i32, i32) {
+    compact_row_geometry_scaled(height, rows, sc)
+}
+
+fn compact_row_geometry_scaled(
+    height: i32,
+    rows: i32,
+    scale: impl Fn(i32) -> i32,
+) -> (i32, i32, i32, i32) {
+    let row_height = height / rows.max(1);
+    let text_height = scale(18).min((row_height - scale(8)).max(scale(12)));
+    let bar_height = scale(8).min((row_height - text_height - scale(2)).max(1));
+    let gap = scale(3).min((row_height - text_height - bar_height).max(0));
+    let inset = ((row_height - text_height - gap - bar_height) / 2).max(0);
+    (row_height, text_height, bar_height, inset)
+}
 
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
     let divider_h = sc(25);
-    let divider_top = (sc(WIDGET_HEIGHT) - divider_h) / 2;
+    let height = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .and_then(|s| unsafe {
+                let mut rect = RECT::default();
+                GetClientRect(s.hwnd.to_hwnd(), &mut rect)
+                    .ok()
+                    .map(|_| rect.bottom)
+            })
+            .unwrap_or(sc(WIDGET_HEIGHT))
+    };
+    let divider_top = (height - divider_h) / 2;
     client_x >= 0
         && client_x < sc(LEFT_DIVIDER_W)
         && client_y >= divider_top
@@ -1740,29 +2088,26 @@ fn usage_layout_widths(language: LanguageId, appearance: Appearance) -> (i32, i3
             let _ = DeleteObject(reset_font);
             fallback
         } else {
-            (
-                measure(label_font, &mut labels.into_iter()) + sc(2),
-                (reset_x + measure(reset_font, &mut resets.iter().map(String::as_str)) + sc(3))
-                    .max(fallback.1),
-            )
+            let label_width = measure(label_font, &mut labels.into_iter());
+            let reset_width = measure(reset_font, &mut resets.iter().map(String::as_str));
+            if label_width > 0 && reset_width > 0 {
+                (label_width + sc(2), reset_x + reset_width + sc(3))
+            } else {
+                fallback
+            }
         };
         ReleaseDC(HWND::default(), hdc);
         widths
     }
 }
 
-fn usage_percent_for_display(language: LanguageId, used_percentage: f64) -> f64 {
-    if language == LanguageId::SimplifiedChinese {
-        poller::remaining_percentage(used_percentage)
-    } else {
-        used_percentage.clamp(0.0, 100.0)
-    }
-}
-
 fn total_widget_width_for(active_models: i32, language: LanguageId, appearance: Appearance) -> i32 {
+    if uses_compact_layout(active_models, language, appearance) {
+        return compact_widget_width(appearance);
+    }
     let bar_segments = row_bar_segment_count(active_models);
     let (label_width, text_width) = usage_layout_widths(language, appearance);
-    let model_width = model_usage_width(bar_segments, text_width);
+    let model_width = model_usage_width(bar_segments, text_width, appearance);
 
     sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
@@ -1786,20 +2131,10 @@ fn total_widget_width_for_state(state: &AppState) -> i32 {
 }
 
 fn total_widget_width() -> i32 {
-    let (active_models, language, appearance) = {
-        let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| {
-                (
-                    active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
-                    s.language,
-                    s.appearance,
-                )
-            })
-            .unwrap_or((1, LanguageId::English, Appearance::default()))
-    };
-    total_widget_width_for(active_models, language, appearance)
+    lock_state()
+        .as_ref()
+        .map(total_widget_width_for_state)
+        .unwrap_or_else(|| total_widget_width_for(1, LanguageId::English, Appearance::default()))
 }
 
 fn claude_accent_color() -> Color {
@@ -1915,7 +2250,7 @@ pub fn run() {
 
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wnd_proc),
             hInstance: HINSTANCE(hinstance.0),
             hIcon: large_icon,
@@ -1931,8 +2266,7 @@ pub fn run() {
             diagnose::log("RegisterClassExW returned 0");
         }
 
-        let claude_code_available = poller::claude_code_credentials_available();
-        let settings = load_settings(claude_code_available);
+        let settings = load_settings();
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
@@ -1952,7 +2286,13 @@ pub fn run() {
             0,
             0,
             total_widget_width_for(initial_model_count, language, settings.appearance),
-            sc(WIDGET_HEIGHT),
+            sc(preferred_widget_height_for(
+                initial_model_count,
+                language,
+                settings.show_session_window,
+                settings.show_weekly_window,
+                settings.appearance,
+            )),
             HWND::default(),
             HMENU::default(),
             hinstance,
@@ -1994,6 +2334,8 @@ pub fn run() {
                 language_override,
                 language,
                 appearance: settings.appearance,
+                quota_display_mode: settings.quota_display_mode.unwrap_or_default(),
+                color_presets: settings.color_presets.clone(),
                 install_channel,
                 session_percent: 0.0,
                 session_text: "--".to_string(),
@@ -2007,14 +2349,21 @@ pub fn run() {
                 antigravity_session_text: "--".to_string(),
                 antigravity_weekly_percent: 0.0,
                 antigravity_weekly_text: "--".to_string(),
-                claude_code_available,
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
+                antigravity_quota_group: settings.antigravity_quota_group,
+                antigravity_groups: Vec::new(),
+
                 show_session_window: settings.show_session_window,
                 show_weekly_window: settings.show_weekly_window,
                 alert_threshold_percent: settings.alert_threshold_percent,
                 notified_quota_windows: settings.notified_quota_windows.into_iter().collect(),
+                notify_on_reset: settings.notify_on_reset,
+                reset_observations: settings.reset_observations,
+                mcp_enabled: settings.mcp_server_enabled,
+                mcp_port: settings.mcp_port,
+                mcp_unavailable: false,
                 data: None,
                 poll_interval_ms: settings.poll_interval_ms,
                 adaptive_refresh: settings.adaptive_refresh,
@@ -2050,7 +2399,10 @@ pub fn run() {
             settings.monitor_device.as_deref(),
             settings.taskbar_index,
         );
-        if attach_to_taskbar(hwnd, selected_index) {
+        if taskbars
+            .get(selected_index)
+            .is_some_and(|taskbar| attach_to_taskbar(hwnd, *taskbar, selected_index))
+        {
             embedded = true;
         } else {
             // During login Explorer may create its taskbar after this app starts.
@@ -2105,6 +2457,7 @@ pub fn run() {
         // Initial poll
         let send_hwnd = SendHwnd::from_hwnd(hwnd);
         request_poll(send_hwnd, false);
+        apply_mcp_setting();
 
         schedule_auto_update_check(hwnd);
         let should_check_updates = {
@@ -2123,14 +2476,67 @@ pub fn run() {
 
         // Message loop
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        while GetMessageW(&mut msg, HWND::default(), 0, 0).0 > 0 {
+            if !settings_window::handle_dialog_message(&msg) {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
+        settings_window::close();
+        mcp_server::stop();
     }
 }
 
-/// Keep missing-window explanations aligned with the Codex quota cells.
+/// Explain missing and expired quota in the provider’s hover region.
+/// The optional MCP server's port: `mcp_port` in settings, else the default.
+fn mcp_port(setting: Option<u16>) -> u16 {
+    setting
+        .filter(|port| *port >= 1024)
+        .unwrap_or(mcp_server::DEFAULT_PORT)
+}
+
+/// Start or stop the MCP server to match the setting. Polling is unaffected:
+/// the server only copies the monitor's state when a tool is called.
+fn apply_mcp_setting() {
+    let Some((enabled, port)) = lock_state()
+        .as_ref()
+        .map(|s| (s.mcp_enabled, mcp_port(s.mcp_port)))
+    else {
+        return;
+    };
+    let unavailable = if enabled {
+        match mcp_server::start(port, mcp_snapshot) {
+            Ok(()) => false,
+            Err(error) => {
+                diagnose::log_error("MCP server could not start", error);
+                true
+            }
+        }
+    } else {
+        mcp_server::stop();
+        false
+    };
+    if let Some(s) = lock_state().as_mut() {
+        s.mcp_unavailable = unavailable;
+    }
+}
+
+fn mcp_settings_label(chinese: bool, unavailable: bool, port: u16) -> String {
+    match (chinese, unavailable) {
+        (false, false) => "Local MCP server for AI agents (read-only)".into(),
+        (false, true) => format!("Local MCP server (read-only): port {port} is unavailable"),
+        (true, false) => "供 AI 代理使用的本地 MCP 服务（只读）".into(),
+        (true, true) => format!("本地 MCP 服务（只读）：端口 {port} 不可用"),
+    }
+}
+
+fn mcp_snapshot() -> mcp_server::Snapshot {
+    let state = lock_state();
+    let s = state.as_ref()?;
+    // Tool order: Claude Code (service 0), then Codex (service 1).
+    Some([0, 1].map(|id| mcp_server::ProviderRecord::from_service(&s.monitor.services[id])))
+}
+
 fn update_quota_tooltips() {
     let (hwnd, regions) = {
         let state = lock_state();
@@ -2140,53 +2546,52 @@ fn update_quota_tooltips() {
             let chinese = s.language == LanguageId::SimplifiedChinese;
             let count = active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity);
             let (label_width, text_width) = usage_layout_widths(s.language, s.appearance);
-            let width = model_usage_width(row_bar_segment_count(count), text_width);
+            let compact = uses_compact_layout(count, s.language, s.appearance);
+            let width = if compact {
+                total_widget_width_for_state(s) - sc(12)
+            } else {
+                model_usage_width(row_bar_segment_count(count), text_width, s.appearance)
+            };
             let mut left = sc(LEFT_DIVIDER_W)
                 + sc(DIVIDER_RIGHT_MARGIN)
                 + label_width
                 + sc(LABEL_RIGHT_MARGIN);
-            for (id, visible, name, session, weekly) in [
-                (
-                    0,
-                    s.show_claude_code,
-                    "Claude Code",
-                    &s.session_text,
-                    &s.weekly_text,
-                ),
-                (
-                    1,
-                    s.show_codex,
-                    "Codex",
-                    &s.codex_session_text,
-                    &s.codex_weekly_text,
-                ),
+            if compact {
+                left = sc(12);
+            }
+            let antigravity_name = antigravity_label(s);
+            for (id, visible, name, session) in [
+                (0, s.show_claude_code, "Claude Code", &s.session_text),
+                (1, s.show_codex, "Codex", &s.codex_session_text),
                 (
                     2,
                     s.show_antigravity,
-                    "Antigravity",
+                    antigravity_name.as_str(),
                     &s.antigravity_session_text,
-                    &s.antigravity_weekly_text,
                 ),
             ] {
                 if !visible {
                     continue;
                 }
-                let description =
-                    s.monitor.services[id].description(SystemTime::now(), Instant::now(), chinese);
+                let service = &s.monitor.services[id];
+                let now = SystemTime::now();
+                let description = service.description(now, Instant::now(), chinese);
                 let mut text = format!("{name}\n{description}");
-                if s.monitor.services[id].error.is_some() && session == "!" {
+                if service.error.is_some() && session == "!" {
                     text.push_str(if chinese {
                         "\n本服务本次未返回额度。"
                     } else {
                         "\nThis provider did not return quota in the latest update."
                     });
                 }
-                if name == "Codex" && s.monitor.services[id].data.is_some() {
-                    for (missing, is_weekly) in [(session == "--", false), (weekly == "--", true)] {
-                        if missing {
-                            text.push('\n');
-                            text.push_str(quota_tooltip::message(chinese, is_weekly));
-                        }
+                if let Some(usage) = service
+                    .data
+                    .as_ref()
+                    .filter(|_| id != 2 || service.error.is_none())
+                {
+                    for note in window_notes(usage, service.history.last_success, now, chinese) {
+                        text.push('\n');
+                        text.push_str(&note);
                     }
                 }
                 regions.push((
@@ -2194,7 +2599,7 @@ fn update_quota_tooltips() {
                         left,
                         top: 0,
                         right: left + width,
-                        bottom: sc(WIDGET_HEIGHT),
+                        bottom: preferred_widget_height_for_state(s),
                     },
                     text,
                 ));
@@ -2209,6 +2614,20 @@ fn update_quota_tooltips() {
 /// Render opaque taskbar content with ClearType via UpdateLayeredWindow.
 fn render_layered() {
     refresh_dpi();
+    let needs_resize = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| unsafe {
+                let mut rect = RECT::default();
+                GetClientRect(s.hwnd.to_hwnd(), &mut rect).is_ok()
+                    && rect.right - rect.left != total_widget_width_for_state(s)
+            })
+            .unwrap_or(false)
+    };
+    if needs_resize {
+        position_at_taskbar();
+    }
     update_quota_tooltips();
     let (
         hwnd_val,
@@ -2244,17 +2663,19 @@ fn render_layered() {
                 s.language,
                 s.appearance,
                 s.language.strings(),
-                s.session_percent,
+                s.quota_display_mode.percentage(s.session_percent),
                 s.session_text.clone(),
-                s.weekly_percent,
+                s.quota_display_mode.percentage(s.weekly_percent),
                 s.weekly_text.clone(),
-                s.codex_session_percent,
+                s.quota_display_mode.percentage(s.codex_session_percent),
                 s.codex_session_text.clone(),
-                s.codex_weekly_percent,
+                s.quota_display_mode.percentage(s.codex_weekly_percent),
                 s.codex_weekly_text.clone(),
-                s.antigravity_session_percent,
+                s.quota_display_mode
+                    .percentage(s.antigravity_session_percent),
                 s.antigravity_session_text.clone(),
-                s.antigravity_weekly_percent,
+                s.quota_display_mode
+                    .percentage(s.antigravity_weekly_percent),
                 s.antigravity_weekly_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
@@ -2288,7 +2709,10 @@ fn render_layered() {
 
     let accent = claude_accent_color();
     let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
-    let codex_accent = provider_icons::codex_color(appearance.is_dark(is_dark));
+    let codex_accent = appearance
+        .codex_colors
+        .resolve(appearance.is_dark(is_dark))
+        .bar;
     let antigravity_accent = antigravity_accent_color();
 
     unsafe {
@@ -2388,7 +2812,7 @@ fn render_layered() {
             AlphaFormat: 1, // AC_SRC_ALPHA
         };
 
-        let _ = UpdateLayeredWindow(
+        let rendered = UpdateLayeredWindow(
             hwnd,
             screen_dc,
             None,
@@ -2399,6 +2823,9 @@ fn render_layered() {
             Some(&blend),
             ULW_ALPHA,
         );
+        if let Err(error) = rendered {
+            diagnose::log_error("UpdateLayeredWindow failed", error);
+        }
 
         // Cleanup
         SelectObject(mem_dc, old_bmp);
@@ -2443,12 +2870,6 @@ fn paint_content(
 ) {
     unsafe {
         let is_dark = appearance.is_dark(is_dark);
-        let session_pct = usage_percent_for_display(language, session_pct);
-        let weekly_pct = usage_percent_for_display(language, weekly_pct);
-        let codex_session_pct = usage_percent_for_display(language, codex_session_pct);
-        let codex_weekly_pct = usage_percent_for_display(language, codex_weekly_pct);
-        let antigravity_session_pct = poller::remaining_percentage(antigravity_session_pct);
-        let antigravity_weekly_pct = poller::remaining_percentage(antigravity_weekly_pct);
         let (label_width, text_width) = usage_layout_widths(language, appearance);
 
         let client_rect = RECT {
@@ -2499,11 +2920,55 @@ fn paint_content(
         FillRect(hdc, &right_rect, right_brush);
         let _ = DeleteObject(right_brush);
 
+        if uses_compact_layout(
+            active_model_count(show_claude_code, show_codex, show_antigravity),
+            language,
+            appearance,
+        ) {
+            let (session_percent, session_value, weekly_percent, weekly_value, color) =
+                if show_codex {
+                    (
+                        codex_session_pct,
+                        codex_session_text,
+                        codex_weekly_pct,
+                        codex_weekly_text,
+                        codex_accent,
+                    )
+                } else if show_claude_code {
+                    (session_pct, session_text, weekly_pct, weekly_text, accent)
+                } else {
+                    (
+                        antigravity_session_pct,
+                        antigravity_session_text,
+                        antigravity_weekly_pct,
+                        antigravity_weekly_text,
+                        antigravity_accent,
+                    )
+                };
+            paint_compact_quota_rows(
+                hdc,
+                width,
+                height,
+                appearance,
+                is_dark,
+                text_color,
+                color,
+                track,
+                session_percent,
+                session_value,
+                weekly_percent,
+                weekly_value,
+                show_session_window,
+                show_weekly_window,
+            );
+            return;
+        }
+
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
         let row_gap = if height < sc(WIDGET_HEIGHT) {
             sc(2)
         } else {
-            sc(8)
+            sc(5)
         };
         let row1_y = (height - 2 * appearance.row_height() - row_gap).max(0) / 2;
         let row2_y = row1_y + appearance.row_height() + row_gap;
@@ -2519,15 +2984,29 @@ fn paint_content(
         let icon_size = sc(provider_icons::SIZE);
         let icon_y = (height - icon_size) / 2;
         let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
-        let model_width = model_usage_width(row_bar_segment_count(active_models), text_width)
-            + sc(MODEL_RIGHT_MARGIN);
+        let model_width =
+            model_usage_width(row_bar_segment_count(active_models), text_width, appearance)
+                + sc(MODEL_RIGHT_MARGIN);
         let mut icon_x = content_x + label_width + sc(LABEL_RIGHT_MARGIN);
-        if show_claude_code {
-            provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Claude);
-            icon_x += model_width;
-        }
-        if show_codex {
-            provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Codex);
+        for (visible, provider) in [
+            (show_claude_code, Provider::Claude),
+            (show_codex, Provider::Codex),
+            (show_antigravity, Provider::Antigravity),
+        ] {
+            if visible && !appearance.hide_provider_logos {
+                if matches!(provider, Provider::Codex) {
+                    provider_icons::draw_codex(
+                        hdc,
+                        icon_x,
+                        icon_y,
+                        icon_size,
+                        appearance.codex_colors.icon_tint(is_dark),
+                    );
+                } else {
+                    provider_icons::draw(hdc, icon_x, icon_y, icon_size, provider);
+                }
+                icon_x += model_width;
+            }
         }
 
         if show_session_window {
@@ -2669,7 +3148,13 @@ fn do_poll(send_hwnd: SendHwnd) {
         let Some(s) = state.as_mut() else {
             return;
         };
-        s.monitor.plan(Instant::now())
+        let (jobs, delay) = s.monitor.wake(Instant::now(), s.poll_interval_ms);
+        // A Windows timer is periodic. Even an early wake with no jobs must
+        // replace that period with the actual remaining time to the deadline.
+        unsafe {
+            SetTimer(send_hwnd.to_hwnd(), TIMER_POLL, delay, None);
+        }
+        jobs
     };
     if !jobs.is_empty() {
         unsafe {
@@ -2684,14 +3169,79 @@ fn do_poll(send_hwnd: SendHwnd) {
     provider_poll::launch(
         jobs,
         |job| {
+            let group = {
+                let state = lock_state();
+                let Some(state) = state.as_ref() else {
+                    return provider_poll::Attempt::cancelled();
+                };
+                let enabled = [
+                    state.show_claude_code,
+                    state.show_codex,
+                    state.show_antigravity,
+                ];
+                if !enabled[job.id] || !state.monitor.job_is_current(job) {
+                    return provider_poll::Attempt::cancelled();
+                }
+                state.antigravity_quota_group.clone()
+            };
             provider_poll::execute(
                 job,
-                || poller::poll_provider(job.id),
+                || poller::poll_provider(job.id, group.as_deref()),
                 poller::credential_watch_snapshot,
             )
         },
         move |job, attempt| complete_provider_poll(send_hwnd, job, attempt),
     );
+}
+
+fn collect_reset_alerts(
+    state: &mut AppState,
+    provider: usize,
+    usage: &crate::models::UsageData,
+    now: SystemTime,
+    alerts: &mut Vec<QuotaAlert>,
+) -> bool {
+    if !state.notify_on_reset {
+        return false;
+    }
+    let strings = state.language.strings();
+    let (name, kind) = [
+        (strings.claude_code_model, tray_icon::TrayIconKind::Claude),
+        (strings.codex_model, tray_icon::TrayIconKind::Codex),
+        (
+            strings.antigravity_model,
+            tray_icon::TrayIconKind::Antigravity,
+        ),
+    ][provider];
+    let mut changed = false;
+    for (weekly, section, window) in [
+        (false, &usage.session, strings.session_window),
+        (true, &usage.weekly, strings.weekly_window),
+    ] {
+        let (saved, reset) = state
+            .reset_observations
+            .observe(provider, weekly, section, now);
+        changed |= saved;
+        if reset {
+            let (title, message) = if state.language == LanguageId::SimplifiedChinese {
+                (
+                    format!("{name} 额度已重置"),
+                    format!("{window} 窗口的额度已恢复。"),
+                )
+            } else {
+                (
+                    format!("{name} quota reset"),
+                    format!("The {window} quota is available again."),
+                )
+            };
+            alerts.push(QuotaAlert {
+                kind,
+                title,
+                message,
+            });
+        }
+    }
+    changed
 }
 
 fn complete_provider_poll(
@@ -2700,7 +3250,7 @@ fn complete_provider_poll(
     attempt: provider_poll::Attempt,
 ) {
     let hwnd = send_hwnd.to_hwnd();
-    let (alerts, auth_notice) = {
+    let (alerts, auth_notice, settings_changed) = {
         let mut state = lock_state();
         let Some(s) = state.as_mut() else {
             return;
@@ -2727,10 +3277,28 @@ fn complete_provider_poll(
             match job.id {
                 0 => fresh.claude_code = data,
                 1 => fresh.codex = data,
-                _ => fresh.antigravity = data,
+                _ => {
+                    if let Some(usage) = &data {
+                        if !usage.antigravity_groups.is_empty() {
+                            s.antigravity_groups = usage.antigravity_groups.clone();
+                        }
+                    }
+                    fresh.antigravity = data;
+                }
             }
         }
-        let alerts = collect_low_quota_alerts(s, &fresh);
+        let previous_keys = s.notified_quota_windows.clone();
+        let mut alerts = collect_low_quota_alerts(s, &fresh);
+        let mut settings_changed = previous_keys != s.notified_quota_windows;
+        let usage = match job.id {
+            0 => &fresh.claude_code,
+            1 => &fresh.codex,
+            _ => &fresh.antigravity,
+        };
+        if let Some(usage) = usage.as_ref() {
+            settings_changed |=
+                collect_reset_alerts(s, job.id, usage, SystemTime::now(), &mut alerts);
+        }
         let cached = s.monitor.cached();
         for (usage, session, weekly) in [
             (
@@ -2783,12 +3351,12 @@ fn complete_provider_poll(
                 ),
             }
         });
-        (alerts, notice)
+        (alerts, notice, settings_changed)
     };
     for alert in &alerts {
         tray_icon::notify_balloon(hwnd, alert.kind, &alert.title, &alert.message);
     }
-    if !alerts.is_empty() {
+    if settings_changed {
         save_state_settings();
     }
     if let Some((kind, title, body)) = auth_notice {
@@ -2868,14 +3436,8 @@ fn check_language_change() {
     }
 }
 
-fn update_display() {
-    let mut state = lock_state();
-    let s = match state.as_mut() {
-        Some(s) => s,
-        None => return,
-    };
-
-    refresh_usage_texts(s);
+fn update_display() -> bool {
+    lock_state().as_mut().is_some_and(refresh_usage_texts)
 }
 
 fn suppress_tray_reposition_for(duration: Duration) {
@@ -2905,7 +3467,7 @@ fn position_at_taskbar() {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
-    let (hwnd, embedded, tray_offset, anchor_left, taskbar_hwnd) = {
+    let (hwnd, embedded, tray_offset, anchor_left, taskbar_hwnd, compact) = {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
@@ -2931,6 +3493,11 @@ fn position_at_taskbar() {
             s.tray_offset,
             s.anchor_left,
             taskbar_hwnd,
+            uses_compact_layout(
+                active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
+                s.language,
+                s.appearance,
+            ),
         )
     };
 
@@ -2973,8 +3540,8 @@ fn position_at_taskbar() {
         save_state_settings();
     }
 
-    let widget_height = sc(WIDGET_HEIGHT).min(taskbar_height);
-    let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
+    let widget_height = preferred_widget_height().min(taskbar_height);
+    let y = compute_anchor_y(anchor_top, anchor_height, widget_height, compact);
     if embedded {
         // Child window: coordinates relative to parent (taskbar)
         let x = compute_anchor_x(
@@ -3019,9 +3586,14 @@ fn compute_anchor_x(
     }
 }
 
-fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32) -> i32 {
-    let anchor_bottom = anchor_top + anchor_height;
-    (anchor_bottom - widget_height).max(anchor_top)
+fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32, compact: bool) -> i32 {
+    let extra_height = (anchor_height - widget_height).max(0);
+    anchor_top
+        + if compact {
+            extra_height / 2
+        } else {
+            extra_height
+        }
 }
 
 /// WinEvent callback for tray icon location changes
@@ -3131,6 +3703,13 @@ unsafe extern "system" fn wnd_proc(
             recover_polling(hwnd, true);
             LRESULT(0)
         }
+        WM_APP_TASKBARS_CHANGED => {
+            if refresh_taskbar_selection(hwnd) {
+                position_at_taskbar();
+                render_layered();
+            }
+            LRESULT(0)
+        }
         WM_DISPLAYCHANGE | WM_DPICHANGED_MSG | WM_SETTINGCHANGE => {
             if msg == WM_DPICHANGED_MSG {
                 let new_dpi = (wparam.0 & 0xFFFF) as u32;
@@ -3155,32 +3734,30 @@ unsafe extern "system" fn wnd_proc(
                     request_poll(SendHwnd::from_hwnd(hwnd), false);
                 }
                 TIMER_COUNTDOWN => {
-                    update_display();
+                    let changed = update_display();
                     render_layered();
                     schedule_countdown_timer();
+                    if changed {
+                        sync_tray_icons(hwnd);
+                    }
                 }
                 TIMER_TASKBAR_RETRY => {
-                    let attachment = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| (s.embedded, s.taskbar_index))
-                    };
-                    match attachment {
-                        Some((true, _)) | None => {
-                            let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
-                        }
-                        Some((false, index)) => {
-                            if attach_to_taskbar(hwnd, index) {
-                                let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
-                                position_at_taskbar();
-                                render_layered();
-                                diagnose::log("taskbar attached after startup retry");
-                            }
-                        }
+                    let embedded = lock_state().as_ref().is_some_and(|s| s.embedded);
+                    if embedded {
+                        let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
+                    } else if refresh_taskbar_selection(hwnd) {
+                        let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
+                        position_at_taskbar();
+                        render_layered();
+                        diagnose::log("taskbar attached after startup retry");
                     }
                 }
                 TIMER_FRESHNESS => {
-                    update_display();
+                    let changed = update_display();
                     render_layered();
+                    if changed {
+                        sync_tray_icons(hwnd);
+                    }
                 }
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
@@ -3220,6 +3797,22 @@ unsafe extern "system" fn wnd_proc(
                 return LRESULT(1);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_LBUTTONDBLCLK => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let click_in_content = {
+                let state = lock_state();
+                state.as_ref().is_some_and(|s| {
+                    let (label_width, _) = usage_layout_widths(s.language, s.appearance);
+                    !s.dragging
+                        && x >= sc(LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN + LABEL_RIGHT_MARGIN)
+                            + label_width
+                })
+            };
+            if click_in_content {
+                request_poll(SendHwnd::from_hwnd(hwnd), true);
+            }
+            LRESULT(0)
         }
         WM_LBUTTONDOWN => {
             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
@@ -3295,8 +3888,19 @@ unsafe extern "system" fn wnd_proc(
                             let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
                             let anchor_top = taskbar_rect.top;
                             let anchor_height = taskbar_height;
-                            let widget_height = sc(WIDGET_HEIGHT).min(taskbar_height);
-                            let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
+                            let widget_height =
+                                preferred_widget_height_for_state(s).min(taskbar_height);
+                            let compact = uses_compact_layout(
+                                active_model_count(
+                                    s.show_claude_code,
+                                    s.show_codex,
+                                    s.show_antigravity,
+                                ),
+                                s.language,
+                                s.appearance,
+                            );
+                            let y =
+                                compute_anchor_y(anchor_top, anchor_height, widget_height, compact);
                             let x = if embedded {
                                 tray_left - taskbar_rect.left - widget_width - new_offset
                             } else {
@@ -3365,15 +3969,10 @@ unsafe extern "system" fn wnd_proc(
                             pt,
                             drag_start_client_x,
                         );
-                        {
+                        if attach_to_taskbar(hwnd, target_taskbar, target_index) {
                             let mut state = lock_state();
                             if let Some(s) = state.as_mut() {
                                 s.tray_offset = new_offset;
-                            }
-                        }
-                        if attach_to_taskbar(hwnd, target_index) {
-                            let mut state = lock_state();
-                            if let Some(s) = state.as_mut() {
                                 s.monitor_device =
                                     native_interop::taskbar_monitor_device(&target_taskbar);
                             }
@@ -3408,6 +4007,7 @@ unsafe extern "system" fn wnd_proc(
                     let sh = SendHwnd::from_hwnd(hwnd);
                     request_poll(sh, true);
                 }
+                IDM_SETTINGS => settings_window::show(hwnd),
                 IDM_VERSION_ACTION => {
                     let (install_channel, release) = {
                         let state = lock_state();
@@ -3441,6 +4041,7 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
                 2 => {
+                    EXIT_REQUESTED.store(true, Ordering::Relaxed);
                     let hook = {
                         let state = lock_state();
                         state.as_ref().and_then(|s| s.win_event_hook)
@@ -3471,28 +4072,32 @@ unsafe extern "system" fn wnd_proc(
                     save_state_settings();
                     position_at_taskbar();
                 }
-                id if (IDM_MONITOR_FIRST..IDM_MONITOR_FIRST + MAX_MONITOR_MENU_ITEMS as u16)
-                    .contains(&id) =>
-                {
-                    let index = (id - IDM_MONITOR_FIRST) as usize;
-                    if let Some(taskbar) = native_interop::find_taskbars().get(index).copied() {
-                        if attach_to_taskbar(hwnd, index) {
-                            {
-                                let mut state = lock_state();
-                                if let Some(s) = state.as_mut() {
-                                    s.monitor_device =
-                                        native_interop::taskbar_monitor_device(&taskbar);
-                                    s.tray_offset = 0;
-                                }
-                            }
-                            save_state_settings();
-                            position_at_taskbar();
-                            render_layered();
-                        }
+                IDM_PASSIVE_MONITORING | IDM_UPDATES_ENABLED => {
+                    let mut preferences = crate::privacy::preferences();
+                    let policy = crate::privacy::policy();
+                    if id == IDM_PASSIVE_MONITORING && !policy.force_passive_monitoring {
+                        preferences.passive_monitoring = !preferences.passive_monitoring;
+                    } else if id == IDM_UPDATES_ENABLED && !policy.disable_updates {
+                        preferences.updates_enabled = !preferences.updates_enabled;
+                    }
+                    crate::privacy::set_preferences(preferences);
+                    save_state_settings();
+                    schedule_auto_update_check(hwnd);
+                    if id == IDM_UPDATES_ENABLED && crate::privacy::updates_enabled() {
+                        begin_update_check(hwnd, false);
                     }
                 }
+                IDM_MCP_SERVER => {
+                    if let Some(s) = lock_state().as_mut() {
+                        s.mcp_enabled = !s.mcp_enabled;
+                    }
+                    save_state_settings();
+                    apply_mcp_setting();
+                }
                 IDM_START_WITH_WINDOWS => {
-                    set_startup_enabled(!is_startup_enabled());
+                    let enabled = !is_startup_enabled();
+                    set_startup_enabled(enabled);
+                    settings_window::note_save_result(is_startup_enabled() == enabled);
                 }
                 IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
                     let new_interval = match id {
@@ -3561,6 +4166,77 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     sync_tray_icons(hwnd);
                 }
+                IDM_SAVE_COLOR_PRESET => {
+                    save_current_color_preset(settings_window::dialog_owner(hwnd))
+                }
+                IDM_USER_PRESET_FIRST..=IDM_USER_PRESET_LAST => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            if let Some(colors) = s
+                                .color_presets
+                                .entries()
+                                .get((id - IDM_USER_PRESET_FIRST) as usize)
+                                .map(|entry| entry.colors)
+                            {
+                                s.appearance.codex_colors = colors;
+                            }
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                }
+                IDM_DELETE_PRESET_FIRST..=IDM_DELETE_PRESET_LAST => {
+                    delete_color_preset(
+                        settings_window::dialog_owner(hwnd),
+                        (id - IDM_DELETE_PRESET_FIRST) as usize,
+                    );
+                }
+                IDM_CODEX_ICON_COLOR | IDM_CODEX_BAR_COLOR | IDM_CODEX_PERCENT_COLOR => {
+                    let role = match id {
+                        IDM_CODEX_ICON_COLOR => ColorRole::Icon,
+                        IDM_CODEX_BAR_COLOR => ColorRole::Bar,
+                        _ => ColorRole::Percentage,
+                    };
+                    let initial = {
+                        let state = lock_state();
+                        state.as_ref().map(|s| {
+                            s.appearance
+                                .codex_colors
+                                .color(role, s.appearance.is_dark(s.is_dark))
+                        })
+                    };
+                    // The native dialog runs a nested message loop: never hold STATE here.
+                    if let Some(initial) = initial {
+                        if let Some(color) = crate::color_picker::choose(
+                            settings_window::dialog_owner(hwnd),
+                            initial,
+                        ) {
+                            {
+                                let mut state = lock_state();
+                                if let Some(s) = state.as_mut() {
+                                    s.appearance.codex_colors.set(role, color);
+                                }
+                            }
+                            save_state_settings();
+                            render_layered();
+                        }
+                    }
+                }
+                IDM_CODEX_PRESET_FIRST..=IDM_CODEX_PRESET_LAST => {
+                    if let Some(preset) =
+                        ColorPreset::ALL.get((id - IDM_CODEX_PRESET_FIRST) as usize)
+                    {
+                        {
+                            let mut state = lock_state();
+                            if let Some(s) = state.as_mut() {
+                                s.appearance.codex_colors = CodexColors::from_preset(*preset);
+                            }
+                        }
+                        save_state_settings();
+                        render_layered();
+                    }
+                }
                 IDM_APPEARANCE_RECOMMENDED
                 | IDM_APPEARANCE_RESET
                 | IDM_PALETTE_SYSTEM
@@ -3568,10 +4244,13 @@ unsafe extern "system" fn wnd_proc(
                 | IDM_PALETTE_LIGHT
                 | IDM_BAR_CONTINUOUS
                 | IDM_BAR_SEGMENTED
+                | IDM_BAR_CLASSIC
                 | IDM_BAR_STANDARD
                 | IDM_BAR_SLIM
                 | IDM_FONT_STANDARD
-                | IDM_FONT_LARGE => {
+                | IDM_FONT_LARGE
+                | IDM_PROVIDER_LOGOS
+                | IDM_COMPACT_LAYOUT => {
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
@@ -3580,6 +4259,13 @@ unsafe extern "system" fn wnd_proc(
                                     s.appearance = Appearance::translucent_dark_taskbar()
                                 }
                                 IDM_APPEARANCE_RESET => s.appearance = Appearance::default(),
+                                IDM_PROVIDER_LOGOS => {
+                                    s.appearance.hide_provider_logos =
+                                        !s.appearance.hide_provider_logos
+                                }
+                                IDM_COMPACT_LAYOUT => {
+                                    s.appearance.compact_layout = !s.appearance.compact_layout
+                                }
                                 IDM_PALETTE_SYSTEM => s.appearance.palette = Palette::System,
                                 IDM_PALETTE_DARK => {
                                     s.appearance.palette = Palette::HighContrastDark
@@ -3589,6 +4275,9 @@ unsafe extern "system" fn wnd_proc(
                                 }
                                 IDM_BAR_CONTINUOUS => s.appearance.bar_style = BarStyle::Continuous,
                                 IDM_BAR_SEGMENTED => s.appearance.bar_style = BarStyle::Segmented,
+                                IDM_BAR_CLASSIC => {
+                                    s.appearance.bar_style = BarStyle::ClassicSegmented
+                                }
                                 IDM_BAR_STANDARD => {
                                     s.appearance.bar_thickness = BarThickness::Standard
                                 }
@@ -3603,6 +4292,13 @@ unsafe extern "system" fn wnd_proc(
                     // Font size and weight change the measured widget width.
                     position_at_taskbar();
                     render_layered();
+                }
+                IDM_ALERT_RESET => {
+                    if let Some(s) = lock_state().as_mut() {
+                        s.notify_on_reset = !s.notify_on_reset;
+                        s.reset_observations = Default::default();
+                    }
+                    save_state_settings();
                 }
                 IDM_ALERT_OFF | IDM_ALERT_10 | IDM_ALERT_20 | IDM_ALERT_30 => {
                     let threshold = match id {
@@ -3638,11 +4334,7 @@ unsafe extern "system" fn wnd_proc(
                         if let Some(s) = state.as_mut() {
                             match id {
                                 IDM_MODEL_CLAUDE_CODE => {
-                                    if s.claude_code_available
-                                        && (s.show_codex
-                                            || s.show_antigravity
-                                            || !s.show_claude_code)
-                                    {
+                                    if s.show_codex || s.show_antigravity || !s.show_claude_code {
                                         s.show_claude_code = !s.show_claude_code;
                                     }
                                 }
@@ -3673,33 +4365,23 @@ unsafe extern "system" fn wnd_proc(
                     let sh = SendHwnd::from_hwnd(hwnd);
                     request_poll(sh, true);
                 }
-                IDM_LANG_SYSTEM
-                | IDM_LANG_ENGLISH
-                | IDM_LANG_DUTCH
-                | IDM_LANG_SPANISH
-                | IDM_LANG_FRENCH
-                | IDM_LANG_GERMAN
-                | IDM_LANG_JAPANESE
-                | IDM_LANG_KOREAN
-                | IDM_LANG_SIMPLIFIED_CHINESE
-                | IDM_LANG_TRADITIONAL_CHINESE
-                | IDM_LANG_RUSSIAN
-                | IDM_LANG_PORTUGUESE_BRAZIL => {
-                    let language_override = match id {
-                        IDM_LANG_SYSTEM => None,
-                        IDM_LANG_ENGLISH => Some(LanguageId::English),
-                        IDM_LANG_DUTCH => Some(LanguageId::Dutch),
-                        IDM_LANG_SPANISH => Some(LanguageId::Spanish),
-                        IDM_LANG_FRENCH => Some(LanguageId::French),
-                        IDM_LANG_GERMAN => Some(LanguageId::German),
-                        IDM_LANG_JAPANESE => Some(LanguageId::Japanese),
-                        IDM_LANG_KOREAN => Some(LanguageId::Korean),
-                        IDM_LANG_SIMPLIFIED_CHINESE => Some(LanguageId::SimplifiedChinese),
-                        IDM_LANG_TRADITIONAL_CHINESE => Some(LanguageId::TraditionalChinese),
-                        IDM_LANG_RUSSIAN => Some(LanguageId::Russian),
-                        IDM_LANG_PORTUGUESE_BRAZIL => Some(LanguageId::PortugueseBrazil),
-                        _ => None,
-                    };
+                IDM_QUOTA_USED | IDM_QUOTA_REMAINING => {
+                    if let Some(s) = lock_state().as_mut() {
+                        s.quota_display_mode = if id == IDM_QUOTA_USED {
+                            QuotaDisplayMode::Used
+                        } else {
+                            QuotaDisplayMode::Remaining
+                        };
+                        refresh_usage_texts(s);
+                    }
+                    save_state_settings();
+                    render_layered();
+                    sync_tray_icons(hwnd);
+                }
+                id if (IDM_LANG_SYSTEM..=IDM_LANG_ITALIAN).contains(&id) => {
+                    let language_override = LanguageId::ALL
+                        .into_iter()
+                        .find(|&language| language_command(language) == id);
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
@@ -3728,6 +4410,11 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
+        WM_CLOSE => {
+            // The updater also closes the window through this message.
+            EXIT_REQUESTED.store(true, Ordering::Relaxed);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_DESTROY => {
             let watch = {
                 let mut state = lock_state();
@@ -3743,640 +4430,225 @@ unsafe extern "system" fn wnd_proc(
                 native_interop::unhook_win_event(h);
             }
             tray_icon::remove_all(hwnd);
-            PostQuitMessage(0);
+            if EXIT_REQUESTED.load(Ordering::Relaxed) {
+                PostQuitMessage(0);
+            } else {
+                // Explorer destroys child windows when their taskbar disappears.
+                // The process must stay alive until the watchdog can relaunch it.
+                diagnose::log(
+                    "widget window destroyed unexpectedly; waiting for watchdog recovery",
+                );
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
-unsafe fn append_appearance_choice(menu: HMENU, id: u16, selected: bool, label: &str) {
-    let wide = native_interop::wide_str(label);
-    let flags = if selected {
-        MF_CHECKED
-    } else {
-        MENU_ITEM_FLAGS(0)
-    };
-    let _ = AppendMenuW(menu, flags, id as usize, PCWSTR::from_raw(wide.as_ptr()));
+fn select_antigravity_group(hwnd: HWND, group: Option<String>) {
+    let changed = lock_state().as_mut().is_some_and(|s| {
+        if group == s.antigravity_quota_group {
+            return false;
+        }
+        s.antigravity_quota_group = group;
+        s.monitor.reselect(2, Instant::now());
+        s.reset_observations.clear_provider(2);
+        s.notified_quota_windows
+            .retain(|key| !key.starts_with("antigravity:"));
+        s.data = Some(s.monitor.cached());
+        refresh_usage_texts(s);
+        true
+    });
+    if changed {
+        save_state_settings();
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
+        }
+        start_poll(SendHwnd::from_hwnd(hwnd), true);
+    }
 }
 
-unsafe fn append_appearance_submenu(parent: HMENU, child: HMENU, label: &str) {
-    let wide = native_interop::wide_str(label);
-    let _ = AppendMenuW(
-        parent,
-        MF_POPUP,
-        child.0 as usize,
-        PCWSTR::from_raw(wide.as_ptr()),
-    );
+fn select_settings_display(hwnd: HWND, target: HWND) {
+    let taskbars = native_interop::find_taskbars();
+    let Some((index, taskbar)) = taskbars
+        .into_iter()
+        .enumerate()
+        .find(|(_, item)| item.hwnd == target)
+    else {
+        return;
+    };
+    if !attach_to_taskbar(hwnd, taskbar, index) {
+        return;
+    }
+    if let Some(s) = lock_state().as_mut() {
+        s.monitor_device = native_interop::taskbar_monitor_device(&taskbar);
+        s.tray_offset = 0;
+    }
+    save_state_settings();
+    position_at_taskbar();
+    render_layered();
+}
+
+fn save_current_color_preset(hwnd: HWND) {
+    let snapshot = {
+        let state = lock_state();
+        state.as_ref().map(|s| {
+            (
+                s.appearance.codex_colors,
+                s.color_presets.clone(),
+                s.language == LanguageId::SimplifiedChinese,
+            )
+        })
+    };
+    let Some((colors, library, chinese)) = snapshot else {
+        return;
+    };
+    let initial = (1..=MAX_USER_PRESETS + 1)
+        .map(|index| {
+            if chinese {
+                format!("我的配色 {index}")
+            } else {
+                format!("Custom {index}")
+            }
+        })
+        .find(|name| library.find(name).is_none())
+        .unwrap_or_default();
+    // Both dialogs run nested message loops; all STATE guards must be released.
+    let Some(name) = crate::preset_dialog::prompt(hwnd, chinese, &initial) else {
+        return;
+    };
+    if library.find(&name).is_some() {
+        let question = if chinese {
+            format!("已存在预设“{name}”。是否用当前配色覆盖？")
+        } else {
+            format!("A preset named “{name}” already exists. Replace it with the current colors?")
+        };
+        if !confirm_preset_action(hwnd, chinese, &question) {
+            return;
+        }
+    }
+    let result = {
+        let mut state = lock_state();
+        state.as_mut().map(|s| s.color_presets.save(&name, colors))
+    };
+    if matches!(result, Some(Ok(()))) {
+        save_state_settings();
+    } else if matches!(result, Some(Err(_))) {
+        let text = native_interop::wide_str(if chinese {
+            "无法保存：名称须为 1–40 个字符，最多保存 32 个预设。请删除不需要的预设后再试。"
+        } else {
+            "Unable to save. Use a name of 1–40 characters; up to 32 presets can be saved. Delete an unused preset and try again."
+        });
+        let title = native_interop::wide_str(if chinese {
+            "配色预设"
+        } else {
+            "Color presets"
+        });
+        unsafe {
+            MessageBoxW(
+                hwnd,
+                PCWSTR(text.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+    }
+}
+
+fn confirm_preset_action(hwnd: HWND, chinese: bool, question: &str) -> bool {
+    let title = native_interop::wide_str(if chinese {
+        "配色预设"
+    } else {
+        "Color presets"
+    });
+    let question = native_interop::wide_str(question);
+    unsafe {
+        MessageBoxW(
+            hwnd,
+            PCWSTR(question.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        ) == IDYES
+    }
+}
+
+fn delete_color_preset(hwnd: HWND, index: usize) {
+    let snapshot = {
+        let state = lock_state();
+        state.as_ref().and_then(|s| {
+            s.color_presets.entries().get(index).map(|entry| {
+                (
+                    entry.name.clone(),
+                    s.language == LanguageId::SimplifiedChinese,
+                )
+            })
+        })
+    };
+    let Some((name, chinese)) = snapshot else {
+        return;
+    };
+    let question = if chinese {
+        format!("删除预设“{name}”？当前显示的配色不会改变。")
+    } else {
+        format!("Delete the preset “{name}”? The current colors will not change.")
+    };
+    if !confirm_preset_action(hwnd, chinese, &question) {
+        return;
+    }
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.color_presets.remove(index);
+        }
+    }
+    save_state_settings();
 }
 
 fn show_context_menu(hwnd: HWND) {
+    let (strings, widget_visible) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else { return };
+        (s.language.strings(), s.widget_visible)
+    };
     unsafe {
-        let (
-            current_interval,
-            strings,
-            language,
-            language_override,
-            install_channel,
-            update_status,
-            widget_visible,
-            show_claude_code,
-            claude_code_available,
-            show_codex,
-            show_antigravity,
-            show_session_window,
-            show_weekly_window,
-            alert_threshold_percent,
-            appearance,
-        ) = {
-            let state = lock_state();
-            match state.as_ref() {
-                Some(s) => (
-                    s.poll_interval_ms,
-                    s.language.strings(),
-                    s.language,
-                    s.language_override,
-                    s.install_channel,
-                    s.update_status.clone(),
-                    s.widget_visible,
-                    s.show_claude_code,
-                    s.claude_code_available,
-                    s.show_codex,
-                    s.show_antigravity,
-                    s.show_session_window,
-                    s.show_weekly_window,
-                    s.alert_threshold_percent,
-                    s.appearance,
-                ),
-                None => (
-                    POLL_15_MIN,
-                    LanguageId::English.strings(),
-                    LanguageId::English,
-                    None,
-                    InstallChannel::Portable,
-                    UpdateStatus::Idle,
-                    true,
-                    true,
-                    false,
-                    false,
-                    false,
-                    true,
-                    true,
-                    0,
-                    Appearance::default(),
-                ),
-            }
-        };
-
-        let menu = CreatePopupMenu().unwrap();
-
-        let refresh_str = native_interop::wide_str(strings.refresh);
-        let _ = AppendMenuW(
-            menu,
-            MENU_ITEM_FLAGS(0),
-            1,
-            PCWSTR::from_raw(refresh_str.as_ptr()),
-        );
-
-        // Update Frequency submenu
-        let freq_menu = CreatePopupMenu().unwrap();
-        let freq_items: [(u16, u32, &str); 4] = [
-            (IDM_FREQ_1MIN, POLL_1_MIN, strings.one_minute),
-            (IDM_FREQ_5MIN, POLL_5_MIN, strings.five_minutes),
-            (IDM_FREQ_15MIN, POLL_15_MIN, strings.fifteen_minutes),
-            (IDM_FREQ_1HOUR, POLL_1_HOUR, strings.one_hour),
-        ];
-        for (id, interval, label) in freq_items {
-            let label_str = native_interop::wide_str(label);
-            let flags = if interval == current_interval {
-                MF_CHECKED
-            } else {
-                MENU_ITEM_FLAGS(0)
-            };
-            let _ = AppendMenuW(
-                freq_menu,
-                flags,
-                id as usize,
-                PCWSTR::from_raw(label_str.as_ptr()),
-            );
-        }
-
-        let adaptive = lock_state().as_ref().is_some_and(|s| s.adaptive_refresh);
-        let adaptive_label =
-            native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-                "剩余 ≤20% 时每分钟刷新"
-            } else {
-                "Refresh every minute when remaining ≤20%"
-            });
-        let _ = AppendMenuW(freq_menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(
-            freq_menu,
-            if adaptive {
-                MF_CHECKED
-            } else {
-                MENU_ITEM_FLAGS(0)
-            },
-            IDM_ADAPTIVE_REFRESH as usize,
-            PCWSTR::from_raw(adaptive_label.as_ptr()),
-        );
-        let freq_label = native_interop::wide_str(strings.update_frequency);
-        let _ = AppendMenuW(
-            menu,
-            MF_POPUP,
-            freq_menu.0 as usize,
-            PCWSTR::from_raw(freq_label.as_ptr()),
-        );
-
-        // Models submenu
-        let models_menu = CreatePopupMenu().unwrap();
-        let claude_label = claude_code_menu_label(strings, language, claude_code_available);
-        let claude_model = native_interop::wide_str(&claude_label);
-        let claude_flags = if !claude_code_available {
-            MF_GRAYED
-        } else if show_claude_code {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            models_menu,
-            claude_flags,
-            IDM_MODEL_CLAUDE_CODE as usize,
-            PCWSTR::from_raw(claude_model.as_ptr()),
-        );
-
-        let codex_model = native_interop::wide_str(strings.codex_model);
-        let codex_flags = if show_codex {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            models_menu,
-            codex_flags,
-            IDM_MODEL_CODEX as usize,
-            PCWSTR::from_raw(codex_model.as_ptr()),
-        );
-
-        let antigravity_model = native_interop::wide_str(strings.antigravity_model);
-        let antigravity_flags = if show_antigravity {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            models_menu,
-            antigravity_flags,
-            IDM_MODEL_ANTIGRAVITY as usize,
-            PCWSTR::from_raw(antigravity_model.as_ptr()),
-        );
-
-        let models_label = native_interop::wide_str(strings.models);
-        let _ = AppendMenuW(
-            menu,
-            MF_POPUP,
-            models_menu.0 as usize,
-            PCWSTR::from_raw(models_label.as_ptr()),
-        );
-
-        // Usage window visibility submenu. Keep at least one window enabled.
-        let usage_menu = CreatePopupMenu().unwrap();
-        let session_label =
-            native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-                "5 小时额度"
-            } else {
-                "5-hour quota"
-            });
-        let session_flags = if show_session_window {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            usage_menu,
-            session_flags,
-            IDM_SHOW_SESSION_WINDOW as usize,
-            PCWSTR::from_raw(session_label.as_ptr()),
-        );
-        let weekly_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-            "每周额度"
-        } else {
-            "Weekly quota"
-        });
-        let weekly_flags = if show_weekly_window {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            usage_menu,
-            weekly_flags,
-            IDM_SHOW_WEEKLY_WINDOW as usize,
-            PCWSTR::from_raw(weekly_label.as_ptr()),
-        );
-        let usage_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-            "显示用量"
-        } else {
-            "Usage display"
-        });
-        let _ = AppendMenuW(
-            menu,
-            MF_POPUP,
-            usage_menu.0 as usize,
-            PCWSTR::from_raw(usage_label.as_ptr()),
-        );
-
-        let chinese = language == LanguageId::SimplifiedChinese;
-        let appearance_menu = CreatePopupMenu().unwrap();
-        append_appearance_choice(
-            appearance_menu,
-            IDM_APPEARANCE_RECOMMENDED,
-            appearance == Appearance::translucent_dark_taskbar(),
-            if chinese {
-                "推荐：半透明深色任务栏"
-            } else {
-                "Recommended: translucent dark taskbar"
-            },
-        );
-        append_appearance_choice(
-            appearance_menu,
-            IDM_APPEARANCE_RESET,
-            appearance == Appearance::default(),
-            if chinese {
-                "恢复默认外观"
-            } else {
-                "Reset appearance"
-            },
-        );
-        let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let palette_menu = CreatePopupMenu().unwrap();
-        append_appearance_choice(
-            palette_menu,
-            IDM_PALETTE_SYSTEM,
-            appearance.palette == Palette::System,
-            if chinese {
-                "跟随系统"
-            } else {
-                "Follow system"
-            },
-        );
-        append_appearance_choice(
-            palette_menu,
-            IDM_PALETTE_DARK,
-            appearance.palette == Palette::HighContrastDark,
-            if chinese {
-                "高对比深色"
-            } else {
-                "High contrast dark"
-            },
-        );
-        append_appearance_choice(
-            palette_menu,
-            IDM_PALETTE_LIGHT,
-            appearance.palette == Palette::HighContrastLight,
-            if chinese {
-                "高对比浅色"
-            } else {
-                "High contrast light"
-            },
-        );
-        append_appearance_submenu(
-            appearance_menu,
-            palette_menu,
-            if chinese {
-                "文字与颜色"
-            } else {
-                "Text and colors"
-            },
-        );
-
-        let style_menu = CreatePopupMenu().unwrap();
-        append_appearance_choice(
-            style_menu,
-            IDM_BAR_CONTINUOUS,
-            appearance.bar_style == BarStyle::Continuous,
-            if chinese {
-                "连续圆角"
-            } else {
-                "Continuous rounded"
-            },
-        );
-        append_appearance_choice(
-            style_menu,
-            IDM_BAR_SEGMENTED,
-            appearance.bar_style == BarStyle::Segmented,
-            if chinese { "分段" } else { "Segmented" },
-        );
-        append_appearance_submenu(
-            appearance_menu,
-            style_menu,
-            if chinese {
-                "进度条样式"
-            } else {
-                "Bar style"
-            },
-        );
-
-        let thickness_menu = CreatePopupMenu().unwrap();
-        append_appearance_choice(
-            thickness_menu,
-            IDM_BAR_STANDARD,
-            appearance.bar_thickness == BarThickness::Standard,
-            if chinese { "标准" } else { "Standard" },
-        );
-        append_appearance_choice(
-            thickness_menu,
-            IDM_BAR_SLIM,
-            appearance.bar_thickness == BarThickness::Slim,
-            if chinese { "细" } else { "Slim" },
-        );
-        append_appearance_submenu(
-            appearance_menu,
-            thickness_menu,
-            if chinese {
-                "进度条粗细"
-            } else {
-                "Bar thickness"
-            },
-        );
-
-        let font_menu = CreatePopupMenu().unwrap();
-        append_appearance_choice(
-            font_menu,
-            IDM_FONT_STANDARD,
-            appearance.font_size == FontSize::Standard,
-            if chinese { "标准" } else { "Standard" },
-        );
-        append_appearance_choice(
-            font_menu,
-            IDM_FONT_LARGE,
-            appearance.font_size == FontSize::Large,
-            if chinese { "较大" } else { "Larger" },
-        );
-        append_appearance_submenu(
-            appearance_menu,
-            font_menu,
-            if chinese { "文字大小" } else { "Text size" },
-        );
-        append_appearance_submenu(
-            menu,
-            appearance_menu,
-            if chinese { "外观" } else { "Appearance" },
-        );
-
-        // Low-quota alert threshold submenu. Zero means opt-out.
-        let alert_menu = CreatePopupMenu().unwrap();
-        let alert_items = [
+        let Ok(menu) = CreatePopupMenu() else { return };
+        for (id, label, flags) in [
+            (1, strings.refresh.to_owned(), MENU_ITEM_FLAGS(0)),
             (
-                IDM_ALERT_OFF,
-                0u8,
-                if language == LanguageId::SimplifiedChinese {
-                    "关闭"
-                } else {
-                    "Off"
-                },
+                IDM_SETTINGS,
+                format!("{}…", strings.settings),
+                MENU_ITEM_FLAGS(0),
             ),
             (
-                IDM_ALERT_10,
-                10u8,
-                if language == LanguageId::SimplifiedChinese {
-                    "剩余 10%"
-                } else {
-                    "10% remaining"
-                },
-            ),
-            (
-                IDM_ALERT_20,
-                20u8,
-                if language == LanguageId::SimplifiedChinese {
-                    "剩余 20%"
-                } else {
-                    "20% remaining"
-                },
-            ),
-            (
-                IDM_ALERT_30,
-                30u8,
-                if language == LanguageId::SimplifiedChinese {
-                    "剩余 30%"
-                } else {
-                    "30% remaining"
-                },
-            ),
-        ];
-        for (id, threshold, label) in alert_items {
-            let label = native_interop::wide_str(label);
-            let flags = if alert_threshold_percent == threshold {
-                MF_CHECKED
-            } else {
-                MENU_ITEM_FLAGS(0)
-            };
-            let _ = AppendMenuW(
-                alert_menu,
-                flags,
-                id as usize,
-                PCWSTR::from_raw(label.as_ptr()),
-            );
-        }
-        let alert_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-            "额度提醒"
-        } else {
-            "Quota alerts"
-        });
-        let _ = AppendMenuW(
-            menu,
-            MF_POPUP,
-            alert_menu.0 as usize,
-            PCWSTR::from_raw(alert_label.as_ptr()),
-        );
-
-        // Settings submenu
-        let settings_menu = CreatePopupMenu().unwrap();
-
-        let startup_str = native_interop::wide_str(strings.start_with_windows);
-        let startup_flags = if is_startup_enabled() {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            settings_menu,
-            startup_flags,
-            IDM_START_WITH_WINDOWS as usize,
-            PCWSTR::from_raw(startup_str.as_ptr()),
-        );
-
-        let anchored = lock_state().as_ref().is_some_and(|s| s.anchor_left);
-        let left_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-            "固定在任务栏最左侧"
-        } else {
-            "Pin to the left edge of the taskbar"
-        });
-        let _ = AppendMenuW(
-            settings_menu,
-            if anchored {
-                MF_CHECKED
-            } else {
-                MENU_ITEM_FLAGS(0)
-            },
-            IDM_ANCHOR_LEFT as usize,
-            PCWSTR::from_raw(left_label.as_ptr()),
-        );
-        let reset_pos_str = native_interop::wide_str(strings.reset_position);
-        let _ = AppendMenuW(
-            settings_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_RESET_POSITION as usize,
-            PCWSTR::from_raw(reset_pos_str.as_ptr()),
-        );
-
-        let taskbars = native_interop::find_taskbars();
-        if taskbars.len() > 1 {
-            let selected_taskbar = {
-                let state = lock_state();
-                state.as_ref().and_then(|s| s.taskbar_hwnd)
-            };
-            let monitor_menu = CreatePopupMenu().unwrap();
-            for (index, taskbar) in taskbars.iter().take(MAX_MONITOR_MENU_ITEMS).enumerate() {
-                let device = native_interop::taskbar_monitor_device(taskbar)
-                    .unwrap_or_else(|| format!("{}", index + 1));
-                let label = if language == LanguageId::SimplifiedChinese {
-                    format!("显示器 {} ({device})", index + 1)
-                } else {
-                    format!("Display {} ({device})", index + 1)
-                };
-                let wide = native_interop::wide_str(&label);
-                let flags = if selected_taskbar == Some(taskbar.hwnd) {
+                tray_icon::IDM_TOGGLE_WIDGET,
+                strings.show_widget.to_owned(),
+                if widget_visible {
                     MF_CHECKED
                 } else {
                     MENU_ITEM_FLAGS(0)
-                };
-                let _ = AppendMenuW(
-                    monitor_menu,
-                    flags,
-                    (IDM_MONITOR_FIRST as usize) + index,
-                    PCWSTR::from_raw(wide.as_ptr()),
-                );
-            }
-            let label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-                "显示器"
-            } else {
-                "Display"
-            });
-            let _ = AppendMenuW(
-                settings_menu,
-                MF_POPUP,
-                monitor_menu.0 as usize,
-                PCWSTR::from_raw(label.as_ptr()),
-            );
+                },
+            ),
+            (2, strings.exit.to_owned(), MENU_ITEM_FLAGS(0)),
+        ] {
+            let text = native_interop::wide_str(&label);
+            let _ = AppendMenuW(menu, flags, id as usize, PCWSTR::from_raw(text.as_ptr()));
         }
-
-        let language_menu = CreatePopupMenu().unwrap();
-        let system_label = native_interop::wide_str(strings.system_default);
-        let system_flags = if language_override.is_none() {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            language_menu,
-            system_flags,
-            IDM_LANG_SYSTEM as usize,
-            PCWSTR::from_raw(system_label.as_ptr()),
-        );
-
-        for language in LanguageId::ALL {
-            let id = match language {
-                LanguageId::English => IDM_LANG_ENGLISH,
-                LanguageId::Dutch => IDM_LANG_DUTCH,
-                LanguageId::Spanish => IDM_LANG_SPANISH,
-                LanguageId::French => IDM_LANG_FRENCH,
-                LanguageId::German => IDM_LANG_GERMAN,
-                LanguageId::Japanese => IDM_LANG_JAPANESE,
-                LanguageId::Korean => IDM_LANG_KOREAN,
-                LanguageId::SimplifiedChinese => IDM_LANG_SIMPLIFIED_CHINESE,
-                LanguageId::TraditionalChinese => IDM_LANG_TRADITIONAL_CHINESE,
-                LanguageId::Russian => IDM_LANG_RUSSIAN,
-                LanguageId::PortugueseBrazil => IDM_LANG_PORTUGUESE_BRAZIL,
-            };
-            let label_str = native_interop::wide_str(language.native_name());
-            let flags = if language_override == Some(language) {
-                MF_CHECKED
-            } else {
-                MENU_ITEM_FLAGS(0)
-            };
-            let _ = AppendMenuW(
-                language_menu,
-                flags,
-                id as usize,
-                PCWSTR::from_raw(label_str.as_ptr()),
-            );
-        }
-
-        let language_label = native_interop::wide_str(strings.language);
-        let _ = AppendMenuW(
-            settings_menu,
-            MF_POPUP,
-            language_menu.0 as usize,
-            PCWSTR::from_raw(language_label.as_ptr()),
-        );
-
-        let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
-
-        let version_label =
-            version_action_label(strings, language, install_channel, &update_status);
-        let version_str = native_interop::wide_str(&version_label);
-        let version_flags = if matches!(
-            update_status,
-            UpdateStatus::Checking | UpdateStatus::Applying
-        ) {
-            MF_GRAYED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            settings_menu,
-            version_flags,
-            IDM_VERSION_ACTION as usize,
-            PCWSTR::from_raw(version_str.as_ptr()),
-        );
-
-        let settings_label = native_interop::wide_str(strings.settings);
-        let _ = AppendMenuW(
-            menu,
-            MF_POPUP,
-            settings_menu.0 as usize,
-            PCWSTR::from_raw(settings_label.as_ptr()),
-        );
-
-        let widget_label = native_interop::wide_str(strings.show_widget);
-        let widget_flags = if widget_visible {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            menu,
-            widget_flags,
-            tray_icon::IDM_TOGGLE_WIDGET as usize,
-            PCWSTR::from_raw(widget_label.as_ptr()),
-        );
-
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-
-        let exit_str = native_interop::wide_str(strings.exit);
-        let _ = AppendMenuW(
-            menu,
-            MENU_ITEM_FLAGS(0),
-            2,
-            PCWSTR::from_raw(exit_str.as_ptr()),
-        );
-
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
+        let mut point = POINT::default();
+        let _ = GetCursorPos(&mut point);
         let _ = SetForegroundWindow(hwnd);
-        let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
+        let command = TrackPopupMenu(
+            menu,
+            TPM_RIGHTBUTTON | TPM_RETURNCMD,
+            point.x,
+            point.y,
+            0,
+            hwnd,
+            None,
+        );
         let _ = DestroyMenu(menu);
+        if command.0 != 0 {
+            let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(command.0 as usize), LPARAM(0));
+        }
     }
 }
 
@@ -4412,17 +4684,19 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.appearance,
                 s.language,
                 s.language.strings(),
-                s.session_percent,
+                s.quota_display_mode.percentage(s.session_percent),
                 s.session_text.clone(),
-                s.weekly_percent,
+                s.quota_display_mode.percentage(s.weekly_percent),
                 s.weekly_text.clone(),
-                s.codex_session_percent,
+                s.quota_display_mode.percentage(s.codex_session_percent),
                 s.codex_session_text.clone(),
-                s.codex_weekly_percent,
+                s.quota_display_mode.percentage(s.codex_weekly_percent),
                 s.codex_weekly_text.clone(),
-                s.antigravity_session_percent,
+                s.quota_display_mode
+                    .percentage(s.antigravity_session_percent),
                 s.antigravity_session_text.clone(),
-                s.antigravity_weekly_percent,
+                s.quota_display_mode
+                    .percentage(s.antigravity_weekly_percent),
                 s.antigravity_weekly_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
@@ -4436,7 +4710,10 @@ fn paint(hdc: HDC, hwnd: HWND) {
 
     let accent = claude_accent_color();
     let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
-    let codex_accent = provider_icons::codex_color(appearance.is_dark(is_dark));
+    let codex_accent = appearance
+        .codex_colors
+        .resolve(appearance.is_dark(is_dark))
+        .bar;
     let antigravity_accent = antigravity_accent_color();
 
     unsafe {
@@ -4494,6 +4771,121 @@ fn paint(hdc: HDC, hwnd: HWND) {
     }
 }
 
+fn paint_compact_quota_rows(
+    hdc: HDC,
+    width: i32,
+    height: i32,
+    appearance: Appearance,
+    is_dark: bool,
+    text_color: &Color,
+    accent: &Color,
+    track: &Color,
+    session_percent: f64,
+    session_text: &str,
+    weekly_percent: f64,
+    weekly_text: &str,
+    show_session: bool,
+    show_weekly: bool,
+) {
+    let rows = show_session as i32 + show_weekly as i32;
+    let (row_height, text_height, bar_height, inset) = compact_row_geometry(height, rows);
+    let secondary = reset_text_color(appearance, is_dark);
+    let content_right = width - sc(12);
+    unsafe {
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let font = create_widget_font(appearance);
+        let reset_font = quota_text::create_reset_font(sc(appearance.font_px() - 1));
+        let old_font = SelectObject(hdc, font);
+        let mut row = 0;
+        for (visible, label, percent, value) in [
+            (show_session, "5h", session_percent, session_text),
+            (show_weekly, "7d", weekly_percent, weekly_text),
+        ] {
+            if !visible {
+                continue;
+            }
+            let y = row * row_height + inset;
+            let draw_text = |left: i32, right: i32, text: &str, color: &Color, flags| {
+                // No reset text is available during startup or an auth error.
+                // DrawTextW may inspect its buffer even when the count is zero.
+                if text.is_empty() {
+                    return;
+                }
+                let mut wide: Vec<u16> = text.encode_utf16().collect();
+                let mut rect = RECT {
+                    left,
+                    top: y,
+                    right,
+                    bottom: y + text_height,
+                };
+                let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
+                let _ = DrawTextW(
+                    hdc,
+                    &mut wide,
+                    &mut rect,
+                    DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | flags,
+                );
+            };
+            SelectObject(hdc, font);
+            draw_text(sc(12), sc(32), label, text_color, DT_LEFT);
+            let (percentage, reset) = quota_text::parts(value);
+            SelectObject(hdc, font);
+            let measure = |value: &str| {
+                let wide: Vec<u16> = value.encode_utf16().collect();
+                let mut size = SIZE::default();
+                if !wide.is_empty() {
+                    let _ = GetTextExtentPoint32W(hdc, &wide, &mut size);
+                }
+                size.cx
+            };
+            // Equal visible gaps, rather than a right-aligned three-digit slot.
+            let percentage_x = sc(12) + measure(label) + sc(8);
+            let reset_x = percentage_x + measure(percentage) + sc(8);
+            draw_text(percentage_x, reset_x - sc(8), percentage, accent, DT_LEFT);
+            SelectObject(hdc, reset_font);
+            // Include a small space before the suffix as in the approved SVG.
+            let reset = reset.replace("重置", " 重置");
+            draw_text(reset_x, width - sc(12), &reset, &secondary, DT_LEFT);
+
+            let gap = sc(3).min((row_height - text_height - bar_height).max(0));
+            let bar_y = y + text_height + gap;
+            let bar = RECT {
+                left: sc(12),
+                top: bar_y,
+                right: content_right,
+                bottom: bar_y + bar_height,
+            };
+            let fill = usage_bar_fill_percentage(percent, value) / 100.0;
+            if appearance.bar_style == BarStyle::Segmented {
+                let segment_width = (bar.right - bar.left) as f64 / 10.0;
+                for segment in 0..10 {
+                    let rect = RECT {
+                        left: bar.left + (segment_width * segment as f64).round() as i32,
+                        right: bar.left + (segment_width * (segment + 1) as f64).round() as i32
+                            - sc(1),
+                        ..bar
+                    };
+                    draw_rounded_rect(hdc, &rect, track, bar_height / 2);
+                    fill_rounded_bar(
+                        hdc,
+                        &rect,
+                        (fill * 10.0 - segment as f64).clamp(0.0, 1.0),
+                        accent,
+                        bar_height / 2,
+                    );
+                }
+            } else {
+                draw_rounded_rect(hdc, &bar, track, bar_height / 2);
+                fill_rounded_bar(hdc, &bar, fill, accent, bar_height / 2);
+            }
+            row += 1;
+        }
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+        let _ = DeleteObject(reset_font);
+    }
+}
+
 fn draw_row(
     hdc: HDC,
     x: i32,
@@ -4527,7 +4919,7 @@ fn draw_row(
     } else {
         *text_color
     };
-    let codex_value_color = provider_icons::codex_color(is_dark);
+    let codex_value_color = appearance.codex_colors.resolve(is_dark).percentage;
     let antigravity_value_color = if use_model_text_colors {
         antigravity_usage_text_color(is_dark)
     } else {
@@ -4554,7 +4946,7 @@ fn draw_row(
         if show_claude_code {
             draw_usage_bar(
                 hdc,
-                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
+                model_x + provider_mark_width(appearance),
                 y,
                 segment_count,
                 claude_percent,
@@ -4566,12 +4958,13 @@ fn draw_row(
                 is_dark,
                 appearance,
             );
-            model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
+            model_x +=
+                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_codex {
             draw_usage_bar(
                 hdc,
-                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
+                model_x + provider_mark_width(appearance),
                 y,
                 segment_count,
                 codex_percent,
@@ -4583,12 +4976,13 @@ fn draw_row(
                 is_dark,
                 appearance,
             );
-            model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
+            model_x +=
+                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_antigravity {
             draw_usage_bar(
                 hdc,
-                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
+                model_x + provider_mark_width(appearance),
                 y,
                 segment_count,
                 antigravity_percent,
@@ -4604,16 +4998,35 @@ fn draw_row(
     }
 }
 
-fn model_usage_width(segment_count: i32, text_width: i32) -> i32 {
-    sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN)
-        + (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count
-        - sc(SEGMENT_GAP)
+fn segment_width(segment_count: i32) -> i32 {
+    sc(if segment_count == SEGMENT_COUNT {
+        SEGMENT_W
+    } else {
+        COMPACT_SEGMENT_W
+    })
+}
+
+fn usage_bar_width(segment_count: i32) -> i32 {
+    segment_count * segment_width(segment_count) + (segment_count - 1) * sc(SEGMENT_GAP)
+}
+
+fn provider_mark_width(appearance: Appearance) -> i32 {
+    if appearance.hide_provider_logos {
+        0
+    } else {
+        sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN)
+    }
+}
+
+fn model_usage_width(segment_count: i32, text_width: i32, appearance: Appearance) -> i32 {
+    provider_mark_width(appearance)
+        + usage_bar_width(segment_count)
         + sc(BAR_RIGHT_MARGIN)
         + text_width
 }
 
 fn usage_bar_fill_percentage(percent: f64, text: &str) -> f64 {
-    if text == "--" {
+    if !text.contains('%') {
         0.0
     } else {
         percent.clamp(0.0, 100.0)
@@ -4634,15 +5047,22 @@ fn draw_usage_bar(
     is_dark: bool,
     appearance: Appearance,
 ) {
-    let seg_w = sc(SEGMENT_W);
+    let seg_w = segment_width(segment_count);
     let seg_h = appearance.bar_height();
     let seg_gap = sc(SEGMENT_GAP);
-    let bar_width = segment_count * (seg_w + seg_gap) - seg_gap;
-    let corner_r = seg_h / 2;
+    let bar_width = usage_bar_width(segment_count);
+    let corner_r = if appearance.bar_style == BarStyle::ClassicSegmented {
+        sc(2)
+    } else {
+        seg_h / 2
+    };
     let bar_y = y + (appearance.row_height() - seg_h) / 2;
 
     let percent_clamped = usage_bar_fill_percentage(percent, text);
-    if appearance.bar_style == BarStyle::Segmented {
+    if matches!(
+        appearance.bar_style,
+        BarStyle::Segmented | BarStyle::ClassicSegmented
+    ) {
         for i in 0..segment_count {
             let rect = RECT {
                 left: bar_x + i * (seg_w + seg_gap),
@@ -4726,12 +5146,183 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 }
 
 #[cfg(test)]
+#[path = "appearance_preview.rs"]
+mod appearance_preview;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn taskbar_watchdog_recovers_when_either_the_window_or_its_host_disappears() {
+        assert!(needs_taskbar_relaunch(false, true, true));
+        assert!(needs_taskbar_relaunch(true, false, true));
+        assert!(!needs_taskbar_relaunch(true, true, true));
+        assert!(!needs_taskbar_relaunch(false, false, false));
+    }
+
+    #[test]
+    fn legacy_appearance_keeps_its_style_and_default_codex_colors() {
+        let settings: SettingsFile = serde_json::from_str(
+            r#"{"tray_offset":321,"appearance":{"bar_style":"segmented","font_size":"large"}}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.tray_offset, 321);
+        assert_eq!(settings.appearance.bar_style, BarStyle::Segmented);
+        assert_eq!(settings.appearance.codex_colors, CodexColors::default());
+        assert!(settings.color_presets.entries().is_empty());
+        let mut saved = UserPresets::default();
+        saved
+            .save("Evening rose", CodexColors::from_preset(ColorPreset::Rose))
+            .unwrap();
+        let customized = SettingsFile {
+            color_presets: saved,
+            appearance: Appearance {
+                bar_style: BarStyle::ClassicSegmented,
+                codex_colors: CodexColors::from_preset(ColorPreset::Clay),
+                ..Appearance::default()
+            },
+            ..settings
+        };
+        let json = serde_json::to_string(&customized).unwrap();
+        let restored: SettingsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.appearance, customized.appearance);
+        assert_eq!(restored.color_presets, customized.color_presets);
+        assert_eq!(restored.tray_offset, 321);
+    }
+
+    #[test]
+    fn compact_layout_is_opt_in_and_preserved_for_supported_selections() {
+        let mut appearance: Appearance = serde_json::from_str("{}").unwrap();
+        assert!(!appearance.compact_layout);
+        assert!(!uses_compact_layout(
+            1,
+            LanguageId::SimplifiedChinese,
+            appearance
+        ));
+        assert_eq!(
+            preferred_widget_height_for(1, LanguageId::SimplifiedChinese, true, true, appearance),
+            WIDGET_HEIGHT
+        );
+
+        appearance.compact_layout = true;
+        let restored: Appearance =
+            serde_json::from_str(&serde_json::to_string(&appearance).unwrap()).unwrap();
+        assert!(uses_compact_layout(
+            1,
+            LanguageId::SimplifiedChinese,
+            restored
+        ));
+        assert!(!uses_compact_layout(
+            2,
+            LanguageId::SimplifiedChinese,
+            restored
+        ));
+        assert!(!uses_compact_layout(1, LanguageId::English, restored));
+        assert_eq!(
+            preferred_widget_height_for(1, LanguageId::SimplifiedChinese, true, false, restored),
+            32
+        );
+        assert_eq!(
+            preferred_widget_height_for(1, LanguageId::SimplifiedChinese, true, true, restored),
+            64
+        );
+        assert_eq!(
+            preferred_widget_height_for(2, LanguageId::SimplifiedChinese, true, true, restored),
+            WIDGET_HEIGHT
+        );
+    }
+
+    #[test]
+    fn compact_width_uses_only_visible_text_and_reserves_status_markers() {
+        for font_size in [FontSize::Standard, FontSize::Large] {
+            let appearance = Appearance {
+                font_size,
+                compact_layout: true,
+                ..Appearance::default()
+            };
+            let session = "8% 18:30重置";
+            let weekly = "100% 12/31重置 *";
+            let single = compact_measured_width(appearance, session, weekly, true, false);
+            let weekly_only = compact_measured_width(appearance, session, weekly, false, true);
+            assert!(weekly_only > single);
+            assert_eq!(
+                single,
+                compact_measured_width(appearance, session, "", true, false)
+            );
+            assert_eq!(
+                weekly_only,
+                compact_measured_width(appearance, session, weekly, true, true)
+            );
+            assert!(compact_measured_width(appearance, "--", "--", true, true) < single);
+        }
+    }
+
+    #[test]
+    fn widget_is_centered_for_single_and_double_quota_rows() {
+        for (top, available, widget) in [(1704, 96, 64), (1704, 96, 96), (0, 48, 32), (-48, 48, 32)]
+        {
+            let y = compute_anchor_y(top, available, widget, true);
+            assert_eq!(y - top, top + available - y - widget);
+        }
+        assert_eq!(compute_anchor_y(100, 48, 64, true), 100);
+        assert_eq!(compute_anchor_y(100, 48, 32, false), 116);
+    }
+
+    #[test]
+    fn compact_startup_and_error_states_render_without_reset_text() {
+        unsafe {
+            let dc = CreateCompatibleDC(HDC::default());
+            assert!(!dc.is_invalid());
+            let appearance = Appearance::default();
+            let (_, text, track) = appearance_colors(appearance, false);
+            let accent = appearance.codex_colors.resolve(false).bar;
+            for value in ["--", "", "网络", "100%"] {
+                paint_compact_quota_rows(
+                    dc,
+                    sc(192),
+                    sc(48),
+                    appearance,
+                    false,
+                    &text,
+                    &accent,
+                    &track,
+                    0.0,
+                    value,
+                    0.0,
+                    value,
+                    true,
+                    true,
+                );
+            }
+            let _ = DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn compact_rows_fit_short_taskbars_with_both_windows_visible() {
+        for dpi in [96, 120, 144, 192] {
+            let scale = |px: i32| (px as f64 * dpi as f64 / 96.0).round() as i32;
+            for height in [32, 40, 48, 64] {
+                for rows in [1, 2] {
+                    let height = scale(height);
+                    let (row_height, text_height, bar_height, inset) =
+                        compact_row_geometry_scaled(height, rows, scale);
+                    let gap = scale(3).min((row_height - text_height - bar_height).max(0));
+                    assert!(bar_height > 0);
+                    assert!(text_height >= scale(12));
+                    assert!(inset + text_height + gap + bar_height <= row_height);
+                    assert!(row_height * rows <= height);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn unavailable_quota_has_no_bar_fill() {
-        assert_eq!(usage_bar_fill_percentage(100.0, "--"), 0.0);
+        for status in ["--", "...", "!", "网络", "429"] {
+            assert_eq!(usage_bar_fill_percentage(100.0, status), 0.0);
+        }
         assert_eq!(usage_bar_fill_percentage(61.0, "剩余61%"), 61.0);
         assert_eq!(usage_bar_fill_percentage(100.0, "剩余100%"), 100.0);
     }
@@ -4801,22 +5392,6 @@ mod tests {
         assert_eq!(
             service_tooltip("Claude Code", "13%", "86%", false, true),
             "Claude Code: 7d 86%"
-        );
-    }
-
-    #[test]
-    fn unavailable_claude_cli_has_an_explicit_menu_label() {
-        assert_eq!(
-            claude_code_menu_label(
-                LanguageId::SimplifiedChinese.strings(),
-                LanguageId::SimplifiedChinese,
-                false,
-            ),
-            "Claude Code（需登录 CLI）"
-        );
-        assert_eq!(
-            claude_code_menu_label(LanguageId::English.strings(), LanguageId::English, true),
-            "Claude Code"
         );
     }
 
@@ -5010,22 +5585,6 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_claude_cli_is_disabled_without_disabling_codex() {
-        let settings = SettingsFile {
-            show_claude_code: true,
-            show_codex: false,
-            show_antigravity: false,
-            ..SettingsFile::default()
-        };
-
-        let (settings, changed) = apply_claude_code_availability(settings, false);
-
-        assert!(changed);
-        assert!(!settings.show_claude_code);
-        assert!(settings.show_codex);
-    }
-
-    #[test]
     fn formats_precise_local_reset_time() {
         let local = SYSTEMTIME {
             wYear: 2026,
@@ -5040,15 +5599,66 @@ mod tests {
     }
 
     #[test]
+    fn rollover_shows_stale_readings_then_hides_them_until_a_new_reading_arrives() {
+        let reset = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let observed = Some(reset - Duration::from_secs(60));
+        let reading = crate::models::UsageSection::reported(42.0, Some(reset));
+        let chinese = LanguageId::SimplifiedChinese.strings();
+        let english = LanguageId::English.strings();
+        let session = poller::UsageWindowKind::Session;
+        let at_reset = window_text(&reading, observed, reset, |section| {
+            poller::format_line(section, chinese, true, session)
+        });
+        assert_eq!(at_reset, "58% *");
+        assert_eq!(
+            window_reset(Some(reset), observed, reset + Duration::from_secs(299)),
+            WindowReset::Rollover
+        );
+        let expired = reset + Duration::from_secs(300);
+        let after_grace = window_text(&reading, observed, expired, |section| {
+            poller::format_line(section, chinese, true, session)
+        });
+        assert_eq!(after_grace, "--");
+        assert_eq!(usage_bar_fill_percentage(58.0, &after_grace), 0.0);
+        let new_reading = window_text(&reading, Some(expired), expired, |section| {
+            poller::format_antigravity_line(section, english, false, session)
+        });
+        assert!(new_reading.starts_with("58%"));
+        assert!(!new_reading.ends_with('*'));
+    }
+
+    #[test]
+    fn alerts_compare_unrounded_capacity_and_skip_unreported_windows() {
+        let mut alerts = Vec::new();
+        let mut notified = BTreeSet::new();
+        for section in [
+            crate::models::UsageSection::default(),
+            crate::models::UsageSection::reported(89.6, None),
+            crate::models::UsageSection::reported(90.4, None),
+        ] {
+            append_quota_alert(
+                &mut alerts,
+                &mut notified,
+                10,
+                LanguageId::English,
+                tray_icon::TrayIconKind::Codex,
+                "codex",
+                "Codex",
+                "session",
+                "5h",
+                &section,
+            );
+        }
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("10% remaining"));
+    }
+
+    #[test]
     fn low_quota_alert_is_deduplicated_until_reset_window_changes() {
         let mut alerts = Vec::new();
         let mut notified = BTreeSet::new();
         let first_reset = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
-        let first = crate::models::UsageSection {
-            percentage: 85.0,
-            resets_at: Some(first_reset),
-            reported: true,
-        };
+        let first = crate::models::UsageSection::reported(85.0, Some(first_reset));
 
         append_quota_alert(
             &mut alerts,
@@ -5077,11 +5687,10 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].message.contains("仅剩 15%"));
 
-        let next = crate::models::UsageSection {
-            percentage: 90.0,
-            resets_at: Some(first_reset + Duration::from_secs(18_000)),
-            reported: true,
-        };
+        let next = crate::models::UsageSection::reported(
+            90.0,
+            Some(first_reset + Duration::from_secs(18_000)),
+        );
         append_quota_alert(
             &mut alerts,
             &mut notified,
@@ -5096,5 +5705,47 @@ mod tests {
         );
         assert_eq!(alerts.len(), 2);
         assert_eq!(notified.len(), 1);
+    }
+    #[test]
+    fn mcp_server_is_opt_in_and_keeps_older_settings_compatible() {
+        let older: SettingsFile = serde_json::from_str(r#"{"show_codex":true}"#).unwrap();
+        assert!(!older.mcp_server_enabled);
+        assert_eq!(mcp_port(older.mcp_port), mcp_server::DEFAULT_PORT);
+        let saved = serde_json::to_value(&older).unwrap();
+        assert_eq!(saved["mcp_server_enabled"], false);
+        assert!(saved.get("mcp_port").is_none());
+
+        let custom: SettingsFile =
+            serde_json::from_str(r#"{"mcp_server_enabled":true,"mcp_port":47000}"#).unwrap();
+        assert!(custom.mcp_server_enabled);
+        assert_eq!(mcp_port(custom.mcp_port), 47000);
+        // Privileged or zero ports fall back to the default.
+        assert_eq!(mcp_port(Some(80)), mcp_server::DEFAULT_PORT);
+        assert_eq!(mcp_port(Some(0)), mcp_server::DEFAULT_PORT);
+        assert!(mcp_settings_label(false, true, 47000).contains("47000"));
+    }
+    #[test]
+    fn hiding_provider_logos_reclaims_their_columns() {
+        let original = Appearance::default();
+        let hidden = Appearance {
+            hide_provider_logos: true,
+            ..original
+        };
+        let regular = total_widget_width_for(2, LanguageId::SimplifiedChinese, original);
+        let compact = total_widget_width_for(2, LanguageId::SimplifiedChinese, hidden);
+        assert_eq!(regular - compact, 2 * provider_mark_width(original));
+        assert_eq!(provider_mark_width(hidden), 0);
+    }
+
+    #[test]
+    fn italian_is_selectable_and_settings_round_trip() {
+        let italian = LanguageId::from_code("it-IT").unwrap();
+        assert_eq!(italian, LanguageId::Italian);
+        assert!(LanguageId::ALL.contains(&italian));
+        assert_eq!(italian.native_name(), "Italiano");
+        let saved: SettingsFile =
+            serde_json::from_str(r#"{"language":"it","quota_display_mode":"remaining"}"#).unwrap();
+        assert_eq!(saved.quota_display_mode, Some(QuotaDisplayMode::Remaining));
+        assert_eq!(serde_json::to_value(saved).unwrap()["language"], "it");
     }
 }

@@ -2,6 +2,7 @@ mod dutch;
 mod english;
 mod french;
 mod german;
+mod italian;
 mod japanese;
 mod korean;
 mod portuguese_brazil;
@@ -23,6 +24,7 @@ pub enum LanguageId {
     Spanish,
     French,
     German,
+    Italian,
     Japanese,
     Korean,
     SimplifiedChinese,
@@ -32,12 +34,13 @@ pub enum LanguageId {
 }
 
 impl LanguageId {
-    pub const ALL: [LanguageId; 11] = [
+    pub const ALL: [LanguageId; 12] = [
         LanguageId::English,
         LanguageId::Dutch,
         LanguageId::Spanish,
         LanguageId::French,
         LanguageId::German,
+        LanguageId::Italian,
         LanguageId::Japanese,
         LanguageId::Korean,
         LanguageId::SimplifiedChinese,
@@ -53,6 +56,7 @@ impl LanguageId {
             Self::Spanish => "es",
             Self::French => "fr",
             Self::German => "de",
+            Self::Italian => "it",
             Self::Japanese => "ja",
             Self::Korean => "ko",
             Self::SimplifiedChinese => "zh-CN",
@@ -69,6 +73,7 @@ impl LanguageId {
             Self::Spanish => "Español",
             Self::French => "Français",
             Self::German => "Deutsch",
+            Self::Italian => "Italiano",
             Self::Japanese => "日本語",
             Self::Korean => "한국어",
             Self::SimplifiedChinese => "简体中文",
@@ -85,6 +90,7 @@ impl LanguageId {
             Self::Spanish => spanish::STRINGS,
             Self::French => french::STRINGS,
             Self::German => german::STRINGS,
+            Self::Italian => italian::STRINGS,
             Self::Japanese => japanese::STRINGS,
             Self::Korean => korean::STRINGS,
             Self::SimplifiedChinese => simplified_chinese::STRINGS,
@@ -101,6 +107,7 @@ impl LanguageId {
             Self::Spanish => spanish::UPDATE_VIA_WINGET_LABEL,
             Self::French => french::UPDATE_VIA_WINGET_LABEL,
             Self::German => german::UPDATE_VIA_WINGET_LABEL,
+            Self::Italian => italian::UPDATE_VIA_WINGET_LABEL,
             Self::Japanese => japanese::UPDATE_VIA_WINGET_LABEL,
             Self::Korean => korean::UPDATE_VIA_WINGET_LABEL,
             Self::SimplifiedChinese => simplified_chinese::UPDATE_VIA_WINGET_LABEL,
@@ -123,6 +130,7 @@ impl LanguageId {
             "es" => Some(Self::Spanish),
             "fr" => Some(Self::French),
             "de" => Some(Self::German),
+            "it" => Some(Self::Italian),
             "ja" => Some(Self::Japanese),
             "ko" => Some(Self::Korean),
             "zh" => {

@@ -1,25 +1,34 @@
 #![windows_subsystem = "windows"]
 
+mod codex_colors;
+mod color_picker;
 mod diagnose;
 mod localization;
+mod mcp_server;
 mod models;
 mod native_interop;
 mod poller;
+mod preset_dialog;
+mod privacy;
 mod provider_icons;
 mod provider_poll;
+mod quota_alerts;
 mod quota_refresh;
 mod quota_text;
 mod quota_tooltip;
 mod recovery_events;
+mod reset_alerts;
 mod retry_after;
 mod settings_store;
 mod theme;
 mod tray_icon;
 mod updater;
+mod user_presets;
 mod window;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    privacy::initialize(&args);
     let diagnose_enabled = args.iter().any(|arg| arg == "--diagnose");
     if diagnose_enabled {
         match diagnose::init() {

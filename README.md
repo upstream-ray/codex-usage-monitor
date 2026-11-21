@@ -43,7 +43,7 @@ This app is for Windows users who already have **Codex CLI or the Codex app inst
 
 Codex is enabled by default. The app reads the same local credentials used by Codex.
 
-Antigravity support is optional too. To show Antigravity usage, install and sign in to Google Antigravity, then enable the **Antigravity** service from the right-click **Monitored services** menu.
+Antigravity support is optional too. To show Antigravity usage, install and sign in to Google Antigravity, then enable the **Antigravity** service under **Settings → Usage**.
 
 It works best if you want a simple "how close am I to the limit?" display that is always visible.
 
@@ -97,37 +97,37 @@ codex-usage
 Once running, it will appear in your taskbar and as one tray icon in the notification area.
 
 - Drag the left divider to move the taskbar widget
-- Choose **Settings → Pin to the left edge of the taskbar** to keep the widget at the left edge instead of next to the tray
-- On multi-monitor setups, choose **Settings → Display** from the right-click menu or drag the widget onto another taskbar. The selection is saved; the primary taskbar is used while the selected display is disconnected, and the widget returns when it reconnects.
-- Right-click the taskbar widget or tray icon for refresh, monitored services, usage rows, quota alerts, update frequency, Start with Windows, reset position, language, updates, and exit
+- Choose **Settings → General → Pin to the left edge of the taskbar** to keep the widget at the left edge instead of next to the tray
+- On multi-monitor setups, choose **Settings → General → Display** or drag the widget onto another taskbar. The selection is saved; the primary taskbar is used while the selected display is disconnected, and the widget returns when it reconnects.
+- Right-click the taskbar widget or tray icon to refresh, open **Settings**, show or hide the widget, or exit. The Settings window stays open while you make changes. Each change takes effect and saves immediately.
 - Left-click the tray icon to toggle the taskbar widget on or off
-- Enable `Start with Windows` from the right-click menu if you want it to launch automatically when you sign in
+- Enable **Start with Windows** under **Settings → General** if you want it to launch automatically when you sign in
 
 ### Monitored Services
 
-Use the right-click **Monitored services** menu to choose which independent services the widget displays. The services are not mutually exclusive, so you can monitor more than one account at the same time:
+Open **Settings → Usage** to choose which independent services the widget displays. The services are not mutually exclusive, so you can monitor more than one account at the same time:
 
 - **Codex** is enabled by default
 - **Claude Code** can be enabled alongside Codex or shown by itself when Claude Code CLI is installed and authenticated
 - **Antigravity** can be enabled alongside the other providers or shown by itself as its own service column
 
-When multiple services are shown, each service has its own usage bar and matching usage text color. Antigravity reads the **Gemini Models** balances from **View Usage** through the signed-in Antigravity CLI. If the CLI query fails, the widget tries Google's account quota summary. Unavailable windows display `--`.
+When multiple services are shown, each service has its own usage bar and matching usage text color. Antigravity reads the **Gemini Models** balances from **View Usage** through the signed-in Antigravity CLI. If the CLI query fails, the widget tries Google's account quota summary. Select another reported group from **Settings → Usage → Antigravity quota group**. Unavailable windows display `--`.
 
-Claude Desktop and Claude Code CLI use separate local sessions. Signing in to Claude Desktop does not enable Claude Code monitoring. When no supported Claude Code CLI credentials are available, the menu shows **Claude Code (CLI login required)** as a disabled item and automatically keeps that service off.
+Claude Desktop and Claude Code CLI use separate local sessions. Signing in to Claude Desktop does not enable Claude Code monitoring. Enable **Claude Code** to start its credential check. The widget shows a sign-in hint if credentials are missing or expired.
 
 ### System Tray Icon
 
 The app always shows one tray icon using the same embedded icon as the executable and desktop shortcut, regardless of how many services are enabled.
 
-Hovering over the tray icon shows a compact summary for all enabled services. Left-clicking it toggles the taskbar widget; right-clicking it opens the settings menu.
+Hovering over the tray icon shows a compact summary for all enabled services. Left-clicking it toggles the taskbar widget; right-clicking it opens the shortcut menu.
 
 ### Usage Display And Alerts
 
-Use the right-click **Usage display** menu to show both quota rows or only one. The app always keeps at least one row visible.
+Use **Settings → Usage** to show both quota rows or only one. The app always keeps at least one row visible. **Quota display** sets **Remaining** or **Used** for all services and windows. The setting applies to text, bars, and tray summaries independently of the UI language. New installations default to **Remaining**. Upgrades choose an initial mode from the previous UI language and save it.
 
-Use **Quota alerts** to choose a remaining-quota threshold of 10%, 20%, or 30%. Alerts are off by default. Each provider and quota window is notified only once until its reset time changes, including across app restarts.
+Use **Quota alerts** to choose a remaining-quota threshold of 10%, 20%, or 30%. Alerts are off by default. Each provider and quota window is notified only once until its reset time changes, including across app restarts. **Notify on reset** is off by default. It sends a notification after a fresh reading confirms that a previously observed quota window has reset.
 
-In Simplified Chinese, the compact taskbar rows use `5h` / `7d`, remaining percentage, and a concrete local reset value such as `18:30重置` or `07/17重置`.
+In Simplified Chinese, the compact taskbar rows use `5h` / `7d`, the selected percentage, and a concrete local reset value such as `18:30重置` or `07/17重置`.
 
 Percentages use fixed digit columns, so the reset text does not shift when a value changes from `9%` to `10%`.
 
@@ -137,14 +137,16 @@ Each enabled service keeps its own data, last successful update, error, and retr
 
 | Display | Meaning |
 | --- | --- |
-| `--` and an empty bar | The service did not report this quota window. For example, some Codex accounts only have a weekly limit. |
-| `*` after the reset text | The latest refresh failed or the data is old. The numbers are from the last successful refresh. |
+| `--` and an empty bar | Quota is unavailable, or the window reset at least five minutes ago and the new reading is pending. |
+| `*` after the reading | The number is stale. If the window reset since the last reading, its reset time is hidden while the new reading is pending. |
+| `<1%` | A positive balance or usage below 1%. |
 | `!`, `NET`, `429`, `5XX`, or `ERR` (Chinese: `!`, `网络`, `限流`, `服务`, `错误`) | The service has not returned data yet since the app started, and the label shows why. |
 
-Hover over a service column to see when it last updated successfully, when it refreshes or retries next, and the latest error. Missing Codex windows also get a short explanation.
+Hover over a service column to see when it last updated successfully, when it refreshes or retries next, and the latest error. The tooltip also explains missing or expired quota windows.
 
 Refresh behavior:
 
+- Double-click the quota area of the widget to refresh it.
 - **Update frequency** sets the normal interval. **Refresh every minute when remaining ≤20%** is on by default. It refreshes a service every minute while one of its quota windows has 20% or less left. A service with a used-up window keeps the normal interval, because it cannot use more quota until the reset.
 - Network and server errors retry with increasing delays. When a server answers `429` with a `Retry-After` time, the app waits until that time.
 - When a login expires or credentials are missing, the app stops retrying that service until its credentials file changes or you choose **Refresh**.
@@ -152,7 +154,13 @@ Refresh behavior:
 
 ### Appearance
 
-Right-click the widget or tray icon and open **Appearance** to choose a system, high-contrast dark, or high-contrast light palette; continuous or segmented bars; standard or slim bars; and standard or larger text. High-contrast palettes add a solid backdrop and bold text for readability over translucent taskbars. The **Recommended: translucent dark taskbar** action applies high-contrast dark colors, slim continuous rounded bars, and larger text. The widget also fits its height to the selected taskbar, avoiding clipped rows on 40-pixel taskbars. Appearance choices are saved in `settings.json`; existing settings keep their previous appearance until changed.
+Right-click the widget or tray icon and open **Settings → Appearance** to choose a system, high-contrast dark, or high-contrast light palette; continuous, segmented, or classic tiled bars; standard or slim bars; and standard or larger text. High-contrast palettes add a solid backdrop and bold text for readability over translucent taskbars. The **Translucent dark preset** action applies high-contrast dark colors, slim continuous rounded bars, and larger text. The widget also fits its height to the selected taskbar, avoiding clipped rows on 40-pixel taskbars. Use **Show provider logos** to control icon spacing. **Codex colors** lets you adjust and save independent Codex icon, bar, and percentage colors. **Compact layout** stacks quota labels over their bars when one service is enabled in Simplified Chinese. See [appearance customization](docs/appearance-customization.md).
+
+### Privacy and local MCP
+
+**Settings → Privacy & updates** controls passive monitoring and application updates. Passive monitoring is on by default. It uses usage endpoints and pauses authentication retries on sign-in failures. See [managed installation and policy](docs/installation.md#managed-installations).
+
+**Settings → Privacy & updates → Local MCP server for AI agents** enables read-only Codex and Claude Code quota tools over loopback. It defaults to off. See the [MCP setup guide](docs/mcp.md).
 
 ## Diagnostics
 
