@@ -1454,37 +1454,6 @@ fn update_language_change() -> bool {
     true
 }
 
-fn version_action_label(
-    strings: Strings,
-    language: LanguageId,
-    install_channel: InstallChannel,
-    status: &UpdateStatus,
-) -> String {
-    let current = env!("CARGO_PKG_VERSION");
-    if !crate::privacy::updates_enabled() {
-        return format!("v{current}");
-    }
-    match status {
-        UpdateStatus::Idle => format!("v{current} - {}", strings.check_for_updates),
-        UpdateStatus::Checking => format!("v{current} - {}", strings.checking_for_updates),
-        UpdateStatus::Applying => format!("v{current} - {}", strings.applying_update),
-        UpdateStatus::UpToDate => format!("v{current} - {}", strings.up_to_date_short),
-        UpdateStatus::Available(release) => match install_channel {
-            InstallChannel::Portable => {
-                format!(
-                    "v{current} - {} v{}",
-                    strings.update_to, release.latest_version
-                )
-            }
-            InstallChannel::Winget => format!(
-                "v{current} - {} v{}",
-                localization::update_via_winget(language),
-                release.latest_version
-            ),
-        },
-    }
-}
-
 fn begin_update_check(hwnd: HWND, interactive: bool) {
     if !crate::privacy::updates_enabled() {
         return;
@@ -2521,12 +2490,12 @@ fn apply_mcp_setting() {
     }
 }
 
-fn mcp_settings_label(chinese: bool, unavailable: bool, port: u16) -> String {
+fn mcp_settings_hint(chinese: bool, unavailable: bool, port: u16) -> String {
     match (chinese, unavailable) {
-        (false, false) => "Local MCP server for AI agents (read-only)".into(),
-        (false, true) => format!("Local MCP server (read-only): port {port} is unavailable"),
-        (true, false) => "供 AI 代理使用的本地 MCP 服务（只读）".into(),
-        (true, true) => format!("本地 MCP 服务（只读）：端口 {port} 不可用"),
+        (false, false) => format!("Lets AI agents read usage data (read-only, port {port})"),
+        (false, true) => format!("Port {port} is unavailable"),
+        (true, false) => format!("供 AI 代理只读查询用量（端口 {port}）"),
+        (true, true) => format!("端口 {port} 不可用"),
     }
 }
 
@@ -5722,7 +5691,7 @@ mod tests {
         // Privileged or zero ports fall back to the default.
         assert_eq!(mcp_port(Some(80)), mcp_server::DEFAULT_PORT);
         assert_eq!(mcp_port(Some(0)), mcp_server::DEFAULT_PORT);
-        assert!(mcp_settings_label(false, true, 47000).contains("47000"));
+        assert!(mcp_settings_hint(false, true, 47000).contains("47000"));
     }
     #[test]
     fn hiding_provider_logos_reclaims_their_columns() {
