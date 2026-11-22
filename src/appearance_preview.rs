@@ -10,12 +10,32 @@ fn sample(
 ) -> WidgetContent<'static> {
     let strings = language.strings();
     let suffixes = [strings.hour_suffix, strings.day_suffix];
+    let today = SYSTEMTIME {
+        wYear: 2026,
+        wMonth: 11,
+        wDay: 22,
+        ..Default::default()
+    };
     let text = std::array::from_fn(|row| {
         std::array::from_fn(|column| {
             let remaining = 100.0 - USED[row][column];
             let time = column + 1;
-            let suffix = suffixes[row];
-            format!("{remaining:.0}% {time}{suffix}").into()
+            let reset = if appearance.reset_time_display == ResetTimeDisplay::Clock {
+                let reset = SYSTEMTIME {
+                    wDay: if row == 0 {
+                        today.wDay
+                    } else {
+                        28 + column as u16
+                    },
+                    wHour: 20 + column as u16,
+                    wMinute: 4,
+                    ..today
+                };
+                short_reset_time(reset, today, row == 1)
+            } else {
+                format!("{time}{}", suffixes[row])
+            };
+            format!("{remaining:.0}% {reset}").into()
         })
     });
     WidgetContent {
@@ -113,10 +133,40 @@ mod tests {
                 );
             }
         }
+        for (language, reset_time_display) in [
+            (LanguageId::SimplifiedChinese, ResetTimeDisplay::Countdown),
+            (LanguageId::SimplifiedChinese, ResetTimeDisplay::Clock),
+            (LanguageId::English, ResetTimeDisplay::Clock),
+        ] {
+            for (font_size, dark) in [(FontSize::Px12, true), (FontSize::Px16, false)] {
+                let appearance = Appearance {
+                    bar_style: BarStyle::Battery,
+                    bar_thickness: BarThickness::Thin,
+                    font_size,
+                    hide_period_labels: true,
+                    percent_inside_battery: true,
+                    reset_time_display,
+                    ..Appearance::default()
+                };
+                let name = format!(
+                    "compact-{language:?}-{reset_time_display:?}-{}.bmp",
+                    font_size.px()
+                );
+                render_fixture_in_language(&directory.join(name), appearance, dark, language);
+            }
+        }
     }
 
     fn render_fixture(path: &std::path::Path, appearance: Appearance, dark: bool) {
-        let language = LanguageId::SimplifiedChinese;
+        render_fixture_in_language(path, appearance, dark, LanguageId::SimplifiedChinese);
+    }
+
+    fn render_fixture_in_language(
+        path: &std::path::Path,
+        appearance: Appearance,
+        dark: bool,
+        language: LanguageId,
+    ) {
         let width = total_widget_width_for(3, language, appearance);
         let height = sc(WIDGET_HEIGHT);
         unsafe {
@@ -194,15 +244,14 @@ mod tests {
         let (background, _, _) = appearance_colors(appearance, dark);
         let bg = dib_rgb(background);
         let pixel = |x, y| pixels[(y * width + x) as usize] & 0x00FFFFFF;
-        let (label_width, text_width) = usage_layout_widths(content.language, appearance);
+        let (label_width, text_width) = usage_layout_widths(content.language, appearance, false);
         let segments = row_bar_segment_count(3);
-        let bar_width = usage_bar_width(segments);
+        let bar_width = usage_bar_width(segments, appearance);
         let model_width =
             model_usage_width(segments, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
         let bar_left = sc(LEFT_DIVIDER_W)
             + sc(DIVIDER_RIGHT_MARGIN)
-            + label_width
-            + sc(LABEL_RIGHT_MARGIN)
+            + period_label_column_width(label_width, appearance)
             + provider_mark_width(appearance);
         let row_height = appearance.row_height();
         let gap = (height - 2 * row_height).clamp(0, sc(5));
@@ -226,7 +275,9 @@ mod tests {
                             "bar outside its vertical bounds in {}",
                             path.display()
                         );
-                        assert_ne!(color, 0, "black pixel in bar of {}", path.display());
+                        if !appearance.shows_percent_in_battery() {
+                            assert_ne!(color, 0, "black pixel in bar of {}", path.display());
+                        }
                         lit_pixels += usize::from(color == accent);
                     }
                 }

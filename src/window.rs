@@ -5,7 +5,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use windows::core::PCWSTR;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
@@ -14,7 +14,7 @@ use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
-use windows::Win32::UI::Shell::ExtractIconExW;
+use windows::Win32::UI::Shell::{ExtractIconExW, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::codex_colors::{codex_brand_color, SingleColor};
@@ -199,6 +199,12 @@ const IDM_SINGLE_COLOR_LAST: u16 = IDM_SINGLE_COLOR_FIRST + SingleColor::ALL.len
 const IDM_THEME_SYSTEM: u16 = 122;
 const IDM_THEME_LIGHT: u16 = 123;
 const IDM_THEME_DARK: u16 = 124;
+const IDM_PERIOD_LABELS: u16 = 125;
+const IDM_PERCENT_OUTSIDE_BATTERY: u16 = 126;
+const IDM_PERCENT_INSIDE_BATTERY: u16 = 127;
+const IDM_RESET_COUNTDOWN: u16 = 128;
+const IDM_RESET_CLOCK: u16 = 129;
+const IDM_WINDOWS_STARTUP_SETTINGS: u16 = 130;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
@@ -496,6 +502,14 @@ fn remaining_bar_color(remaining: f64, dark: bool) -> Color {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResetTimeDisplay {
+    #[default]
+    Countdown,
+    Clock,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct Appearance {
     palette: Palette,
@@ -505,6 +519,9 @@ struct Appearance {
     color_mode: ColorMode,
     single_color: SingleColor,
     hide_provider_logos: bool,
+    hide_period_labels: bool,
+    percent_inside_battery: bool,
+    reset_time_display: ResetTimeDisplay,
 }
 
 impl Appearance {
@@ -527,6 +544,10 @@ impl Appearance {
 
     fn font_px(self) -> i32 {
         self.font_size.px()
+    }
+
+    fn shows_percent_in_battery(self) -> bool {
+        self.bar_style == BarStyle::Battery && self.percent_inside_battery
     }
 
     fn row_height(self) -> i32 {
@@ -812,6 +833,39 @@ fn format_local_system_time(local: SYSTEMTIME) -> String {
         "{:04}-{:02}-{:02} {:02}:{:02}",
         local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute
     )
+}
+
+fn short_reset_time(reset: SYSTEMTIME, today: SYSTEMTIME, weekly: bool) -> String {
+    let reset_date = (reset.wYear, reset.wMonth, reset.wDay);
+    let today_date = (today.wYear, today.wMonth, today.wDay);
+    let clock = format!("{:02}:{:02}", reset.wHour, reset.wMinute);
+    let date = format!("{:02}/{:02}", reset.wMonth, reset.wDay);
+    if weekly {
+        date
+    } else if reset_date == today_date {
+        clock
+    } else {
+        format!("{date} {clock}")
+    }
+}
+
+fn clock_quota_line(
+    section: &crate::models::UsageSection,
+    mode: QuotaDisplayMode,
+    today: SYSTEMTIME,
+    weekly: bool,
+) -> String {
+    if !section.has_reading() {
+        return "--".into();
+    }
+    let percent = poller::format_percent(mode.percentage(section.percentage));
+    match section
+        .resets_at
+        .and_then(native_interop::system_time_to_local)
+    {
+        Some(reset) => format!("{percent}  {}", short_reset_time(reset, today, weekly)),
+        None => percent,
+    }
 }
 
 fn service_tooltip(
@@ -1318,13 +1372,14 @@ fn window_text(
     }
 }
 
-/// Tooltip lines explaining `--` and rollover values of a provider's windows.
+/// Tooltip lines for reset times and unavailable or rolled-over quota windows.
 fn window_notes(
     usage: &crate::models::UsageData,
     observed_at: Option<SystemTime>,
     now: SystemTime,
-    chinese: bool,
+    language: LanguageId,
 ) -> Vec<String> {
+    let chinese = language == LanguageId::SimplifiedChinese;
     let mut notes = Vec::new();
     for (section, weekly) in [(&usage.session, false), (&usage.weekly, true)] {
         if !section.has_reading() {
@@ -1332,6 +1387,17 @@ fn window_notes(
             continue;
         }
         if window_reset(section.resets_at, observed_at, now) == WindowReset::Current {
+            if let Some(at) = format_precise_reset_time(section.resets_at.filter(|&t| t > now)) {
+                let label = match (language, weekly) {
+                    (LanguageId::SimplifiedChinese, false) => "5 小时额度重置",
+                    (LanguageId::SimplifiedChinese, true) => "周额度重置",
+                    (LanguageId::TraditionalChinese, false) => "5 小時額度重置",
+                    (LanguageId::TraditionalChinese, true) => "每週額度重置",
+                    (_, false) => "5-hour reset",
+                    (_, true) => "Weekly reset",
+                };
+                notes.push(format!("{label} · {at}"));
+            }
             continue;
         }
         let at = format_precise_reset_time(section.resets_at).unwrap_or_default();
@@ -1351,12 +1417,14 @@ fn window_notes(
 
 fn refresh_usage_texts(state: &mut AppState) -> bool {
     let strings = state.language.strings();
-    let show_local_reset = state.language == LanguageId::SimplifiedChinese;
     let Some(data) = state.data.as_ref() else {
         return false;
     };
     let mut changed = false;
     let now = SystemTime::now();
+    let local_today = (state.appearance.reset_time_display == ResetTimeDisplay::Clock)
+        .then(|| native_interop::system_time_to_local(now))
+        .flatten();
     for (id, visible, usage, session, weekly) in [
         (
             0,
@@ -1388,18 +1456,16 @@ fn refresh_usage_texts(state: &mut AppState) -> bool {
         if let Some(usage) = usage.filter(|_| !antigravity || service.error.is_none()) {
             let observed_at = service.history.last_success;
             let stale = service.stale(now);
-            for (output, section, window) in [
-                (session, &usage.session, poller::UsageWindowKind::Session),
-                (weekly, &usage.weekly, poller::UsageWindowKind::Weekly),
+            for (weekly, output, section) in [
+                (false, session, &usage.session),
+                (true, weekly, &usage.weekly),
             ] {
                 let mut text = window_text(section, observed_at, now, |section| {
-                    poller::format_quota_line(
-                        section,
-                        strings,
-                        show_local_reset,
-                        state.quota_display_mode,
-                        window,
-                    )
+                    if let Some(today) = local_today {
+                        clock_quota_line(section, state.quota_display_mode, today, weekly)
+                    } else {
+                        poller::format_quota_line(section, strings, state.quota_display_mode, now)
+                    }
                 });
                 quota_refresh::mark_stale(&mut text, stale);
                 changed |= *output != text;
@@ -1678,16 +1744,50 @@ fn begin_winget_update(hwnd: HWND) {
 const STARTUP_REGISTRY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const STARTUP_REGISTRY_KEY: &str = "CodexUsage";
 const LEGACY_STARTUP_REGISTRY_KEY: &str = "ClaudeCodeUsageMonitor";
+const STARTUP_APPROVAL_PATH: PCWSTR =
+    w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run");
+static STARTUP_WRITE_FAILED: AtomicBool = AtomicBool::new(false);
 
-/// Returns true only if the startup registry value points to this executable.
-fn is_startup_enabled() -> bool {
-    let Some(reg_value) = read_startup_value(STARTUP_REGISTRY_KEY) else {
-        return false;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartupStatus {
+    Off,
+    Enabled,
+    Blocked,
+}
+
+fn startup_status() -> StartupStatus {
+    let registered = read_startup_value(STARTUP_REGISTRY_KEY)
+        .zip(current_exe_path_string())
+        .is_some_and(|(command, exe)| startup_command_matches(&command, &exe));
+    if !registered {
+        StartupStatus::Off
+    } else if startup_blocked_by_windows() {
+        StartupStatus::Blocked
+    } else {
+        StartupStatus::Enabled
+    }
+}
+
+fn startup_blocked_by_windows() -> bool {
+    let mut entry = [0u8; 12];
+    let mut size = entry.len() as u32;
+    let name = native_interop::wide_str(STARTUP_REGISTRY_KEY);
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            STARTUP_APPROVAL_PATH,
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_BINARY,
+            None,
+            Some(entry.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
     };
-    let Some(current_exe) = current_exe_path_string() else {
-        return false;
-    };
-    startup_command_matches(&reg_value, &current_exe)
+    result.is_ok() && startup_approval_is_disabled(&entry[..size as usize])
+}
+
+fn startup_approval_is_disabled(entry: &[u8]) -> bool {
+    matches!(entry.get(..4), Some([3 | 7, 0, 0, 0]))
 }
 
 fn startup_command_matches(value: &str, exe: &str) -> bool {
@@ -1788,7 +1888,7 @@ fn migrate_legacy_startup_entry() {
     }
 
     if should_write_migrated_startup(legacy_exists, current_exists) {
-        set_startup_enabled(true);
+        let _ = set_startup_enabled(true);
     }
 
     if read_startup_value(STARTUP_REGISTRY_KEY).is_some() {
@@ -1801,52 +1901,67 @@ fn should_write_migrated_startup(legacy_exists: bool, current_exists: bool) -> b
     legacy_exists && !current_exists
 }
 
-fn set_startup_enabled(enable: bool) {
+fn set_startup_enabled(enable: bool) -> bool {
     unsafe {
         let path = native_interop::wide_str(STARTUP_REGISTRY_PATH);
-
         let mut hkey = HKEY::default();
-        let result = RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR::from_raw(path.as_ptr()),
-            0,
-            KEY_SET_VALUE,
-            &mut hkey,
-        );
+        let result = if enable {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(path.as_ptr()),
+                0,
+                None,
+                REG_OPTION_NON_VOLATILE,
+                KEY_SET_VALUE,
+                None,
+                &mut hkey,
+                None,
+            )
+        } else {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(path.as_ptr()),
+                0,
+                KEY_SET_VALUE,
+                &mut hkey,
+            )
+        };
         if result.is_err() {
-            return;
+            return !enable && result == ERROR_FILE_NOT_FOUND;
         }
 
         let key_name = native_interop::wide_str(STARTUP_REGISTRY_KEY);
-
-        if enable {
-            let mut exe_buf = [0u16; 260];
-            let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
-            if len > 0 {
-                // Quoting also supports installation paths containing spaces.
-                let command = native_interop::wide_str(&format!(
-                    "\"{}\"",
-                    String::from_utf16_lossy(&exe_buf[..len])
-                ));
-                let byte_len = (command.len() * 2) as u32;
-                let _ = RegSetValueExW(
+        let written = if enable {
+            current_exe_path_string().is_some_and(|exe| {
+                let command = native_interop::wide_str(&format!("\"{exe}\""));
+                RegSetValueExW(
                     hkey,
                     PCWSTR::from_raw(key_name.as_ptr()),
                     0,
                     REG_SZ,
                     Some(std::slice::from_raw_parts(
                         command.as_ptr() as *const u8,
-                        byte_len as usize,
+                        command.len() * 2,
                     )),
-                );
-            }
+                )
+                .is_ok()
+            })
         } else {
-            let _ = RegDeleteValueW(hkey, PCWSTR::from_raw(key_name.as_ptr()));
+            let removed = RegDeleteValueW(hkey, PCWSTR::from_raw(key_name.as_ptr()));
             let legacy_key_name = native_interop::wide_str(LEGACY_STARTUP_REGISTRY_KEY);
-            let _ = RegDeleteValueW(hkey, PCWSTR::from_raw(legacy_key_name.as_ptr()));
-        }
+            let legacy_removed = RegDeleteValueW(hkey, PCWSTR::from_raw(legacy_key_name.as_ptr()));
+            [removed, legacy_removed]
+                .into_iter()
+                .all(|result| result.is_ok() || result == ERROR_FILE_NOT_FOUND)
+        };
 
         let _ = RegCloseKey(hkey);
+        written
+            && if enable {
+                startup_status() != StartupStatus::Off
+            } else {
+                read_startup_value(STARTUP_REGISTRY_KEY).is_none()
+            }
     }
 }
 
@@ -1912,23 +2027,30 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
 }
 
 /// Labels and reset texts that can occupy the widest space in each column.
-fn usage_layout_samples(language: LanguageId) -> (Vec<&'static str>, Vec<String>) {
+fn usage_layout_samples(
+    language: LanguageId,
+    reset_time_display: ResetTimeDisplay,
+    cross_day: bool,
+) -> (Vec<&'static str>, Vec<String>) {
     let strings = language.strings();
     let labels = vec![strings.session_window, strings.weekly_window];
-    let resets = if language == LanguageId::SimplifiedChinese {
-        vec!["23:59重置 *".to_string(), "12/31重置 *".to_string()]
-    } else {
-        [
-            strings.day_suffix,
-            strings.hour_suffix,
-            strings.minute_suffix,
-            strings.second_suffix,
-        ]
-        .into_iter()
-        .map(|suffix| format!("99{suffix} *"))
-        .chain(std::iter::once(format!("{} *", strings.now)))
-        .collect()
-    };
+    if reset_time_display == ResetTimeDisplay::Clock {
+        let mut resets = vec!["88/88 *".into(), "88:88 *".into()];
+        if cross_day {
+            resets.push("88/88 88:88 *".into());
+        }
+        return (labels, resets);
+    }
+    let resets = [
+        strings.day_suffix,
+        strings.hour_suffix,
+        strings.minute_suffix,
+        strings.second_suffix,
+    ]
+    .into_iter()
+    .map(|suffix| format!("99{suffix} *"))
+    .chain(std::iter::once(format!("{} *", strings.now)))
+    .collect();
     (labels, resets)
 }
 
@@ -1958,9 +2080,17 @@ unsafe fn create_widget_font(appearance: Appearance) -> HFONT {
 
 /// Label and quota-text column widths in physical pixels, measured with the
 /// fonts used for drawing so larger text and longer translations still fit.
-fn usage_layout_widths(language: LanguageId, appearance: Appearance) -> (i32, i32) {
-    let reset_x = sc(quota_text::reset_offset(appearance.font_px()));
-    let fallback = if language == LanguageId::SimplifiedChinese {
+fn usage_layout_widths(
+    language: LanguageId,
+    appearance: Appearance,
+    cross_day: bool,
+) -> (i32, i32) {
+    let reset_x = if appearance.shows_percent_in_battery() {
+        0
+    } else {
+        sc(quota_text::reset_offset(appearance.font_px()))
+    };
+    let (fallback_label, fallback_text) = if language == LanguageId::SimplifiedChinese {
         (
             sc(SIMPLIFIED_CHINESE_LABEL_WIDTH),
             sc(SIMPLIFIED_CHINESE_TEXT_WIDTH),
@@ -1968,6 +2098,14 @@ fn usage_layout_widths(language: LanguageId, appearance: Appearance) -> (i32, i3
     } else {
         (sc(LABEL_WIDTH), sc(TEXT_WIDTH))
     };
+    let fallback = (
+        fallback_label,
+        if appearance.reset_time_display == ResetTimeDisplay::Clock {
+            fallback_text.max(reset_x + sc(13 * appearance.font_px() + 3))
+        } else {
+            fallback_text
+        },
+    );
     unsafe {
         let hdc = GetDC(HWND::default());
         if hdc.is_invalid() {
@@ -1991,7 +2129,8 @@ fn usage_layout_widths(language: LanguageId, appearance: Appearance) -> (i32, i3
             let _ = DeleteObject(font);
             widest
         };
-        let (labels, resets) = usage_layout_samples(language);
+        let (labels, resets) =
+            usage_layout_samples(language, appearance.reset_time_display, cross_day);
         let label_font = create_widget_font(appearance);
         let reset_font = quota_text::create_reset_font(sc(appearance.font_px()));
         let widths = if label_font.is_invalid() || reset_font.is_invalid() {
@@ -2012,30 +2151,81 @@ fn usage_layout_widths(language: LanguageId, appearance: Appearance) -> (i32, i3
     }
 }
 
+fn period_label_column_width(label_width: i32, appearance: Appearance) -> i32 {
+    if appearance.hide_period_labels {
+        0
+    } else {
+        label_width + sc(LABEL_RIGHT_MARGIN)
+    }
+}
+
 fn total_widget_width_for(active_models: i32, language: LanguageId, appearance: Appearance) -> i32 {
+    widget_width_from_columns(
+        active_models,
+        appearance,
+        usage_layout_widths(language, appearance, false),
+    )
+}
+
+fn widget_width_from_columns(
+    active_models: i32,
+    appearance: Appearance,
+    (label_width, text_width): (i32, i32),
+) -> i32 {
     let bar_segments = row_bar_segment_count(active_models);
-    let (label_width, text_width) = usage_layout_widths(language, appearance);
     let model_width = model_usage_width(bar_segments, text_width, appearance);
 
     sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
-        + label_width
-        + sc(LABEL_RIGHT_MARGIN)
+        + period_label_column_width(label_width, appearance)
         + model_width * active_models
         + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
         + sc(RIGHT_MARGIN)
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(
+    widget_width_from_columns(
         active_model_count(
             state.show_claude_code,
             state.show_codex,
             state.show_antigravity,
         ),
-        state.language,
         state.appearance,
+        current_usage_layout_widths(state),
     )
+}
+
+fn has_cross_day_reset(
+    appearance: Appearance,
+    session_visible: bool,
+    providers: [bool; 3],
+    session: [&str; 3],
+) -> bool {
+    appearance.reset_time_display == ResetTimeDisplay::Clock
+        && session_visible
+        && providers.into_iter().zip(session).any(|(visible, value)| {
+            let reset = quota_text::parts(value).1.as_bytes();
+            // Cross-day session labels start with MM/DD HH:MM.
+            visible && reset.get(2) == Some(&b'/') && reset.get(8) == Some(&b':')
+        })
+}
+
+fn current_usage_layout_widths(state: &AppState) -> (i32, i32) {
+    let cross_day = has_cross_day_reset(
+        state.appearance,
+        state.show_session_window,
+        [
+            state.show_claude_code,
+            state.show_codex,
+            state.show_antigravity,
+        ],
+        [
+            &state.session_text,
+            &state.codex_session_text,
+            &state.antigravity_session_text,
+        ],
+    );
+    usage_layout_widths(state.language, state.appearance, cross_day)
 }
 
 fn total_widget_width() -> i32 {
@@ -2449,12 +2639,11 @@ fn update_quota_tooltips() {
         if !s.dragging {
             let chinese = s.language == LanguageId::SimplifiedChinese;
             let count = active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity);
-            let (label_width, text_width) = usage_layout_widths(s.language, s.appearance);
+            let (label_width, text_width) = current_usage_layout_widths(s);
             let width = model_usage_width(row_bar_segment_count(count), text_width, s.appearance);
             let mut left = sc(LEFT_DIVIDER_W)
                 + sc(DIVIDER_RIGHT_MARGIN)
-                + label_width
-                + sc(LABEL_RIGHT_MARGIN);
+                + period_label_column_width(label_width, s.appearance);
             let antigravity_name = antigravity_label(s);
             for (id, visible, name, session) in [
                 (0, s.show_claude_code, "Claude Code", &s.session_text),
@@ -2485,7 +2674,7 @@ fn update_quota_tooltips() {
                     .as_ref()
                     .filter(|_| id != 2 || service.error.is_none())
                 {
-                    for note in window_notes(usage, service.history.last_success, now, chinese) {
+                    for note in window_notes(usage, service.history.last_success, now, s.language) {
                         text.push('\n');
                         text.push_str(&note);
                     }
@@ -2708,7 +2897,22 @@ fn paint_content(hdc: HDC, width: i32, height: i32, content: &WidgetContent<'_>)
         .max(1) as i32;
     let is_dark = appearance.is_dark(system_dark);
     let (bg, text_color, track) = appearance_colors(appearance, system_dark);
-    let (label_width, text_width) = usage_layout_widths(language, appearance);
+    let cross_day = has_cross_day_reset(
+        appearance,
+        visible_rows[0],
+        providers,
+        text[0].each_ref().map(|value| value.as_ref()),
+    );
+    let (label_width, text_width) = usage_layout_widths(language, appearance, cross_day);
+    let active_models = providers
+        .into_iter()
+        .filter(|visible| *visible)
+        .count()
+        .max(1) as i32;
+    let segment_count = row_bar_segment_count(active_models);
+    let bar_width = usage_bar_width(segment_count, appearance);
+    let model_width =
+        model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
     appearance.font_size = appearance.font_size.fit(height, rows, sc);
 
     unsafe {
@@ -2773,15 +2977,7 @@ fn paint_content(hdc: HDC, width: i32, height: i32, content: &WidgetContent<'_>)
         let font = create_widget_font(appearance);
         let old_font = SelectObject(hdc, font);
 
-        let active_models = providers
-            .into_iter()
-            .filter(|visible| *visible)
-            .count()
-            .max(1) as i32;
-        let segment_count = row_bar_segment_count(active_models);
-        let model_width =
-            model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
-        let model_left = content_x + label_width + sc(LABEL_RIGHT_MARGIN);
+        let model_left = content_x + period_label_column_width(label_width, appearance);
         if !appearance.hide_provider_logos {
             let size = sc(provider_icons::SIZE).min(height);
             let mut icon_x = model_left;
@@ -2802,19 +2998,21 @@ fn paint_content(hdc: HDC, width: i32, height: i32, content: &WidgetContent<'_>)
             if !visible_rows[row] {
                 continue;
             }
-            let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-            let mut label_wide: Vec<u16> = label.encode_utf16().collect();
-            let _ = DrawTextW(
-                hdc,
-                &mut label_wide,
-                &mut RECT {
-                    left: content_x,
-                    top: row_y,
-                    right: content_x + label_width,
-                    bottom: row_y + row_height,
-                },
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-            );
+            if !appearance.hide_period_labels {
+                let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+                let mut label_wide: Vec<u16> = label.encode_utf16().collect();
+                let _ = DrawTextW(
+                    hdc,
+                    &mut label_wide,
+                    &mut RECT {
+                        left: content_x,
+                        top: row_y,
+                        right: content_x + label_width,
+                        bottom: row_y + row_height,
+                    },
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                );
+            }
             let mut model_x = model_left + provider_mark_width(appearance);
             for (column, provider) in WIDGET_PROVIDERS.into_iter().enumerate() {
                 if !providers[column] {
@@ -2835,6 +3033,7 @@ fn paint_content(hdc: HDC, width: i32, height: i32, content: &WidgetContent<'_>)
                     row_y,
                     row_height,
                     segment_count,
+                    bar_width,
                     mode.percentage(used),
                     &text[row][column],
                     &appearance.bar_color(provider, used, is_dark),
@@ -3571,10 +3770,10 @@ unsafe extern "system" fn wnd_proc(
             let click_in_content = {
                 let state = lock_state();
                 state.as_ref().is_some_and(|s| {
-                    let (label_width, _) = usage_layout_widths(s.language, s.appearance);
+                    let (label_width, _) = usage_layout_widths(s.language, s.appearance, false);
                     !s.dragging
-                        && x >= sc(LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN + LABEL_RIGHT_MARGIN)
-                            + label_width
+                        && x >= sc(LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN)
+                            + period_label_column_width(label_width, s.appearance)
                 })
             };
             if click_in_content {
@@ -3852,9 +4051,18 @@ unsafe extern "system" fn wnd_proc(
                     apply_mcp_setting();
                 }
                 IDM_START_WITH_WINDOWS => {
-                    let enabled = !is_startup_enabled();
-                    set_startup_enabled(enabled);
-                    settings_window::note_save_result(is_startup_enabled() == enabled);
+                    let enable = startup_status() != StartupStatus::Enabled;
+                    STARTUP_WRITE_FAILED.store(!set_startup_enabled(enable), Ordering::Relaxed);
+                }
+                IDM_WINDOWS_STARTUP_SETTINGS => {
+                    let _ = ShellExecuteW(
+                        hwnd,
+                        w!("open"),
+                        w!("ms-settings:startupapps"),
+                        None,
+                        None,
+                        SW_SHOWNORMAL,
+                    );
                 }
                 IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
                     let new_interval = match id {
@@ -3954,7 +4162,12 @@ unsafe extern "system" fn wnd_proc(
                 | IDM_COLOR_REMAINING
                 | IDM_COLOR_SINGLE
                 | IDM_SINGLE_COLOR_FIRST..=IDM_SINGLE_COLOR_LAST
-                | IDM_PROVIDER_LOGOS => {
+                | IDM_PROVIDER_LOGOS
+                | IDM_PERIOD_LABELS
+                | IDM_PERCENT_OUTSIDE_BATTERY
+                | IDM_PERCENT_INSIDE_BATTERY
+                | IDM_RESET_COUNTDOWN
+                | IDM_RESET_CLOCK => {
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
@@ -3966,6 +4179,20 @@ unsafe extern "system" fn wnd_proc(
                                 IDM_PROVIDER_LOGOS => {
                                     s.appearance.hide_provider_logos =
                                         !s.appearance.hide_provider_logos
+                                }
+                                IDM_PERIOD_LABELS => {
+                                    s.appearance.hide_period_labels =
+                                        !s.appearance.hide_period_labels;
+                                }
+                                IDM_PERCENT_OUTSIDE_BATTERY | IDM_PERCENT_INSIDE_BATTERY => {
+                                    s.appearance.percent_inside_battery =
+                                        id == IDM_PERCENT_INSIDE_BATTERY;
+                                }
+                                IDM_RESET_COUNTDOWN => {
+                                    s.appearance.reset_time_display = ResetTimeDisplay::Countdown
+                                }
+                                IDM_RESET_CLOCK => {
+                                    s.appearance.reset_time_display = ResetTimeDisplay::Clock
                                 }
                                 IDM_PALETTE_SYSTEM => s.appearance.palette = Palette::System,
                                 IDM_PALETTE_DARK => {
@@ -3998,9 +4225,12 @@ unsafe extern "system" fn wnd_proc(
                         }
                     }
                     save_state_settings();
-                    // Font size and weight change the measured widget width.
+                    let text_changed = update_display();
                     position_at_taskbar();
                     render_layered();
+                    if text_changed {
+                        sync_tray_icons(hwnd);
+                    }
                 }
                 IDM_ALERT_RESET => {
                     if let Some(s) = lock_state().as_mut() {
@@ -4285,8 +4515,14 @@ fn segment_width(segment_count: i32) -> i32 {
     })
 }
 
-fn usage_bar_width(segment_count: i32) -> i32 {
-    segment_count * segment_width(segment_count) + (segment_count - 1) * sc(SEGMENT_GAP)
+fn usage_bar_width(segment_count: i32, appearance: Appearance) -> i32 {
+    let width =
+        segment_count * segment_width(segment_count) + (segment_count - 1) * sc(SEGMENT_GAP);
+    if appearance.shows_percent_in_battery() {
+        width.max(sc(quota_text::percent_width(appearance.font_px()) + 7))
+    } else {
+        width
+    }
 }
 
 fn provider_mark_width(appearance: Appearance) -> i32 {
@@ -4299,7 +4535,7 @@ fn provider_mark_width(appearance: Appearance) -> i32 {
 
 fn model_usage_width(segment_count: i32, text_width: i32, appearance: Appearance) -> i32 {
     provider_mark_width(appearance)
-        + usage_bar_width(segment_count)
+        + usage_bar_width(segment_count, appearance)
         + sc(BAR_RIGHT_MARGIN)
         + text_width
 }
@@ -4318,6 +4554,7 @@ fn draw_usage_bar(
     y: i32,
     row_height: i32,
     segment_count: i32,
+    bar_width: i32,
     percent: f64,
     text: &str,
     accent: &Color,
@@ -4328,7 +4565,6 @@ fn draw_usage_bar(
     appearance: Appearance,
 ) {
     let bar_height = appearance.bar_height(row_height);
-    let bar_width = usage_bar_width(segment_count);
     let bar_y = y + (row_height - bar_height) / 2;
     let rect = RECT {
         left: bar_x,
@@ -4338,6 +4574,7 @@ fn draw_usage_bar(
     };
     let ratio = usage_bar_fill_percentage(percent, text) / 100.0;
     let radius = bar_height / 2;
+    let percent_inside = appearance.shows_percent_in_battery();
     match appearance.bar_style {
         BarStyle::Continuous => {
             draw_rounded_rect(hdc, &rect, track, radius);
@@ -4386,7 +4623,25 @@ fn draw_usage_bar(
                 bottom: top + height,
                 ..rect
             };
-            draw_battery(hdc, rect, ratio, accent, track, is_dark)
+            if percent_inside {
+                let (label, reset) = quota_text::parts(text);
+                draw_battery(hdc, rect, ratio, accent, track, is_dark, Some(label));
+                let left = bar_x + bar_width + sc(BAR_RIGHT_MARGIN);
+                quota_text::draw_reset(
+                    hdc,
+                    RECT {
+                        left,
+                        top: y,
+                        right: left + text_width,
+                        bottom: y + row_height,
+                    },
+                    reset,
+                    &reset_text_color(appearance, is_dark),
+                    sc(appearance.font_px()),
+                );
+                return;
+            }
+            draw_battery(hdc, rect, ratio, accent, track, is_dark, None);
         }
     }
 
@@ -4411,6 +4666,9 @@ fn drawn_bar_height(appearance: Appearance, row_height: i32) -> i32 {
     let bar_height = appearance.bar_height(row_height);
     let height = match appearance.bar_style {
         BarStyle::Dots => bar_height.max(sc(6)),
+        BarStyle::Battery if appearance.shows_percent_in_battery() => {
+            (bar_height + sc(4)).max(sc(appearance.font_px() + 4))
+        }
         BarStyle::Battery => bar_height + sc(4),
         BarStyle::Continuous | BarStyle::Segmented => bar_height,
     };
@@ -4433,7 +4691,15 @@ fn draw_ellipse(hdc: HDC, rect: &RECT, color: &Color) {
     }
 }
 
-fn draw_battery(hdc: HDC, rect: RECT, ratio: f64, accent: &Color, track: &Color, dark: bool) {
+fn draw_battery(
+    hdc: HDC,
+    rect: RECT,
+    ratio: f64,
+    accent: &Color,
+    track: &Color,
+    dark: bool,
+    label: Option<&str>,
+) {
     let edge = sc(1);
     let height = rect.bottom - rect.top;
     let terminal_height = (height / 2).max(1);
@@ -4462,8 +4728,12 @@ fn draw_battery(hdc: HDC, rect: RECT, ratio: f64, accent: &Color, track: &Color,
         bottom: body.bottom - edge,
     };
     draw_rounded_rect(hdc, &inside, track, edge);
-    // Preserve a visible fill even at 4 px, where the outline uses two pixels.
-    let vertical_gap = ((height - 2 * edge - 1) / 2).clamp(0, edge);
+    // In compact mode the text sits over two continuous backgrounds.
+    let vertical_gap = if label.is_some() {
+        0
+    } else {
+        ((height - 2 * edge - 1) / 2).clamp(0, edge)
+    };
     let fill = RECT {
         left: inside.left + edge,
         top: inside.top + vertical_gap,
@@ -4471,10 +4741,50 @@ fn draw_battery(hdc: HDC, rect: RECT, ratio: f64, accent: &Color, track: &Color,
         bottom: inside.bottom - vertical_gap,
     };
     fill_rounded_bar(hdc, &fill, ratio, accent, 0);
+    if let Some(label) = label {
+        let filled_right = fill.left + fill_width(&fill, ratio);
+        let regions = [
+            (inside.left, fill.left, track),
+            (fill.left, filled_right, accent),
+            (filled_right, inside.right, track),
+        ];
+        for (left, right, background) in regions {
+            if left >= right {
+                continue;
+            }
+            unsafe {
+                let saved = SaveDC(hdc);
+                if saved != 0 {
+                    let _ = IntersectClipRect(hdc, left, inside.top, right, inside.bottom);
+                    quota_text::draw_centered(hdc, body, label, battery_text_color(background));
+                    let _ = RestoreDC(hdc, saved);
+                }
+            }
+        }
+    }
+}
+
+fn battery_text_color(background: &Color) -> COLORREF {
+    let linear = |channel: u8| {
+        let value = f64::from(channel) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * linear(background.r)
+        + 0.7152 * linear(background.g)
+        + 0.0722 * linear(background.b);
+    COLORREF(if luminance >= 0.179 { 0 } else { 0xFF_FFFF })
+}
+
+fn fill_width(rect: &RECT, fraction: f64) -> i32 {
+    ((rect.right - rect.left) as f64 * fraction).round() as i32
 }
 
 fn fill_rounded_bar(hdc: HDC, rect: &RECT, fraction: f64, color: &Color, radius: i32) {
-    let width = ((rect.right - rect.left) as f64 * fraction).round() as i32;
+    let width = fill_width(rect, fraction);
     if width <= 0 {
         return;
     }
@@ -4656,13 +4966,15 @@ mod tests {
                         font_size,
                         ..Appearance::default()
                     };
-                    let (label_width, text_width) = usage_layout_widths(language, appearance);
+                    let (label_width, text_width) =
+                        usage_layout_widths(language, appearance, false);
                     let reset_width =
                         text_width - sc(quota_text::reset_offset(appearance.font_px()));
                     let label_font = create_widget_font(appearance);
                     let reset_font = quota_text::create_reset_font(sc(appearance.font_px()));
                     assert!(!label_font.is_invalid() && !reset_font.is_invalid());
-                    let (labels, resets) = usage_layout_samples(language);
+                    let (labels, resets) =
+                        usage_layout_samples(language, appearance.reset_time_display, false);
                     for label in labels {
                         let (width, height) = width_of(label_font, label);
                         assert!(width <= label_width, "{language:?}: {label:?}");
@@ -4797,6 +5109,15 @@ mod tests {
     }
 
     #[test]
+    fn windows_startup_approval_detects_disabled_entries() {
+        assert!(startup_approval_is_disabled(&[3, 0, 0, 0, 1, 2, 3, 4]));
+        assert!(startup_approval_is_disabled(&[7, 0, 0, 0]));
+        assert!(!startup_approval_is_disabled(&[2, 0, 0, 0]));
+        assert!(!startup_approval_is_disabled(&[6, 0, 0, 0]));
+        assert!(!startup_approval_is_disabled(&[3]));
+    }
+
+    #[test]
     fn displays_distinct_transient_error_categories() {
         assert_eq!(
             poll_error_display_label(
@@ -4903,15 +5224,113 @@ mod tests {
     }
 
     #[test]
+    fn formats_short_reset_times_without_a_suffix() {
+        let today = SYSTEMTIME {
+            wYear: 2026,
+            wMonth: 11,
+            wDay: 22,
+            wHour: 20,
+            wMinute: 4,
+            ..Default::default()
+        };
+        let week = SYSTEMTIME { wDay: 28, ..today };
+        let tomorrow = SYSTEMTIME {
+            wDay: 23,
+            wHour: 0,
+            wMinute: 30,
+            ..today
+        };
+        assert_eq!(short_reset_time(today, today, false), "20:04");
+        assert_eq!(short_reset_time(week, today, true), "11/28");
+        assert_eq!(short_reset_time(tomorrow, today, false), "11/23 00:30");
+    }
+
+    #[test]
+    fn compact_battery_and_hidden_period_labels_reclaim_widget_width() {
+        let mut appearance = Appearance {
+            bar_style: BarStyle::Battery,
+            ..serde_json::from_str("{}").unwrap()
+        };
+        assert_eq!(appearance.reset_time_display, ResetTimeDisplay::Countdown);
+        assert!(!appearance.hide_period_labels);
+        assert!(!appearance.percent_inside_battery);
+        let language = LanguageId::SimplifiedChinese;
+        let default_width = total_widget_width_for(3, language, appearance);
+        appearance.hide_period_labels = true;
+        let without_labels = total_widget_width_for(3, language, appearance);
+        assert!(without_labels < default_width);
+        appearance.percent_inside_battery = true;
+        let compact = total_widget_width_for(3, language, appearance);
+        assert!(compact < without_labels);
+        appearance.reset_time_display = ResetTimeDisplay::Clock;
+        assert!(total_widget_width_for(3, language, appearance) > compact);
+        let short_clock = usage_layout_widths(language, appearance, false).1;
+        let extended_clock = usage_layout_widths(language, appearance, true).1;
+        assert!(extended_clock > short_clock);
+        let values = ["74%  20:04", "89%  11/23 00:30", "100%  11/28"];
+        assert!(has_cross_day_reset(appearance, true, [true; 3], values));
+        assert!(!has_cross_day_reset(
+            appearance,
+            true,
+            [true, false, true],
+            values
+        ));
+        assert!(!has_cross_day_reset(appearance, false, [true; 3], values));
+        let json = serde_json::to_string(&appearance).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Appearance>(&json).unwrap(),
+            appearance
+        );
+    }
+
+    #[test]
+    fn quota_hover_shows_both_reset_times_to_the_minute() {
+        use crate::models::{UsageData, UsageSection};
+
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let session = now + Duration::from_secs(17_999);
+        let weekly = now + Duration::from_secs(604_799);
+        let mut usage = UsageData {
+            session: UsageSection::reported(20.0, Some(session)),
+            weekly: UsageSection::reported(40.0, Some(weekly)),
+            ..UsageData::default()
+        };
+        let session_time = format_precise_reset_time(Some(session)).unwrap();
+        let weekly_time = format_precise_reset_time(Some(weekly)).unwrap();
+        assert_eq!(
+            window_notes(&usage, Some(now), now, LanguageId::SimplifiedChinese),
+            [
+                format!("5 小时额度重置 · {session_time}"),
+                format!("周额度重置 · {weekly_time}"),
+            ]
+        );
+        assert_eq!(
+            window_notes(&usage, Some(now), now, LanguageId::English),
+            [
+                format!("5-hour reset · {session_time}"),
+                format!("Weekly reset · {weekly_time}"),
+            ]
+        );
+        usage.session.resets_at = None;
+        assert_eq!(
+            window_notes(&usage, Some(now), session, LanguageId::SimplifiedChinese),
+            [format!("周额度重置 · {weekly_time}")]
+        );
+        assert!(
+            window_notes(&usage, Some(now), weekly, LanguageId::SimplifiedChinese)[0]
+                .contains("已于")
+        );
+    }
+
+    #[test]
     fn rollover_shows_stale_readings_then_hides_them_until_a_new_reading_arrives() {
         let reset = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
         let observed = Some(reset - Duration::from_secs(60));
         let reading = crate::models::UsageSection::reported(42.0, Some(reset));
         let chinese = LanguageId::SimplifiedChinese.strings();
         let english = LanguageId::English.strings();
-        let session = poller::UsageWindowKind::Session;
         let at_reset = window_text(&reading, observed, reset, |section| {
-            poller::format_line(section, chinese, true, session)
+            poller::format_quota_line(section, chinese, QuotaDisplayMode::Remaining, reset)
         });
         assert_eq!(at_reset, "58% *");
         assert_eq!(
@@ -4920,12 +5339,12 @@ mod tests {
         );
         let expired = reset + Duration::from_secs(300);
         let after_grace = window_text(&reading, observed, expired, |section| {
-            poller::format_line(section, chinese, true, session)
+            poller::format_quota_line(section, chinese, QuotaDisplayMode::Remaining, expired)
         });
         assert_eq!(after_grace, "--");
         assert_eq!(usage_bar_fill_percentage(58.0, &after_grace), 0.0);
         let new_reading = window_text(&reading, Some(expired), expired, |section| {
-            poller::format_antigravity_line(section, english, false, session)
+            poller::format_quota_line(section, english, QuotaDisplayMode::Remaining, expired)
         });
         assert!(new_reading.starts_with("58%"));
         assert!(!new_reading.ends_with('*'));

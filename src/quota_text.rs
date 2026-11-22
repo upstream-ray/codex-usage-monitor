@@ -15,7 +15,7 @@ fn cell(width: i32, font_px: i32) -> i32 {
     (width * font_px + BASE_FONT_PX - 1) / BASE_FONT_PX
 }
 
-fn percent_width(font_px: i32) -> i32 {
+pub(super) fn percent_width(font_px: i32) -> i32 {
     cell(DIGIT_CELL, font_px) * 3 + cell(PERCENT_CELL, font_px)
 }
 
@@ -141,28 +141,39 @@ pub fn draw(
     } else {
         text(hdc, percentage, rect, DT_RIGHT);
     }
+    let reset_x = x + scale(reset_offset(font_px));
+    draw_reset(
+        hdc,
+        RECT {
+            left: reset_x,
+            right: x + width,
+            ..rect
+        },
+        reset,
+        secondary,
+        scale(font_px),
+    );
+}
+
+pub(super) fn draw_reset(hdc: HDC, rect: RECT, reset: &str, color: &Color, font_height: i32) {
     if reset.is_empty() {
         return;
     }
-
-    let reset_x = x + scale(reset_offset(font_px));
     unsafe {
-        let font = create_reset_font(scale(font_px));
+        let font = create_reset_font(font_height);
         let old_font = SelectObject(hdc, font);
-        let _ = SetTextColor(hdc, COLORREF(secondary.to_colorref()));
-        text(
-            hdc,
-            reset,
-            RECT {
-                left: reset_x,
-                right: x + width,
-                ..rect
-            },
-            DT_LEFT,
-        );
+        let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
+        text(hdc, reset, rect, DT_LEFT);
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
     }
+}
+
+pub(super) fn draw_centered(hdc: HDC, rect: RECT, value: &str, color: COLORREF) {
+    unsafe {
+        let _ = SetTextColor(hdc, color);
+    }
+    text(hdc, value, rect, DT_CENTER);
 }
 
 #[cfg(test)]

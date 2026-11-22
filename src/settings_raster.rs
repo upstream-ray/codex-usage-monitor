@@ -117,8 +117,20 @@ impl<'a> Canvas<'a> {
         self.draw(RoundedRect::new(x - r, y - r, x + r, y + r, r), None, argb);
     }
 
-    pub(super) fn pill(&mut self, left: f32, top: f32, right: f32, bottom: f32, radius: f32, argb: u32) {
-        self.draw(RoundedRect::new(left, top, right, bottom, radius), None, argb);
+    pub(super) fn pill(
+        &mut self,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        radius: f32,
+        argb: u32,
+    ) {
+        self.draw(
+            RoundedRect::new(left, top, right, bottom, radius),
+            None,
+            argb,
+        );
     }
 
     pub(super) fn card(&mut self, rect: RECT, radius: f32, fill: u32, border: u32) {
@@ -402,8 +414,10 @@ mod tests {
         let mut light = [0; 64];
         let mut dark = [0; 64];
         let bounds = rect(0, 0, 8, 8);
-        Canvas::new(&mut light, 8, bounds).control(bounds, 2.0, 0xFF_FFFF, 0xE0_E0E0, 0xB0_B0B0, false);
-        Canvas::new(&mut dark, 8, bounds).control(bounds, 2.0, 0x30_3030, 0x3E_3E3E, 0x55_5555, true);
+        Canvas::new(&mut light, 8, bounds)
+            .control(bounds, 2.0, 0xFF_FFFF, 0xE0_E0E0, 0xB0_B0B0, false);
+        Canvas::new(&mut dark, 8, bounds)
+            .control(bounds, 2.0, 0x30_3030, 0x3E_3E3E, 0x55_5555, true);
         // Light mode: top edge uses border, bottom edge uses elevation.
         assert_eq!(light[4], 0xE0_E0E0);
         assert_eq!(light[7 * 8 + 4], 0xB0_B0B0);

@@ -12,7 +12,6 @@ use std::os::windows::process::CommandExt;
 use crate::diagnose;
 use crate::localization::Strings;
 use crate::models::{QuotaDisplayMode, UsageData, UsageSection};
-use crate::native_interop;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -1674,88 +1673,24 @@ fn days_since_unix_epoch(year: i64, month: i64, day: i64) -> i64 {
     years + months + day - 1
 }
 
-#[cfg(test)]
-pub fn format_antigravity_line(
-    section: &UsageSection,
-    strings: Strings,
-    local_reset: bool,
-    window: UsageWindowKind,
-) -> String {
-    format_quota_line(
-        section,
-        strings,
-        local_reset,
-        QuotaDisplayMode::Remaining,
-        window,
-    )
-}
-
-#[cfg(test)]
-pub fn format_line(
-    section: &UsageSection,
-    strings: Strings,
-    local_reset: bool,
-    window: UsageWindowKind,
-) -> String {
-    let mode = if local_reset {
-        QuotaDisplayMode::Remaining
-    } else {
-        QuotaDisplayMode::Used
-    };
-    format_quota_line(section, strings, local_reset, mode, window)
-}
-
 pub fn format_quota_line(
     section: &UsageSection,
     strings: Strings,
-    local_reset: bool,
     mode: QuotaDisplayMode,
-    window: UsageWindowKind,
+    now: SystemTime,
 ) -> String {
     if !section.has_reading() {
         return "--".to_string();
     }
-    let percentage = mode.percentage(section.percentage);
-    if local_reset {
-        let reset = section
-            .resets_at
-            .and_then(native_interop::system_time_to_local);
-        return format_simplified_chinese_values(percentage, reset, window);
-    }
-    format_percent_with_countdown(percentage, section.resets_at, strings)
-}
-
-fn format_percent_with_countdown(
-    percentage: f64,
-    resets_at: Option<SystemTime>,
-    strings: Strings,
-) -> String {
-    let pct = format_percent(percentage);
-    let cd = format_countdown(resets_at, strings);
-    if cd.is_empty() {
-        pct
-    } else {
-        format!("{pct} \u{00b7} {cd}")
-    }
-}
-
-fn format_simplified_chinese_values(
-    remaining: f64,
-    reset: Option<windows::Win32::Foundation::SYSTEMTIME>,
-    window: UsageWindowKind,
-) -> String {
-    let remaining = format_percent(remaining);
-    let Some(reset) = reset else {
-        return remaining;
+    let pct = format_percent(mode.percentage(section.percentage));
+    let Some(reset) = section.resets_at else {
+        return pct;
     };
-    match window {
-        UsageWindowKind::Session => {
-            format!("{remaining}  {:02}:{:02}重置", reset.wHour, reset.wMinute)
-        }
-        UsageWindowKind::Weekly => {
-            format!("{remaining}  {:02}/{:02}重置", reset.wMonth, reset.wDay)
-        }
-    }
+    let countdown = match reset.duration_since(now) {
+        Ok(remaining) => format_countdown_from_secs(remaining.as_secs(), strings),
+        Err(_) => strings.now.to_string(),
+    };
+    format!("{pct} \u{00b7} {countdown}")
 }
 
 pub fn format_percent(value: f64) -> String {
@@ -1775,20 +1710,6 @@ pub fn format_percent(value: f64) -> String {
 
 pub fn remaining_percentage(used_percentage: f64) -> f64 {
     (100.0 - used_percentage).clamp(0.0, 100.0)
-}
-
-fn format_countdown(resets_at: Option<SystemTime>, strings: Strings) -> String {
-    let reset = match resets_at {
-        Some(t) => t,
-        None => return String::new(),
-    };
-
-    let remaining = match reset.duration_since(SystemTime::now()) {
-        Ok(d) => d,
-        Err(_) => return strings.now.to_string(),
-    };
-
-    format_countdown_from_secs(remaining.as_secs(), strings)
 }
 
 /// Calculate how long until the display text would change
@@ -1906,11 +1827,11 @@ mod tests {
             crate::localization::LanguageId::English,
         ] {
             assert_eq!(
-                format_line(
+                format_quota_line(
                     &usage.session,
                     language.strings(),
-                    language == crate::localization::LanguageId::SimplifiedChinese,
-                    UsageWindowKind::Session,
+                    QuotaDisplayMode::Remaining,
+                    UNIX_EPOCH
                 ),
                 "--"
             );
@@ -1958,12 +1879,20 @@ mod tests {
         .unwrap();
         let usage = codex_usage_from_response(response).unwrap();
         let strings = crate::localization::LanguageId::SimplifiedChinese.strings();
-        assert!(
-            format_line(&usage.session, strings, true, UsageWindowKind::Session)
-                .starts_with("100%")
-        );
+        assert!(format_quota_line(
+            &usage.session,
+            strings,
+            QuotaDisplayMode::Remaining,
+            UNIX_EPOCH
+        )
+        .starts_with("100%"));
         assert_eq!(
-            format_line(&usage.weekly, strings, true, UsageWindowKind::Weekly),
+            format_quota_line(
+                &usage.weekly,
+                strings,
+                QuotaDisplayMode::Remaining,
+                UNIX_EPOCH
+            ),
             "--"
         );
     }
@@ -2048,20 +1977,30 @@ mod tests {
         let usage = claude_usage_from_response(response);
         let strings = crate::localization::LanguageId::English.strings();
         assert_eq!(
-            format_line(&usage.session, strings, false, UsageWindowKind::Session),
+            format_quota_line(&usage.session, strings, QuotaDisplayMode::Used, UNIX_EPOCH),
             "0%"
         );
         assert_eq!(
-            format_line(&usage.weekly, strings, false, UsageWindowKind::Weekly),
+            format_quota_line(&usage.weekly, strings, QuotaDisplayMode::Used, UNIX_EPOCH),
             "--"
         );
         let strings = crate::localization::LanguageId::SimplifiedChinese.strings();
         assert_eq!(
-            format_line(&usage.session, strings, true, UsageWindowKind::Session),
+            format_quota_line(
+                &usage.session,
+                strings,
+                QuotaDisplayMode::Remaining,
+                UNIX_EPOCH
+            ),
             "100%"
         );
         assert_eq!(
-            format_line(&usage.weekly, strings, true, UsageWindowKind::Weekly),
+            format_quota_line(
+                &usage.weekly,
+                strings,
+                QuotaDisplayMode::Remaining,
+                UNIX_EPOCH
+            ),
             "--"
         );
     }
@@ -2102,33 +2041,24 @@ mod tests {
     }
 
     #[test]
-    fn simplified_chinese_line_labels_remaining_usage() {
-        let strings = crate::localization::LanguageId::SimplifiedChinese.strings();
-        assert_eq!(strings.session_window, "5h");
-        assert_eq!(strings.weekly_window, "7d");
-        let section = UsageSection::reported(30.0, None);
-        assert_eq!(
-            format_line(&section, strings, true, UsageWindowKind::Session),
-            "70%"
-        );
-        let session_reset = windows::Win32::Foundation::SYSTEMTIME {
-            wHour: 18,
-            wMinute: 30,
-            ..Default::default()
-        };
-        assert_eq!(
-            format_simplified_chinese_values(82.0, Some(session_reset), UsageWindowKind::Session,),
-            "82%  18:30重置"
-        );
-        let weekly_reset = windows::Win32::Foundation::SYSTEMTIME {
-            wMonth: 7,
-            wDay: 17,
-            ..Default::default()
-        };
-        assert_eq!(
-            format_simplified_chinese_values(97.0, Some(weekly_reset), UsageWindowKind::Weekly,),
-            "97%  07/17重置"
-        );
+    fn chinese_quota_lines_use_compact_countdowns() {
+        use crate::localization::LanguageId;
+
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        for language in [
+            LanguageId::SimplifiedChinese,
+            LanguageId::TraditionalChinese,
+        ] {
+            let strings = language.strings();
+            assert_eq!(strings.session_window, "5h");
+            assert_eq!(strings.weekly_window, "7d");
+            for (seconds, expected) in [(17_999, "4h"), (604_799, "6d"), (45, "45s"), (90, "1m")] {
+                let section =
+                    UsageSection::reported(30.0, Some(now + Duration::from_secs(seconds)));
+                let text = format_quota_line(&section, strings, QuotaDisplayMode::Remaining, now);
+                assert_eq!(crate::quota_text::parts(&text), ("70%", expected));
+            }
+        }
     }
 
     #[test]
@@ -2213,14 +2143,20 @@ mod tests {
         .expect("valid usage result");
 
         let strings = crate::localization::LanguageId::English.strings();
-        assert!(
-            format_antigravity_line(&usage.session, strings, false, UsageWindowKind::Session)
-                .starts_with("90%")
-        );
-        assert!(
-            format_antigravity_line(&usage.weekly, strings, false, UsageWindowKind::Weekly)
-                .starts_with("97%")
-        );
+        assert!(format_quota_line(
+            &usage.session,
+            strings,
+            QuotaDisplayMode::Remaining,
+            UNIX_EPOCH
+        )
+        .starts_with("90%"));
+        assert!(format_quota_line(
+            &usage.weekly,
+            strings,
+            QuotaDisplayMode::Remaining,
+            UNIX_EPOCH
+        )
+        .starts_with("97%"));
         assert_eq!(
             usage.session.resets_at,
             parse_iso8601(Some("2026-11-21T13:48:16Z"))
@@ -2260,11 +2196,21 @@ mod tests {
         let usage = antigravity_usage_from_summary(summary).unwrap();
         let strings = crate::localization::LanguageId::SimplifiedChinese.strings();
         assert_eq!(
-            format_antigravity_line(&usage.session, strings, true, UsageWindowKind::Session),
+            format_quota_line(
+                &usage.session,
+                strings,
+                QuotaDisplayMode::Remaining,
+                UNIX_EPOCH
+            ),
             "--"
         );
         assert_eq!(
-            format_antigravity_line(&usage.weekly, strings, true, UsageWindowKind::Weekly),
+            format_quota_line(
+                &usage.weekly,
+                strings,
+                QuotaDisplayMode::Remaining,
+                UNIX_EPOCH
+            ),
             "100%"
         );
     }
@@ -2345,14 +2291,12 @@ mod tests {
             LanguageId::Italian,
             LanguageId::SimplifiedChinese,
         ] {
-            let local = language == LanguageId::SimplifiedChinese;
             assert_eq!(
                 format_quota_line(
                     &section,
                     language.strings(),
-                    local,
                     QuotaDisplayMode::Remaining,
-                    UsageWindowKind::Session
+                    UNIX_EPOCH
                 ),
                 "15%"
             );
@@ -2360,9 +2304,8 @@ mod tests {
                 format_quota_line(
                     &section,
                     language.strings(),
-                    local,
                     QuotaDisplayMode::Used,
-                    UsageWindowKind::Session
+                    UNIX_EPOCH
                 ),
                 "85%"
             );

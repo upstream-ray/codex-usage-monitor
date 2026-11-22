@@ -6,7 +6,7 @@
 use super::*;
 use std::cell::RefCell;
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWCP_ROUND, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
@@ -26,11 +26,6 @@ thread_local! {
     static ACTIVE: RefCell<Option<PopupState>> = const { RefCell::new(None) };
 }
 
-pub(super) struct DropdownResult {
-    pub(super) picked: Option<usize>,
-    pub(super) closed_on_anchor: bool,
-}
-
 struct PopupState {
     hwnd: HWND,
     items: Vec<OptionItem>,
@@ -45,11 +40,9 @@ struct PopupState {
     opens_upward: bool,
     start: Instant,
     animating: bool,
-    anchor: RECT,
     buffer: Option<Bitmap>,
     result: Option<usize>,
     done: bool,
-    closed_on_anchor: bool,
 }
 
 impl PopupState {
@@ -131,15 +124,6 @@ impl PopupState {
         }
         self.result = picked;
         self.done = true;
-        if picked.is_none() {
-            let mut pt = POINT::default();
-            if GetCursorPos(&mut pt).is_ok() {
-                self.closed_on_anchor = pt.x >= self.anchor.left
-                    && pt.x < self.anchor.right
-                    && pt.y >= self.anchor.top
-                    && pt.y < self.anchor.bottom;
-            }
-        }
         let _ = KillTimer(self.hwnd, ANIM_TIMER);
         let _ = ShowWindow(self.hwnd, SW_HIDE);
     }
@@ -164,7 +148,11 @@ impl PopupState {
             1.0
         };
         let slide_px = ((1.0 - t) * self.px(8) as f32).round() as i32;
-        let y_shift = if self.opens_upward { slide_px } else { -slide_px };
+        let y_shift = if self.opens_upward {
+            slide_px
+        } else {
+            -slide_px
+        };
 
         let surface = if self.theme.dark {
             0x2C_2C2C
@@ -259,7 +247,11 @@ impl PopupState {
                 let thumb_top = track_top + (track_h - thumb_h) * (self.scroll as f32 / max_s);
                 let bar_right = (client.right - self.px(3)) as f32;
                 let bar_left = bar_right - self.pxf(3.0);
-                let thumb_color = if self.theme.dark { 0x9F_9F9F } else { 0x7A_7A7A };
+                let thumb_color = if self.theme.dark {
+                    0x9F_9F9F
+                } else {
+                    0x7A_7A7A
+                };
                 canvas.pill(
                     bar_left,
                     thumb_top,
@@ -341,7 +333,9 @@ pub(super) fn compute_popup_rect(
         (t, h, true)
     };
 
-    let left = anchor.left.clamp(work.left + 4, (work.right - width - 4).max(work.left + 4));
+    let left = anchor
+        .left
+        .clamp(work.left + 4, (work.right - width - 4).max(work.left + 4));
     (
         RECT {
             left,
@@ -377,27 +371,20 @@ pub(super) fn next_enabled_index(
 }
 
 pub(super) unsafe fn pick(
-    owner: HWND,
+    button: HWND,
     items: &[OptionItem],
     selected: usize,
     anchor: RECT,
     theme: Theme,
     fonts: Fonts,
     dpi: u32,
-) -> DropdownResult {
+) -> Option<usize> {
     if items.is_empty() {
-        return DropdownResult {
-            picked: None,
-            closed_on_anchor: false,
-        };
+        return None;
     }
 
-    let Ok(module) = GetModuleHandleW(None) else {
-        return DropdownResult {
-            picked: None,
-            closed_on_anchor: false,
-        };
-    };
+    let owner = GetAncestor(button, GA_ROOT);
+    let module = GetModuleHandleW(None).ok()?;
     let instance = HINSTANCE(module.0);
     let cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
     let _ = RegisterClassW(&WNDCLASSW {
@@ -423,7 +410,8 @@ pub(super) unsafe fn pick(
 
     let anchor_w = anchor.right - anchor.left;
     let item_step = scale(ITEM_HEIGHT + ITEM_GAP, dpi);
-    let content_height = scale(PAD_Y * 2, dpi) + items.len() as i32 * item_step - scale(ITEM_GAP, dpi);
+    let content_height =
+        scale(PAD_Y * 2, dpi) + items.len() as i32 * item_step - scale(ITEM_GAP, dpi);
     let max_h = scale(MAX_HEIGHT, dpi);
     let scroll_extra = if content_height > max_h {
         scale(10, dpi)
@@ -456,7 +444,7 @@ pub(super) unsafe fn pick(
         scale(4, dpi),
     );
 
-    let Ok(hwnd) = CreateWindowExW(
+    let hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
         POPUP_CLASS,
         PCWSTR::null(),
@@ -469,12 +457,8 @@ pub(super) unsafe fn pick(
         HMENU::default(),
         instance,
         None,
-    ) else {
-        return DropdownResult {
-            picked: None,
-            closed_on_anchor: false,
-        };
-    };
+    )
+    .ok()?;
 
     // Windows 11 native rounded corners and themed thin border with drop shadow.
     let corner = DWMWCP_ROUND;
@@ -508,11 +492,9 @@ pub(super) unsafe fn pick(
         opens_upward,
         start: Instant::now(),
         animating: true,
-        anchor,
         buffer: None,
         result: None,
         done: false,
-        closed_on_anchor: false,
     };
     if selected < items.len() {
         state.ensure_visible(selected);
@@ -537,25 +519,17 @@ pub(super) unsafe fn pick(
             }
             break;
         }
+        // The click on the dropdown button dismisses the popup and must not reopen it.
+        if msg.hwnd == button && matches!(msg.message, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK) {
+            with_popup(|state| state.close(None));
+            break;
+        }
         let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
     let _ = DestroyWindow(hwnd);
-    ACTIVE.with(|slot| {
-        slot.borrow_mut()
-            .take()
-            .map_or(
-                DropdownResult {
-                    picked: None,
-                    closed_on_anchor: false,
-                },
-                |state| DropdownResult {
-                    picked: state.result,
-                    closed_on_anchor: state.closed_on_anchor,
-                },
-            )
-    })
+    ACTIVE.with(|slot| slot.borrow_mut().take().and_then(|state| state.result))
 }
 
 fn with_popup<T>(f: impl FnOnce(&mut PopupState) -> T) -> Option<T> {
@@ -588,9 +562,7 @@ unsafe extern "system" fn dropdown_proc(
         WM_MOUSEMOVE => {
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             let track = with_popup(|s| {
-                let hit = s
-                    .hit_item(y)
-                    .filter(|&i| s.items[i].action.is_some());
+                let hit = s.hit_item(y).filter(|&i| s.items[i].action.is_some());
                 if s.highlighted != hit {
                     s.highlighted = hit;
                     let _ = InvalidateRect(hwnd, None, false);
@@ -622,9 +594,7 @@ unsafe extern "system" fn dropdown_proc(
         WM_LBUTTONDOWN => {
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             with_popup(|s| {
-                let hit = s
-                    .hit_item(y)
-                    .filter(|&i| s.items[i].action.is_some());
+                let hit = s.hit_item(y).filter(|&i| s.items[i].action.is_some());
                 s.pressed = hit;
                 s.highlighted = hit;
                 let _ = InvalidateRect(hwnd, None, false);
@@ -634,9 +604,7 @@ unsafe extern "system" fn dropdown_proc(
         WM_LBUTTONUP => {
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             with_popup(|s| {
-                let hit = s
-                    .hit_item(y)
-                    .filter(|&i| s.items[i].action.is_some());
+                let hit = s.hit_item(y).filter(|&i| s.items[i].action.is_some());
                 let pressed = s.pressed.take();
                 if let Some(index) = hit.filter(|&i| pressed == Some(i)) {
                     s.close(Some(index));
@@ -729,7 +697,8 @@ pub(super) unsafe fn render_preview_bitmap(
     dpi: u32,
 ) -> Option<Bitmap> {
     let item_step = scale(ITEM_HEIGHT + ITEM_GAP, dpi);
-    let content_height = scale(PAD_Y * 2, dpi) + items.len() as i32 * item_step - scale(ITEM_GAP, dpi);
+    let content_height =
+        scale(PAD_Y * 2, dpi) + items.len() as i32 * item_step - scale(ITEM_GAP, dpi);
     let height = content_height.min(scale(MAX_HEIGHT, dpi));
     let mut bmp = Bitmap::new(width, height)?;
     let bounds = bmp.bounds();
@@ -804,7 +773,11 @@ pub(super) unsafe fn render_preview_bitmap(
         }
         draw_text(
             dc,
-            if index == selected { fonts.strong } else { fonts.body },
+            if index == selected {
+                fonts.strong
+            } else {
+                fonts.body
+            },
             theme.text,
             &item.label,
             text_rect,
