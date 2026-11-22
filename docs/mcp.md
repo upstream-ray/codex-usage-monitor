@@ -5,8 +5,7 @@ Codex Usage can serve its current quota readings to AI agents through the
 CLI or another MCP client can ask how much quota is left before starting a long task,
 or pick the provider with more headroom, using what the widget already shows.
 
-The server is **off by default**. Turn it on with **Settings > Privacy & updates > Local MCP server for AI
-agents (read-only)**. The choice is saved in `settings.json`.
+The server is **off by default**. Turn it on under **Settings → Privacy & updates → Local MCP server**. The choice is saved in `settings.json`.
 
 ## Why tool calls cost no quota
 
@@ -66,7 +65,7 @@ Every result has the same keys.
     values are from the last successful reading.
   - `unavailable`: no successful reading since the app started. `error_category` says
     why, if a refresh has failed.
-  - `disabled`: the provider is not selected under **Models**. No values are reported.
+  - `disabled`: the provider is not selected under **Settings → Usage → Monitored services**. No values are reported.
 - `five_hour` and `weekly`: `null` when there is no value. Percentages are not rounded.
   `resets_at` is a Unix time in seconds, or `null` when the provider gave none.
 - `expired_windows`: windows whose reset time has passed since the reading. Their old
@@ -80,7 +79,7 @@ Every result has the same keys.
 
 ## Set up a client
 
-Turn the server on in the menu first. These commands change only the client's own
+Turn the server on under **Settings → Privacy & updates** first. These commands change only the client's own
 configuration.
 
 **Claude Code**

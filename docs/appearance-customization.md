@@ -1,26 +1,68 @@
 # Appearance customization
 
-## User-facing behavior
+Open **Settings → Appearance** (Simplified Chinese: **设置 → 外观**) to customize the taskbar widget with a live preview at the top of the page. Every change applies and saves immediately.
 
-- **Background style** selects the existing system, high-contrast dark, or high-contrast light background treatment. The Simplified Chinese label is **背景样式**.
-- **Codex colors** (**Codex 配色**) controls the Codex widget mark, quota bars, and percentage numbers independently. The application tray icon and reset text retain their existing rendering.
-- Original keeps the upstream defaults. Terracotta, Rose, Glacier, and Lilac provide distinct light/dark-aware combinations. The old `mint` configuration value is accepted as an alias for Rose.
-- Classic segmented (tiles) adds small-radius rectangular segments without changing the existing segmented and continuous styles or their defaults.
-- **Save current colors as preset…** sits below the three custom-color controls. A named preset appears after the built-in presets in the **Codex colors** list. Overwriting or deleting requires a confirmation; cancellation preserves settings. Names are trimmed and compared case-insensitively. There are at most 32 saved presets, each with a 1–40-character name.
-- Applying or resetting appearance never erases the saved library. Deleting a saved entry leaves the active colors unchanged.
+![Codex Usage Appearance settings page with live preview](../.github/settings-appearance.png)
 
-## Persistence and implementation
+## Widget style options
 
-`appearance.codex_colors` stores the active base preset and optional `#RRGGBB` overrides. The top-level `color_presets` array stores named copies of that same scheme. Keeping the base preset preserves automatic theme adaptation for colors that have not been overridden.
+| Setting | Options | Default | Notes |
+| --- | --- | --- | --- |
+| **Background style** (`palette`) | `system`, `high_contrast_dark`, `high_contrast_light` | `system` | High-contrast modes add a solid backdrop and bold typography for readability on translucent taskbars. |
+| **Bar style** (`bar_style`) | `continuous`, `segmented`, `dots`, `battery` | `continuous` | Continuous rounded bar, segmented bar, dot indicators, or battery icon bar. |
+| **Bar thickness** (`bar_thickness`) | `thin`, `medium`, `thick` | `medium` | Logical bar heights of `4 px`, `7 px`, and `10 px` (capped to fit each row). |
+| **Text size** (`font_size`) | `"12"`, `"14"`, `"16"` | `"12"` | Steps down automatically (`16` → `14` → `12`) when the selected taskbar height cannot fit both rows cleanly. |
+| **Show provider logos** (`hide_provider_logos`) | On / Off | On | Controls whether the Claude, OpenAI, and Antigravity marks are shown before each service column. |
+| **Show quota period labels** (`hide_period_labels`) | On / Off | On | Controls whether the `5h` / `7d` period labels are shown on the left edge of the widget. |
+| **Percentage position** (`percent_inside_battery`) | Outside battery / Inside battery | Outside battery | Applies only when **Bar style** is set to **Battery**; placing percentages inside the battery significantly narrows multi-service layouts. |
+| **Reset time display** (`reset_time_display`) | `countdown`, `clock` | `countdown` | **Countdown** shows compact durations (`4h`, `6d`, `45s`); **Reset time** shows local clock timestamps (`20:04`, cross-day `11/23 00:30`, weekly `11/28`). Hovering a column always shows the full `YYYY-MM-DD HH:MM` timestamp. |
 
-`codex_colors.rs` owns parsing and color resolution; `user_presets.rs` owns validation, deduplication, limits, and tolerant library loading. Invalid entries are skipped without discarding unrelated settings. `color_picker.rs` uses the native Windows color picker. `preset_dialog.rs` supplies a native modal name dialog with standard Save/Cancel and keyboard behavior. The app-state lock is released before entering any modal dialog.
+## Color options
 
-`provider_icons.rs` recolors the existing Codex artwork with premultiplied alpha and a bounded one-icon cache. Replacing a cached icon releases its old native handle. Original artwork is used unless tinting is requested. `window.rs` connects settings commands, persistence, and rendering; authentication and polling are unchanged.
+Colors apply uniformly across every enabled service:
+
+- **Brand colors** (`color_mode: "brand"`, default): Uses each provider's signature accent (coral for Claude Code, green for Codex, blue for Antigravity).
+- **By remaining quota** (`color_mode: "remaining"`): Colors bars by remaining headroom — green (`> 50%`), amber (`20%–50%`), and red (`< 20%`).
+- **Single color** (`color_mode: "single"`): Applies one shared palette across all services, with five built-in swatches (`single_color`: `glacier`, `lilac`, `clay`, `rose`, `neutral`) adapted for light and dark backgrounds.
+
+## Quick looks & presets
+
+- **Translucent dark preset:** Applies `high_contrast_dark`, `continuous`, `thin`, and `14 px` text (optimized for dark translucent 40 px Windows taskbars).
+- **Restore defaults:** Resets every appearance option back to `Appearance::default()`.
+
+## Compact 3-service example
+
+When displaying Codex, Claude Code, and Antigravity together, combine **Battery** style + **Inside battery** percentages + hidden period labels:
+
+![Compact three-service battery layout with countdown timers](../.github/taskbar-compact-battery.png)
+
+![Compact three-service battery layout with reset clock times](../.github/taskbar-compact-clock.png)
+
+## Persistence & legacy migration
+
+All options are stored under the `appearance` object in `%APPDATA%\CodexUsage\settings.json`. Older settings migrate automatically without losing unrelated preferences:
+
+- `bar_style: "classic_segmented"` maps to `"segmented"`.
+- `bar_thickness: "standard"` maps to `"medium"`, and `"slim"` maps to `"thin"`.
+- `font_size: "standard"` maps to `"12"`, and `"large"` maps to `"14"`.
+- Retired fields from earlier releases (such as per-Codex color overrides, `color_presets`, and single-service `compact_layout`) are safely ignored on load.
 
 ## Validation
 
-Run `cargo fmt --check`, `cargo test --locked`, and `cargo build --release --locked`.
+Run:
 
-For native GDI fixtures, set `CODEX_APPEARANCE_PREVIEW_DIR` to a writable directory and run `cargo test --locked render_appearance_previews -- --ignored`. For the interactive name-dialog check, run `cargo test --locked native_dialog_cancel_and_save -- --ignored`, cancel the Chinese dialog, then enter `Evening rose` and save in the English dialog.
+```powershell
+cargo fmt --check
+cargo test --locked
+cargo build --release --locked
+```
 
-Tests cover old settings, saved-scheme round trips, duplicate names, deletion, malformed entries, capacity bounds, custom color independence, native tinting, and the new presets' percentage contrast on the reference light/dark backgrounds. Compare Clippy diagnostics against the unchanged upstream baseline because it already has warnings with current toolchains.
+To regenerate visual appearance fixtures and settings snapshots:
+
+```powershell
+$env:CODEX_APPEARANCE_PREVIEW_DIR = ".\tmp\appearance"
+cargo test --locked render_appearance_previews -- --ignored
+
+$env:CODEX_SETTINGS_SNAPSHOT_DIR = ".\tmp\settings"
+cargo test --locked render_settings_snapshots -- --ignored
+```

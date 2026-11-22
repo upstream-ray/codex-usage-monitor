@@ -1,268 +1,221 @@
-![Windows](https://img.shields.io/badge/platform-Windows-blue)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+![Windows](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D4)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Latest Release](https://img.shields.io/github/v/release/upstream-ray/codex-usage-monitor)](https://github.com/upstream-ray/codex-usage-monitor/releases/latest)
 
 **English** | [简体中文](README.zh-CN.md)
 
-# Codex Usage
+# Codex Usage — Windows Taskbar Quota Monitor
 
-<img src=".github/codex-usage-icon.png" alt="Codex Usage icon" width="96" height="96">
+<img src=".github/codex-usage-icon.png" alt="Codex Usage application icon" width="72" height="72">
 
-![Screenshot](.github/animation.gif)
+Codex Usage is a lightweight native Windows taskbar widget that monitors **OpenAI Codex**, **Claude Code**, and **Google Antigravity** usage limits and reset times. Enable one service or display all three side by side directly on the Windows 10 or Windows 11 taskbar without opening a browser or desktop app.
 
-This animation shows the original segmented-bar design. Current builds let you choose segmented or continuous bars in **Appearance**.
+Built in Rust with native Win32 APIs (~1.2 MB single executable, no Electron or WebView2 runtime), it includes a Windows 11 Fluent settings window with light/dark themes, 12 interface languages, low-quota alerts, and an optional read-only local MCP server for AI agents.
 
-A lightweight native Windows taskbar widget for monitoring Codex usage, with optional Claude Code and Google Antigravity usage display.
+![Codex Usage taskbar widget displaying Claude Code, OpenAI Codex, and Google Antigravity 5-hour and weekly quota bars with countdown timers on a dark Windows taskbar](.github/taskbar-preview.png)
 
-It sits in your taskbar and shows how much of your Codex usage window remains without opening the Codex app or account usage page.
+**[Download latest release](https://github.com/upstream-ray/codex-usage-monitor/releases/latest)** · **[Installation & policy](docs/installation.md)** · **[Appearance guide](docs/appearance-customization.md)** · **[Local MCP setup](docs/mcp.md)** · **[Troubleshooting](docs/troubleshooting.md)**
 
-## What You Get
+---
 
-- A **5h** bar for your current Codex usage window
-- A **7d** bar for your current weekly window
-- Simplified Chinese display with explicit remaining usage and reset countdowns
-- Optional Claude Code usage alongside Codex
-- Optional Antigravity model usage bars for Google's 5-hour and weekly Gemini quota windows
-- A live countdown until each limit resets
-- Optional low-quota alerts at 10%, 20%, or 30% remaining, deduplicated per reset window
-- Independent display controls for the 5-hour and weekly rows
-- A small native widget that lives directly in the Windows taskbar
-- One system tray icon that matches the desktop app icon
-- Left-click the tray icon to toggle the taskbar widget on or off
-- Right-click options for refresh, monitored services, usage rows, quota alerts, update frequency, language, startup, widget visibility, and updates
-- Multi-monitor taskbar placement, so the widget can live on the taskbar for the screen you prefer
-- Appearance options for palette, bar style, bar thickness, and text size
-- Claude and OpenAI marks for each service column, with Codex shown in green
-- Quota windows that a service does not report show `--` and an empty bar instead of a false 100%
-- Each service refreshes and retries on its own; a failed refresh keeps the last numbers and marks them `*`
-- Hover over a service column to see its last successful update, next refresh, and any error
-- Automatic refresh after the computer wakes from sleep or the network comes back
+## Requirements & Account Support
 
-## Who This Is For
+- **Operating system:** Windows 10 or Windows 11. Automatic refresh after network recovery requires Windows 10 version 2004 or later; earlier Windows 10 builds still refresh on schedule and after sleep wake.
+- **Account prerequisite:** At least one supported CLI or app installed and signed in locally.
 
-This app is for Windows users who already have **Codex CLI or the Codex app installed and signed in**.
+| Service | Default | Login Prerequisite | Local Credential Source | Quota Windows & Notes |
+| --- | --- | --- | --- | --- |
+| **Codex** | On | Codex CLI or Codex app signed in | `$CODEX_HOME/auth.json` or `~/.codex/auth.json` | 5-hour (`5h`) and weekly (`7d`) limits from the locally authenticated Codex account. |
+| **Claude Code** | Off | Claude Code CLI signed in (Windows or WSL) | `~/.claude/.credentials.json`, `$CLAUDE_CONFIG_DIR`, or installed WSL distro | Supports Pro, Max, Teams, Enterprise, and Console accounts (not the free Claude.ai plan, per Anthropic docs as of March 19, 2026). **Signing in to Claude Desktop alone does not provide Claude Code credentials.** |
+| **Google Antigravity** | Off | Google Antigravity signed in | Antigravity CLI `/usage` (falls back to Windows Credential Manager `gemini:antigravity`) | Shows 5-hour and weekly **Gemini Models** quotas by default; choose another reported group under **Settings → Usage → Antigravity quota group**. |
 
-Codex is enabled by default. The app reads the same local credentials used by Codex.
+Unreported windows display `--` and an empty bar rather than a false `100%`. Missing or expired credentials show `!` on the taskbar and a sign-in warning inside **Settings → Usage**.
 
-Antigravity support is optional too. To show Antigravity usage, install and sign in to Google Antigravity, then enable the **Antigravity** service under **Settings → Usage**.
+---
 
-It works best if you want a simple "how close am I to the limit?" display that is always visible.
+## Download, Install & First Launch
 
-## Requirements
+### 1. Per-User Install (Recommended)
 
-- Windows 10 or Windows 11
-- Codex CLI or Codex app installed and authenticated
-- Optional: Claude Code installed and authenticated
-- Optional: Google Antigravity installed and authenticated, if you want Antigravity usage
-
-Refresh after network recovery needs Windows 10 version 2004 or later. On earlier Windows 10 builds the app still runs, but it only refreshes after wake from sleep and on its normal schedule.
-
-If you use Claude Code through WSL, that is supported too. The monitor can read your Claude Code credentials from Windows or from your WSL environment.
-
-## Install
-
-For a per-user installation, download `install.ps1` from the [latest release](https://github.com/upstream-ray/codex-usage-monitor/releases/latest), then run:
+Download `install.ps1` from the [latest release](https://github.com/upstream-ray/codex-usage-monitor/releases/latest), then run it in PowerShell (no administrator privileges required):
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-The installer verifies the release SHA256 and installs to `%LOCALAPPDATA%\Programs\CodexUsage` without administrator access. It adds a Start menu shortcut and an entry in Windows Installed Apps.
+The installer verifies the release SHA-256 checksum, installs to `%LOCALAPPDATA%\Programs\CodexUsage\codex-usage.exe`, creates Start Menu and Desktop shortcuts, registers an entry in Windows **Installed apps**, and launches the app automatically. It does **not** add the install folder to `PATH`.
 
-For portable use, download `codex-usage.exe` from the same release and run it from any user-writable directory. You can also build it locally:
+### 2. Portable Run
 
-```powershell
-cargo build --release
-```
+Download `codex-usage.exe` from the same [release page](https://github.com/upstream-ray/codex-usage-monitor/releases/latest) and run it from any user-writable folder. Portable copies share the same `%APPDATA%\CodexUsage\settings.json` file and support in-app self-updates.
 
-Local builds create the executable at `target\release\codex-usage.exe`.
+### 3. First Setup
 
-## Uninstall
+1. Launch **Codex Usage** (automatically started after `install.ps1`, or via the Start Menu / Desktop shortcut).
+2. Right-click the taskbar widget or the single system tray icon and choose **Settings…**.
+3. Open **Settings → Usage** and enable **Codex**, **Claude Code**, and/or **Antigravity**. Every change takes effect and saves immediately.
+4. Open **Settings → General** to switch the settings theme (**Follow system**, **Light**, **Dark**), UI language (12 languages), or **Start with Windows**.
 
-Uninstall **Codex Usage** from Windows Settings > Apps > Installed apps, or run:
+### Upgrade & Uninstall
+
+- **In-app updates:** Check and install updates from **Settings → Privacy & updates** (enabled by default; checks GitHub Releases and verifies SHA-256).
+- **Uninstall:** Remove **Codex Usage** in Windows **Settings → Apps → Installed apps**, or run:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\CodexUsage\uninstall.ps1"
 ```
 
-Uninstalling preserves `%APPDATA%\CodexUsage\settings.json`. Add `-RemoveSettings` to delete settings explicitly. See [Installation model](docs/installation.md) for upgrade, portable, and startup behavior.
+Normal uninstall preserves `%APPDATA%\CodexUsage\settings.json`. Append `-RemoveSettings` to delete saved preferences as well. See the [Installation model](docs/installation.md) for upgrades, managed installations, and device policies.
 
-## Use
+---
 
-Run:
+## Reading the Taskbar Widget
 
-```powershell
-codex-usage
-```
+Each enabled service gets its own column with independent status and retry handling.
 
-Once running, it will appear in your taskbar and as one tray icon in the notification area.
+- **Quota rows (`5h` / `7d`):** Represent the 5-hour session window and weekly window.
+- **Remaining vs. Used:** Under **Settings → Usage → Quota value**, choose **Remaining** (default for new installs) or **Used**. Percentages, bars, and tray tooltips update together across all services and languages.
+- **Reset time formats (consistent across all languages):**
 
-- Drag the left divider to move the taskbar widget
-- Choose **Settings → General → Pin to the left edge of the taskbar** to keep the widget at the left edge instead of next to the tray
-- On multi-monitor setups, choose **Settings → General → Display** or drag the widget onto another taskbar. The selection is saved; the primary taskbar is used while the selected display is disconnected, and the widget returns when it reconnects.
-- Right-click the taskbar widget or tray icon to refresh, open **Settings**, show or hide the widget, or exit. The Settings window stays open while you make changes. Each change takes effect and saves immediately.
-- Left-click the tray icon to toggle the taskbar widget on or off
-- Enable **Start with Windows** under **Settings → General** if you want it to launch automatically when you sign in
+| Mode (**Settings → Appearance → Reset time display**) | 5-hour (same day) | 5-hour (next day) | Weekly |
+| --- | --- | --- | --- |
+| **Countdown** *(default)* | `4h` / `45m` / `30s` | `4h` | `6d` |
+| **Reset time** | `20:04` | `11/23 00:30` | `11/28` |
 
-### Monitored Services
-
-Open **Settings → Usage** to choose which independent services the widget displays. The services are not mutually exclusive, so you can monitor more than one account at the same time:
-
-- **Codex** is enabled by default
-- **Claude Code** can be enabled alongside Codex or shown by itself when Claude Code CLI is installed and authenticated
-- **Antigravity** can be enabled alongside the other providers or shown by itself as its own service column
-
-When multiple services are shown, each service has its own usage bar and matching usage text color. Antigravity reads the **Gemini Models** balances from **View Usage** through the signed-in Antigravity CLI. If the CLI query fails, the widget tries Google's account quota summary. Select another reported group from **Settings → Usage → Antigravity quota group**. Unavailable windows display `--`.
-
-Claude Desktop and Claude Code CLI use separate local sessions. Signing in to Claude Desktop does not enable Claude Code monitoring. Enable **Claude Code** to start its credential check. The widget shows a sign-in hint if credentials are missing or expired.
-
-### System Tray Icon
-
-The app always shows one tray icon using the same embedded icon as the executable and desktop shortcut, regardless of how many services are enabled.
-
-Hovering over the tray icon shows a compact summary for all enabled services. Left-clicking it toggles the taskbar widget; right-clicking it opens the shortcut menu.
-
-### Usage Display And Alerts
-
-Use **Settings → Usage** to show both quota rows or only one. The app always keeps at least one row visible. **Quota display** sets **Remaining** or **Used** for all services and windows. The setting applies to text, bars, and tray summaries independently of the UI language. New installations default to **Remaining**. Upgrades choose an initial mode from the previous UI language and save it.
-
-Use **Quota alerts** to choose a remaining-quota threshold of 10%, 20%, or 30%. Alerts are off by default. Each provider and quota window is notified only once until its reset time changes, including across app restarts. **Notify on reset** is off by default. It sends a notification after a fresh reading confirms that a previously observed quota window has reset.
-
-In Simplified Chinese, the compact taskbar rows use `5h` / `7d`, the selected percentage, and a concrete local reset value such as `18:30重置` or `07/17重置`.
-
-Percentages use fixed digit columns, so the reset text does not shift when a value changes from `9%` to `10%`.
-
-### Refresh And Status
-
-Each enabled service keeps its own data, last successful update, error, and retry schedule. A slow or failing service does not delay or replace the numbers of another service.
+- **Exact local reset time:** Hover over any service column on the taskbar to see the full local date and time (`YYYY-MM-DD HH:MM`, for example `5-hour reset · 2026-11-22 20:04`), last successful update, next scheduled refresh, and any error details.
+- **Common status indicators:**
 
 | Display | Meaning |
 | --- | --- |
-| `--` and an empty bar | Quota is unavailable, or the window reset at least five minutes ago and the new reading is pending. |
-| `*` after the reading | The number is stale. If the window reset since the last reading, its reset time is hidden while the new reading is pending. |
-| `<1%` | A positive balance or usage below 1%. |
-| `!`, `NET`, `429`, `5XX`, or `ERR` (Chinese: `!`, `网络`, `限流`, `服务`, `错误`) | The service has not returned data yet since the app started, and the label shows why. |
+| `--` and empty bar | The service does not report this window, or it reset at least 5 minutes ago and the fresh reading is still pending. |
+| `*` after reading | The reading is stale (latest refresh failed or expired). If the window already reset, the old reset label is hidden until new data arrives. |
+| `<1%` | Positive remaining or used quota below 1%. |
+| `!`, `NET`, `429`, `5XX`, `ERR` | No data returned yet since startup: auth needed (`!`), network/TLS error (`NET`), rate limited (`429`), server error (`5XX`), or unexpected response (`ERR`). |
 
-Hover over a service column to see when it last updated successfully, when it refreshes or retries next, and the latest error. The tooltip also explains missing or expired quota windows.
+- **Taskbar & tray controls:**
+  - **Drag** the left divider on the widget to reposition it on the taskbar, or drag it onto another monitor's taskbar.
+  - **Double-click** the quota area to refresh immediately.
+  - **Left-click** the tray icon to show or hide the taskbar widget; hover over it for a compact summary of all enabled services.
+  - **Right-click** the widget or tray icon for the 4-item quick menu (**Refresh**, **Settings…**, **Show taskbar widget**, **Exit**).
+  - Use **Settings → General → Pin to the left edge of the taskbar** and **Display** to control docking and multi-monitor persistence (temporarily falls back to the primary taskbar when a display disconnects, and restores automatically on reconnect).
 
-Refresh behavior:
+---
 
-- Double-click the quota area of the widget to refresh it.
-- **Update frequency** sets the normal interval. **Refresh every minute when remaining ≤20%** is on by default. It refreshes a service every minute while one of its quota windows has 20% or less left. A service with a used-up window keeps the normal interval, because it cannot use more quota until the reset.
-- Network and server errors retry with increasing delays. When a server answers `429` with a `Retry-After` time, the app waits until that time.
-- When a login expires or credentials are missing, the app stops retrying that service until its credentials file changes or you choose **Refresh**.
-- Shortly after a quota window resets, the app checks again so the new window shows quickly.
+## Customizing Appearance & Reducing Taskbar Width
 
-### Appearance
+Open **Settings → Appearance** to tune the widget with a live preview at the top:
 
-Right-click the widget or tray icon and open **Settings → Appearance** to choose a system, high-contrast dark, or high-contrast light palette; continuous, segmented, or classic tiled bars; standard or slim bars; and standard or larger text. High-contrast palettes add a solid backdrop and bold text for readability over translucent taskbars. The **Translucent dark preset** action applies high-contrast dark colors, slim continuous rounded bars, and larger text. The widget also fits its height to the selected taskbar, avoiding clipped rows on 40-pixel taskbars. Use **Show provider logos** to control icon spacing. **Codex colors** lets you adjust and save independent Codex icon, bar, and percentage colors. **Compact layout** stacks quota labels over their bars when one service is enabled in Simplified Chinese. See [appearance customization](docs/appearance-customization.md).
+- **Bar style:** Continuous rounded, Segmented, Dots, or **Battery** (with **Percentage position** set to **Outside battery** or **Inside battery**).
+- **Bar thickness & text size:** Thin / Medium / Thick bars and `12 px` / `14 px` / `16 px` text (automatically steps down if the taskbar height is tight).
+- **Background & colors:** Follow system, High contrast dark, or High contrast light backdrop; **Brand colors**, **By remaining quota** (green / amber / red), or **Single color** (5 curated swatches).
+- **Quick looks:** One-click **Translucent dark** (high-contrast dark, thin continuous bars, `14 px` text) or **Restore defaults**.
 
-### Privacy and local MCP
+### Making a 3-Service Widget Narrower
 
-**Settings → Privacy & updates** controls passive monitoring and application updates. Passive monitoring is on by default. It uses usage endpoints and pauses authentication retries on sign-in failures. See [managed installation and policy](docs/installation.md#managed-installations).
+When monitoring Codex, Claude Code, and Antigravity at the same time, combine these settings to save taskbar space:
 
-**Settings → Privacy & updates → Local MCP server for AI agents** enables read-only Codex and Claude Code quota tools over loopback. It defaults to off. See the [MCP setup guide](docs/mcp.md).
+1. Under **Settings → Appearance**, set **Bar style** to **Battery** and **Percentage position** to **Inside battery**.
+2. Turn off **Show quota period labels** (`5h` / `7d`) and/or **Show provider logos**.
+3. Keep **Reset time display** on **Countdown** (narrower than cross-day clock timestamps).
+4. Under **Settings → Usage**, optionally show only the 5-hour row or only the weekly row (at least one row always stays visible).
 
-## Diagnostics
+![Compact three-service taskbar widget using battery bars with percentages inside each battery and hidden period labels](.github/taskbar-compact-battery.png)
 
-If you need to troubleshoot startup or visibility issues, run:
+![Compact three-service taskbar widget showing local reset clock times such as 20:04 and 11/28](.github/taskbar-compact-clock.png)
+
+![Codex Usage Windows 11 Fluent Appearance settings page with live preview and customization controls](.github/settings-appearance.png)
+
+See the [Appearance customization guide](docs/appearance-customization.md) for all options and configuration fields.
+
+---
+
+## Refresh, Alerts & Startup
+
+- **Independent polling & backoff:** Each service maintains its own schedule, error state, and exponential retry backoff. A slow or failing provider never blocks or overwrites another.
+- **Update frequency:** Choose `1 min`, `5 min`, `15 min` (default), or `1 hour` under **Settings → Usage**. **Refresh faster when quota is low** (every minute when remaining is 20% or less) is on by default (exhausted `0%` windows stay on the normal schedule until reset).
+- **Smart recovery:** Honors `429 Retry-After` headers, pauses auth retries when credentials are missing/expired until the credential file changes or you manually refresh, checks again shortly after a reset boundary, and refreshes automatically after sleep wake or network recovery.
+- **Alerts (Settings → Alerts):**
+  - **Low-quota alert:** Off by default; choose `10%`, `20%`, or `30%` remaining. Deduplicated once per service and reset window, even across app restarts.
+  - **Notify on reset:** Off by default; notifies after a fresh reading confirms that a previously observed window has reset.
+- **Start with Windows (Settings → General):** Launches automatically after signing in to Windows. If Windows has disabled the entry in **Startup apps**, Codex Usage detects the blocked state and displays an **Open Startup apps** button that jumps directly to Windows Startup settings so you can re-enable it.
+
+![Codex Usage dark mode General settings window with merged title bar, theme selector, language selector, and startup controls](.github/settings-dark.png)
+
+For taskbar error codes and recovery steps, see [Troubleshooting](docs/troubleshooting.md).
+
+---
+
+## Privacy, Local MCP & Diagnostics
+
+### Privacy & Network Behavior
+
+Codex Usage is open source with no external backend and no telemetry.
+
+- **What it reads locally:** Only the local credential/usage sources listed in the [Requirements & Account Support](#requirements--account-support) table for the services you enable.
+- **Outbound network traffic:** Sends usage queries directly to the official endpoints of enabled providers (OpenAI ChatGPT Codex, Anthropic Claude, Google Cloud Code / Antigravity) and checks GitHub only when update checks are enabled. Outbound requests honor standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` environment variables.
+- **Passive monitoring (on by default):** Under **Settings → Privacy & updates**, passive monitoring queries usage endpoints only and pauses retries on auth failures instead of invoking CLI refreshes or model inference. Inference-based fallback (such as Claude Messages API rate-limit headers) and background CLI token refresh run only if you explicitly switch passive monitoring off.
+- **What it never does:** Never sends credentials to third-party servers, never uploads project files, never edits Codex `auth.json` directly, never writes Windows Credential Manager entries, and never reads Claude Desktop sessions.
+
+### Local MCP Server for AI Agents
+
+Under **Settings → Privacy & updates**, enable **Local MCP server** (off by default) to expose read-only quota tools over loopback (`http://127.0.0.1:46827/mcp`).
+
+- Currently exposes `get_codex_usage` and `get_claude_usage` (Codex and Claude Code; Antigravity is not exposed via MCP).
+- Reads directly from the widget's in-memory snapshot — tool calls make zero API requests and consume zero model quota.
+- See the [Local MCP guide](docs/mcp.md) for Claude Code / Codex CLI setup, custom ports, JSON schema, and security boundaries.
+
+### Diagnostics & Settings Path
+
+Settings are stored in `%APPDATA%\CodexUsage\settings.json`. To write a diagnostic log to `%TEMP%\codex-usage.log` (version, install channel, failure categories, retry timing — never tokens or credentials):
 
 ```powershell
-codex-usage --diagnose
+# Per-user installation
+& "$env:LOCALAPPDATA\Programs\CodexUsage\codex-usage.exe" --diagnose
+
+# Portable copy (from the folder containing codex-usage.exe)
+.\codex-usage.exe --diagnose
 ```
 
-This writes a log file to:
+---
 
-```text
-%TEMP%\codex-usage.log
+## Frequently Asked Questions
+
+### Can the Windows taskbar show Codex, Claude Code, and Google Antigravity quotas at the same time?
+
+Yes. Open **Settings → Usage** and enable any combination of **Codex**, **Claude Code**, and **Antigravity**. Each service displays in its own column with independent polling, error handling, and color coding.
+
+### If I am only signed in to Claude Desktop, can Codex Usage read my Claude Code quota?
+
+No. Claude Desktop and Claude Code CLI use separate local sessions, and Codex Usage does not read Claude Desktop authentication data. Install and sign in to **Claude Code CLI** (on Windows or inside WSL), then enable **Claude Code** in **Settings → Usage**.
+
+### How do I see the exact local reset time for 5-hour and weekly quotas?
+
+Hover over a service column on the taskbar to see the full local date and time (`YYYY-MM-DD HH:MM`) for both the 5-hour and weekly windows. To show clock times directly on the taskbar instead of countdowns (`4h`, `6d`), set **Settings → Appearance → Reset time display** to **Reset time** (`20:04`, `11/23 00:30`, `11/28`).
+
+### How can I make the taskbar widget narrower when all three services are enabled?
+
+Set **Settings → Appearance → Bar style** to **Battery** and **Percentage position** to **Inside battery**, then turn off **Show quota period labels** (and optionally **Show provider logos**). Keeping **Reset time display** on **Countdown** or hiding one of the two quota rows under **Settings → Usage** reduces width even further.
+
+### Why didn't Codex Usage launch after signing in even though Start with Windows was enabled?
+
+Windows may have disabled the entry in **Settings → Apps → Startup**. Open **Codex Usage → Settings → General**: if Windows is blocking startup, the **Start with Windows** row displays a warning and an **Open Startup apps** button to jump straight to Windows Startup settings and re-enable it.
+
+### Does monitoring quotas or enabling the local MCP server consume model quota or upload credentials?
+
+No. By default, **Passive monitoring** is on, so Codex Usage only queries usage endpoints and never sends model prompts. Local MCP calls read the widget's cached in-memory snapshot on `127.0.0.1` without making network requests. Credentials stay on your machine and are sent only to the official provider endpoints over TLS (or your configured proxy).
+
+---
+
+## Building from Source & License
+
+Requires Rust (2021 edition) on Windows:
+
+```powershell
+cargo build --release
 ```
 
-The log records the application version, install channel, executable path, polling failure category, and retry timing. It does not log access tokens or credential contents. See [Troubleshooting](docs/troubleshooting.md) for the taskbar error labels and recovery steps.
+The compiled single-file executable is written to `target\release\codex-usage.exe`.
 
-Settings are saved to:
-
-```text
-%APPDATA%\CodexUsage\settings.json
-```
-
-## Account Support
-
-Codex usage is read from the account authenticated in the local Codex installation. Optional Claude Code monitoring works with the account types supported by Claude Code.
-
-As of **March 19, 2026**, Anthropic's Claude Code setup documentation says:
-
-- **Supported:** Pro, Max, Teams, Enterprise, and Console accounts
-- **Not supported:** the free Claude.ai plan
-
-If Anthropic changes Claude Code availability in the future, this app should follow whatever Claude Code supports, as long as the usage data remains exposed through the same authenticated endpoints.
-
-## Privacy And Security
-
-This project is **open source**, so you can inspect exactly what it does.
-
-What the app reads:
-
-- Your local Claude Code OAuth credentials from `~/.claude/.credentials.json`
-- If `CLAUDE_CONFIG_DIR` is set, the Claude Code credentials file in that directory
-- If needed, the same credentials file inside an installed WSL distro
-- If Codex is enabled, your local Codex credentials from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`
-- If Antigravity is enabled, the Antigravity CLI `/usage` output. If the CLI query fails, the local Antigravity OAuth token from Windows Credential Manager target `gemini:antigravity`
-
-What the app sends over the network:
-
-- Requests to Anthropic's Claude endpoints to read your usage and rate-limit information
-- Requests to ChatGPT's Codex usage endpoint to read your Codex usage and rate-limit information, if Codex is enabled
-- Requests to Google's Cloud Code / Antigravity endpoints to read your Antigravity quota information, if Antigravity is enabled
-- Requests to GitHub only if you use the app's update check / self-update feature
-- If proxy environment variables such as `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY` are set, those outbound requests may use that proxy
-
-What the app stores locally:
-
-- Widget position
-- Selected taskbar / screen
-- Widget visibility
-- Polling frequency
-- Language preference
-- Last update check time
-- Visible quota rows and low-quota alert threshold
-- Quota-window notification keys used to prevent duplicate alerts
-- Displayed model preferences
-- Appearance, selected display, left-edge pinning, and the faster-refresh setting
-
-What it does **not** do:
-
-- It does not send your credentials to any other server
-- It does not use a separate backend service
-- It does not collect analytics or telemetry
-- It does not upload your project files
-- It does not directly edit your Codex credentials file
-- It does not read or reuse Claude Desktop authentication data
-
-Notes:
-
-- If your Claude Code token is expired, the app may ask the local Claude CLI to refresh it in the background
-- If your Codex token is expired, the app may ask the local Codex CLI to refresh it in the background. The monitor does not write `auth.json` itself; any credential update is handled by the Codex CLI.
-- If your Antigravity token is expired, open Antigravity and sign in again. The monitor does not write Windows Credential Manager entries itself.
-- Portable installs can update themselves by downloading the latest release from this repository
-- Proxies should be trusted because proxied usage requests include your OAuth bearer token inside the TLS connection
-
-## How It Works
-
-The monitor:
-
-1. Finds your enabled model login credentials
-2. Reads your current usage from Anthropic, ChatGPT, and/or Google's Antigravity endpoints
-3. Shows the result directly in the Windows taskbar
-4. Keeps the widget aligned with the selected taskbar and tray area
-5. Refreshes periodically in the background
-
-If the newer usage endpoint is unavailable, it can fall back to reading the rate-limit headers returned by Claude's Messages API.
-
-## Open Source
-
-This project is licensed under the MIT License. The original [LICENSE](LICENSE) and copyright notice are preserved.
-
-The Claude and OpenAI marks come from [Lobe Icons](https://github.com/lobehub/lobe-icons) under the MIT License. See [src/icons/providers](src/icons/providers). Brand names and marks belong to their owners.
-
-Codex Usage is a maintained derivative of [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor). Thanks to Craig Constable and the upstream contributors for the original project. Changes in this repository are not affiliated with or endorsed by the upstream maintainers or OpenAI.
-
-If you want to inspect the behavior or audit the code, everything is in this repository.
+- **License:** MIT License ([LICENSE](LICENSE)).
+- **Icons:** Provider marks from [Lobe Icons](https://github.com/lobehub/lobe-icons) under the MIT License (see [src/icons/providers](src/icons/providers)). Brand names and marks belong to their respective owners.
+- **Upstream acknowledgment:** Codex Usage is a maintained derivative of [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) by Craig Constable and contributors. Changes in this repository are not affiliated with or endorsed by the upstream maintainers, OpenAI, Anthropic, or Google.

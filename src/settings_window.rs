@@ -5587,6 +5587,11 @@ mod tests {
             std::fs::write(path, bmp).unwrap();
         };
 
+        let snapshot_language = std::env::var("CODEX_SETTINGS_SNAPSHOT_LANG")
+            .ok()
+            .and_then(|code| LanguageId::from_code(&code))
+            .unwrap_or(LanguageId::SimplifiedChinese);
+
         unsafe {
             {
                 let mut state = lock_state();
@@ -5597,8 +5602,8 @@ mod tests {
                     win_event_hook: None,
                     is_dark: false,
                     embedded: false,
-                    language_override: Some(LanguageId::SimplifiedChinese),
-                    language: LanguageId::SimplifiedChinese,
+                    language_override: Some(snapshot_language),
+                    language: snapshot_language,
                     appearance: Appearance::default(),
                     quota_display_mode: QuotaDisplayMode::Remaining,
                     settings_theme: SettingsTheme::Light,

@@ -1,277 +1,221 @@
-![Windows](https://img.shields.io/badge/platform-Windows-blue)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+![Windows](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D4)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Latest Release](https://img.shields.io/github/v/release/upstream-ray/codex-usage-monitor)](https://github.com/upstream-ray/codex-usage-monitor/releases/latest)
 
 [English](README.md) | **简体中文**
 
-# Codex Usage
+# Codex Usage — Windows 任务栏额度监控
 
-<img src=".github/codex-usage-icon.png" alt="Codex Usage 图标" width="96" height="96">
+<img src=".github/codex-usage-icon.png" alt="Codex Usage 应用图标" width="72" height="72">
 
-![运行效果](.github/animation.gif)
+Codex Usage 是一款轻量的 Windows 原生任务栏额度监控小组件，用于在任务栏直接查看 **OpenAI Codex**、**Claude Code** 和 **Google Antigravity** 的 5 小时与每周额度及重置时间。无需打开网页或桌面客户端，可单独监控其中一个服务，也可将三个服务并排显示在 Windows 10 或 Windows 11 任务栏上。
 
-这张动图展示的是早期分段进度条。当前版本可在**外观**中选择分段或连续进度条。
+应用采用 Rust 与原生 Win32 API 编写（约 1.2 MB 单文件可执行程序，无 Electron 或 WebView2 运行时依赖），内置 Windows 11 Fluent 风格设置窗口（支持浅色、深色与跟随系统主题）、12 种界面语言、低额度与重置提醒，以及面向 AI 代理的本地只读 MCP 服务。
 
-一款轻量级的 Windows 原生任务栏小组件，用于监控 Codex 用量，并可选择同时显示 Claude Code 和 Google Antigravity 用量。
+![Windows 深色任务栏上的 Codex Usage 组件，同时显示 Claude Code、OpenAI Codex 和 Google Antigravity 的 5 小时与每周连续圆角进度条及倒计时](.github/taskbar-preview.png)
 
-它常驻任务栏，无需打开 Codex 应用或账户用量页面，就能随时查看 Codex 用量窗口还剩多少。
+**[下载最新版本](https://github.com/upstream-ray/codex-usage-monitor/releases/latest)** · **[安装与托管策略](docs/installation.md)** · **[外观自定义指南](docs/appearance-customization.md)** · **[本地 MCP 配置](docs/mcp.md)** · **[故障排查](docs/troubleshooting.md)**
 
-## 功能亮点
+---
 
-- 显示当前 Codex **5 小时**用量窗口
-- 显示当前**每周**用量窗口
-- 支持简体中文界面，明确显示剩余用量和重置倒计时
-- 可同时显示 Claude Code 用量
-- 可显示 Google 5 小时及每周 Gemini 配额窗口中的 Antigravity 模型用量
-- 实时显示各项限额的重置倒计时
-- 可在剩余配额为 10%、20% 或 30% 时发出提醒；每个重置窗口只提醒一次
-- 可分别控制 5 小时和每周用量行的显示
-- 小巧的原生组件，直接嵌入 Windows 任务栏
-- 使用一个与桌面应用一致的系统托盘图标
-- 左键单击托盘图标可显示或隐藏任务栏组件
-- 独立设置窗口可连续调整用量、外观、提醒和更新等选项。每项改动即时生效并保存。
-- 支持多显示器任务栏，可将组件放到指定屏幕的任务栏中
-- 可调整配色、进度条样式、进度条粗细和文字大小
-- 每个服务列显示 Claude 或 OpenAI 标志，Codex 使用绿色
-- 服务没有返回的额度窗口显示 `--` 和空进度条，不再误显示剩余 100%
-- 各服务独立刷新和重试；刷新失败时保留上次的数字并标记 `*`
-- 鼠标悬停在服务列上，可查看上次成功更新时间、下次刷新时间和错误原因
-- 电脑从睡眠中唤醒或网络恢复后自动刷新
+## 系统要求与账户支持
 
-## 适用人群
+- **操作系统**：Windows 10 或 Windows 11。网络恢复后自动刷新需要 Windows 10 2004 及以上版本；更早版本的 Windows 10 仍会按设定周期及睡眠唤醒后正常刷新。
+- **登录前提**：本机已安装并登录至少一个受支持的 CLI 或客户端。
 
-本应用适合已经在 Windows 上**安装并登录 Codex CLI 或 Codex 应用**的用户。
+| 服务 | 默认状态 | 登录前提 | 本地凭据来源 | 额度窗口与说明 |
+| --- | --- | --- | --- | --- |
+| **Codex** | 开启 | 已安装并登录 Codex CLI 或 Codex 应用 | `$CODEX_HOME/auth.json` 或 `~/.codex/auth.json` | 显示当前本地登录账户的 5 小时（`5h`）与每周（`7d`）额度。 |
+| **Claude Code** | 关闭 | 已安装并登录 Claude Code CLI（支持 Windows 与 WSL） | `~/.claude/.credentials.json`、`$CLAUDE_CONFIG_DIR` 或已安装的 WSL 发行版 | 截至 2026 年 3 月 19 日 Anthropic 文档支持 Pro、Max、Teams、Enterprise 与 Console 账户，不支持免费 Claude.ai 方案。**仅登录 Claude 桌面端无法获取 Claude Code 额度。** |
+| **Google Antigravity** | 关闭 | 已安装并登录 Google Antigravity | Antigravity CLI `/usage` 输出（查询失败时回退读取 Windows 凭据管理器 `gemini:antigravity`） | 默认读取 **Gemini Models** 的 5 小时与每周额度；可在「设置 → 用量 → Antigravity 额度组」切换其他已返回额度组。 |
 
-Codex 默认启用，应用会读取 Codex 使用的同一份本地登录凭据。
+服务未返回的额度窗口会显示 `--` 和空进度条，不再误显示为 `100%`。凭据缺失或过期时，任务栏显示 `!`，同时在「设置 → 用量」对应项下方给出登录提示。
 
-Antigravity 也是可选功能。若要显示其用量，请安装并登录 Google Antigravity，然后在**设置 → 用量**中启用 **Antigravity**。
+---
 
-如果你希望始终看到自己离用量上限还有多远，而不必反复打开其他页面，这款工具会很合适。
+## 下载、安装与首次使用
 
-## 系统要求
+### 1. 按用户安装（推荐）
 
-- Windows 10 或 Windows 11
-- 已安装并完成身份验证的 Codex CLI 或 Codex 应用
-- 可选：已安装并完成身份验证的 Claude Code
-- 可选：若需查看 Antigravity 用量，需安装并登录 Google Antigravity
-
-网络恢复后自动刷新需要 Windows 10 2004 或更高版本。在更早的 Windows 10 上，应用照常运行，但只在睡眠唤醒后和按正常周期刷新。
-
-通过 WSL 使用 Claude Code 也受支持。监控器可以从 Windows 或 WSL 环境读取 Claude Code 凭据。
-
-## 安装
-
-如需按用户安装，请从[最新版本](https://github.com/upstream-ray/codex-usage-monitor/releases/latest)下载 `install.ps1`，然后运行：
+从[最新发布页](https://github.com/upstream-ray/codex-usage-monitor/releases/latest)下载 `install.ps1`，在 PowerShell 中运行（无需管理员权限）：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-安装程序会校验发布文件的 SHA256，并在无需管理员权限的情况下安装到 `%LOCALAPPDATA%\Programs\CodexUsage`。它还会创建开始菜单快捷方式，并在 Windows“已安装的应用”中添加卸载项。
+安装脚本会校验发布文件的 SHA-256，将程序安装到 `%LOCALAPPDATA%\Programs\CodexUsage\codex-usage.exe`，创建开始菜单与桌面快捷方式，在 Windows「已安装的应用」中注册卸载项，并在安装完成后自动启动。安装过程**不会修改系统 `PATH`**。
 
-如需便携使用，可从同一版本页面下载 `codex-usage.exe`，放在任意具有写入权限的目录中运行。你也可以在本地构建：
+### 2. 便携运行
 
-```powershell
-cargo build --release
-```
+也可以从同一[发布页](https://github.com/upstream-ray/codex-usage-monitor/releases/latest)直接下载 `codex-usage.exe`，放在任意当前用户可写的目录中运行。便携版与安装版共用 `%APPDATA%\CodexUsage\settings.json`，同样支持应用内自更新。
 
-本地构建的可执行文件位于 `target\release\codex-usage.exe`。
+### 3. 首次配置
 
-## 卸载
+1. 启动 **Codex Usage**（运行 `install.ps1` 后会自动启动，后续可从开始菜单或桌面快捷方式打开）。
+2. 右键单击任务栏组件或系统托盘图标，选择「设置…」。
+3. 在「设置 → 用量」中开启需要监控的 **Codex**、**Claude Code** 或 **Antigravity**。每项改动会立即生效并保存。
+4. 在「设置 → 常规」中按需调整设置窗口主题（跟随系统、浅色、深色）、界面语言（支持 12 种语言）及「开机自动启动」。
 
-可在 Windows“设置”>“应用”>“已安装的应用”中卸载 **Codex Usage**，或运行：
+### 升级与卸载
+
+- **应用内更新**：在「设置 → 隐私与更新」中检查并安装更新（默认开启，从 GitHub Releases 下载并校验 SHA-256）。
+- **卸载**：在 Windows「设置 → 应用 → 已安装的应用」中卸载 **Codex Usage**，或运行：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\CodexUsage\uninstall.ps1"
 ```
 
-卸载时会保留 `%APPDATA%\CodexUsage\settings.json`。如需同时删除设置，请显式添加 `-RemoveSettings`。有关升级、便携版和开机启动的说明，请参阅[安装机制](docs/installation.md)。
+默认卸载会保留 `%APPDATA%\CodexUsage\settings.json`，以便重装后恢复配置；如需连同设置一起删除，请添加 `-RemoveSettings` 参数。升级迁移、托管安装与设备策略详见[安装机制](docs/installation.md)。
 
-## 使用方法
+---
 
-运行：
+## 读懂任务栏组件
 
-```powershell
-codex-usage
-```
+每个已启用的服务拥有独立的数据列、刷新节奏与错误状态。
 
-启动后，它会出现在任务栏和通知区域的系统托盘中。
+- **额度周期（`5h` / `7d`）**：分别对应 5 小时额度窗口与每周额度窗口。
+- **剩余与已用**：在「设置 → 用量 → 额度数值」中可统一切换「剩余」（新安装默认）或「已用」。百分比数值、进度条填充比例与托盘摘要会同步切换，且不受界面语言影响。
+- **重置时间格式（中英文任务栏使用统一简洁格式）**：
 
-- 拖动左侧分隔线可移动任务栏组件
-- 选择**设置 → 常规 → 固定在任务栏最左侧**，可让组件固定在任务栏左端，而不是托盘旁边
-- 在多显示器环境中，选择**设置 → 常规 → 显示器**指定任务栏，也可将组件拖到另一个任务栏。选择会保存；断开所选显示器时暂用主任务栏，重新连接后自动返回。
-- 右键单击任务栏组件或托盘图标，可以立即刷新、打开设置、显示或隐藏组件、退出。设置窗口在调整时保持打开。
-- 左键单击托盘图标可显示或隐藏任务栏组件
-- 如需登录 Windows 后自动运行，请在**设置 → 常规**中启用**开机自动启动**
+| 显示模式（「设置 → 外观 → 重置时间显示」） | 5 小时额度（当天重置） | 5 小时额度（跨日重置） | 每周额度 |
+| --- | --- | --- | --- |
+| **倒计时**（默认） | `4h` / `45m` / `30s` | `4h` | `6d` |
+| **重置时刻** | `20:04` | `11/23 00:30` | `11/28` |
 
-### 监控服务
+- **查看精确本地重置时间**：将鼠标悬停在任务栏上的任一服务列，即可查看 5 小时与每周额度的完整本地日期和时分（`YYYY-MM-DD HH:MM`，例如 `5 小时额度重置 · 2026-11-22 20:04`）、上次成功更新时间、下次刷新时间及具体错误原因。
+- **常见状态说明**：
 
-在**设置 → 用量**中选择组件要显示的独立服务。这些服务不是互斥模型，因此可以同时监控多个账户：
-
-- **Codex** 默认启用
-- **Claude Code** 在已安装并登录 Claude Code CLI 时，可与 Codex 同时显示或单独显示
-- **Antigravity** 可与其他提供商同时显示，也可作为独立服务列单独显示
-
-显示多个服务时，每个服务都有自己的用量条和对应的文字颜色。Antigravity 优先通过已登录的 Antigravity CLI 读取 **View Usage** 中 **Gemini Models** 的剩余额度。CLI 无法查询时，组件尝试读取 Google 的账户配额摘要。也可以在**设置 → 用量 → Antigravity 额度组**中选择其他已返回的额度组。缺失的窗口显示为 `--`。
-
-Claude 桌面客户端与 Claude Code CLI 使用相互独立的本地登录状态。只登录 Claude 桌面客户端不会启用 Claude Code 监控。启用 **Claude Code** 后才检查它的凭据。凭据缺失或过期时，组件会提示登录。
-
-### 系统托盘图标
-
-无论启用了多少服务，应用始终只显示一个托盘图标，并使用与可执行文件及桌面快捷方式相同的内嵌图标。
-
-将鼠标悬停在托盘图标上，会显示所有已启用服务的紧凑用量摘要。左键单击可显示或隐藏任务栏组件，右键单击可打开快捷菜单。
-
-### 用量显示与提醒
-
-在**设置 → 用量**中，可同时显示两个配额周期，也可只显示其中一个。应用始终会保留至少一行。**额度显示**可统一选择「剩余」或「已用」，数值、进度条和托盘提示会同步切换。新安装默认显示剩余量。旧设置按原界面语言选定并保存初始模式，之后切换语言时沿用该选择。
-
-在**额度提醒**中，可选择剩余配额为 10%、20% 或 30% 时提醒。提醒默认关闭。每个提供商的每个配额窗口只会提醒一次，直到重置时间发生变化；即使应用重启，也不会重复提醒。也可开启「额度重置时通知」，等新读数确认窗口重置后再收到通知。
-
-简体中文界面的紧凑任务栏行使用 `5h` / `7d`、选定的额度百分比，以及 `18:30重置` 或 `07/17重置` 这样的具体本地重置时间。
-
-百分比使用固定宽度的数字列，数值从 `9%` 变成 `10%` 时，重置时间的位置不会移动。
-
-### 刷新与状态
-
-每个已启用的服务分别保存自己的数据、上次成功更新时间、错误和重试计划。一个服务变慢或出错，不会拖慢或覆盖其他服务的数字。
-
-| 显示 | 含义 |
+| 任务栏显示 | 含义 |
 | --- | --- |
-| `--` 和空进度条 | 暂时取不到额度，或窗口重置已满 5 分钟且新读数仍未返回。 |
-| 读数后的 `*` | 显示的是已过时的读数。若窗口已重置，组件会隐藏旧重置时间，等待新读数。 |
-| `<1%` | 剩余量或已用量大于 0 且小于 1%。 |
-| `!`、`网络`、`限流`、`服务`、`错误` | 应用启动后该服务还没有成功返回过数据，文字说明原因。 |
+| `--` 与空进度条 | 该服务未返回此窗口额度，或窗口重置已满 5 分钟且新读数尚未返回。 |
+| 读数后的 `*` | 当前显示的是过时读数（最近一次刷新失败或已超时）。若窗口已过重置时刻，旧重置时间会隐藏，等待新读数。 |
+| `<1%` | 剩余量或已用量大于 0 但不足 1%。 |
+| `!`、`网络`、`限流`、`服务`、`错误` | 启动后尚未成功获取过数据：需登录（`!`）、网络或 TLS 失败（`网络`）、触发限流（`限流`）、服务端异常（`服务`）或响应异常（`错误`）。 |
 
-鼠标悬停在服务列上，可查看上次成功更新时间、下次刷新或重试时间，以及最近的错误。额度缺失或窗口已重置时，悬停提示会说明原因。
+- **任务栏与托盘操作**：
+  - **拖动**组件最左侧的竖向分隔线可自由移动位置，或直接拖到另一块显示器的任务栏。
+  - **双击**组件右侧的额度区域可立即手动刷新。
+  - **左键单击**系统托盘图标可快速显示或隐藏任务栏组件；悬停托盘图标可查看所有已启用服务的紧凑摘要。
+  - **右键单击**组件或托盘图标打开精简菜单（刷新、设置…、显示任务栏组件、退出）。
+  - 在「设置 → 常规」中可开启「固定在任务栏最左侧」或通过「显示器」指定目标任务栏；断开外接显示器时会暂落主任务栏，重新连接后自动恢复。
 
-刷新规则
+---
 
-- 双击组件的额度区可立即刷新。
-- **更新频率**设置正常刷新间隔。**剩余 ≤20% 时每分钟刷新**默认开启：某个服务的任一额度窗口剩余不超过 20% 时，该服务改为每分钟刷新一次。额度已经用完的服务保持正常间隔，因为重置前它不会再消耗额度。
-- 网络和服务器错误会按逐渐变长的间隔重试。服务器返回 `429` 并带有 `Retry-After` 时，应用会等到该时间再请求。
-- 登录过期或找不到凭据时，应用停止重试该服务，直到凭据文件发生变化，或你手动选择**刷新**。
-- 额度窗口刚重置后，应用会很快再查一次，让新窗口尽快显示。
+## 自定义外观与缩小组件宽度
 
-### 自定义外观
+在「设置 → 外观」中调整样式时，顶部预览区会实时显示效果：
 
-右键任务栏组件或托盘图标，打开**设置 → 外观**，可以调整以下选项。
+- **进度条样式**：支持连续圆角、分段、圆点与**电池** 4 种样式；选择电池样式时，「百分比位置」可选「电池外」或「电池内」。
+- **粗细与字号**：3 档进度条粗细（细 / 中 / 粗）与 3 档文字大小（`12 px` / `14 px` / `16 px`），当任务栏高度较窄时字号会自动降档防止裁切。
+- **背景与配色**：背景样式可选跟随系统、高对比深色或高对比浅色；配色方式支持**品牌色**、**按余量变色**（绿 / 琥珀 / 红）或**统一单色**（5 种内置色块）。
+- **快速外观**：支持一键套用「半透明深色」（高对比深色背景、细连续圆角进度条、`14 px` 字号）或「恢复默认」。
 
-- **文字与颜色**：跟随系统、高对比深色、高对比浅色。高对比模式使用实色背景和加粗文字，避免半透明任务栏的壁纸降低可读性。
-- **进度条样式**可选择连续圆角、分段或经典方块。
-- **进度条粗细**：标准或细。
-- **文字大小**：标准或较大。
-- 可以显示或隐藏服务图标。Codex 图标、进度条和数字可分别配色并保存为预设。
-- 简体中文界面只监控一个服务时，可以启用上下排布的紧凑布局。
+### 三个服务同显时如何缩窄组件宽度
 
-对于深色半透明、约 40 像素高的 Windows 任务栏，可直接选**半透明深色预设**。该预设使用高对比深色、细连续圆角进度条和较大文字。组件高度会限制在当前任务栏高度内，避免两行内容被裁切。所有外观选项保存在 `settings.json` 的 `appearance` 字段中；旧配置会沿用原来的外观。
+同时开启 Codex、Claude Code 和 Antigravity 时，可按以下组合显著压缩任务栏占用宽度：
 
-### 隐私与本地 MCP
+1. 在「设置 → 外观」将「进度条样式」设为「电池」，并将「百分比位置」设为「电池内」。
+2. 关闭「显示额度周期标签」（隐藏 `5h` / `7d`），按需关闭「显示服务图标」。
+3. 将「重置时间显示」保持为「倒计时」（比跨日「重置时刻」更紧凑）。
+4. 在「设置 → 用量」中按需仅保留 5 小时额度或每周额度中的一行（应用至少保留一行）。
 
-**设置 → 隐私与更新**可配置被动监控和应用更新。被动监控默认开启，登录失效时暂停认证重试并提示重新登录。托管设备可使用[安装与策略说明](docs/installation.md#managed-installations)。
+![三个服务同显的紧凑任务栏组件，采用电池样式并将百分比显示在电池内，隐藏周期标签并使用倒计时](.github/taskbar-compact-battery.png)
 
-**设置 → 隐私与更新 → 供 AI 代理使用的本地 MCP 服务**可通过本机回环地址查询 Codex 和 Claude Code 的额度。默认关闭，配置方式见 [MCP 指南](docs/mcp.md)。
+![三个服务同显的电池紧凑样式，显示 20:04 和 11/28 等具体本地重置时刻](.github/taskbar-compact-clock.png)
 
-## 诊断
+![Codex Usage 的 Windows 11 Fluent 风格外观设置页，包含顶部实时预览与各项样式控制](.github/settings-appearance-zh-CN.png)
 
-如需排查启动或显示问题，请运行：
+完整外观选项与配置字段详见[外观自定义指南](docs/appearance-customization.md)。
+
+---
+
+## 刷新、提醒与开机自动启动
+
+- **多服务独立刷新与重试**：每个服务独立维护数据、错误状态和指数退避重试，单个服务超时或报错不会拖慢或覆盖其他服务。
+- **更新频率**：在「设置 → 用量」中可选 `1 分钟`、`5 分钟`、`15 分钟`（默认）或 `1 小时`。「额度紧张时加快刷新」默认开启，当任一额度窗口剩余不超过 20% 时自动切为每分钟刷新（已用尽为 `0%` 的窗口维持正常间隔直到重置）。
+- **自动恢复**：遵循服务端 `429 Retry-After` 提示；登录失效时暂停重试，直到凭据文件变化或手动刷新；窗口重置后会及时补查，并在电脑睡眠唤醒或网络恢复后自动刷新。
+- **提醒（「设置 → 提醒」）**：
+  - **低额度提醒**：默认关闭，可选剩余 `10%`、`20%` 或 `30%` 触发通知；每个服务的每个重置周期只提醒一次，重启应用也不会重复提醒。
+  - **额度重置时通知**：默认关闭，在新读数确认已观察窗口完成重置后发出通知。
+- **开机自动启动（「设置 → 常规」）**：开启后在登录 Windows 时自动运行。如果该启动项在 Windows 系统「启动应用」中被手动禁用，设置页会自动识别禁用状态，并显示「打开启动应用」按钮，点击即可直达 Windows 系统设置重新启用。
+
+![Codex Usage 深色模式下的常规设置窗口，展示融合标题栏、主题与语言下拉选择及开机自动启动选项](.github/settings-dark-zh-CN.png)
+
+完整的状态码含义与排查方法见[故障排查](docs/troubleshooting.md)。
+
+---
+
+## 隐私、本地 MCP 与诊断
+
+### 隐私与网络行为
+
+Codex Usage 完全开源，没有自建后端服务，也不收集任何遥测或统计数据。
+
+- **本地读取范围**：仅读取[系统要求与账户支持](#系统要求与账户支持)表中已启用服务对应的本地凭据或 CLI 输出。
+- **网络请求范围**：仅向已启用服务的官方额度端点发送查询请求（OpenAI ChatGPT Codex、Anthropic Claude、Google Cloud Code / Antigravity），并仅在开启更新检查时访问 GitHub Releases。出站请求会遵循系统代理环境变量（`HTTPS_PROXY`、`HTTP_PROXY`、`ALL_PROXY`），请确保代理可信。
+- **被动监控（默认开启）**：在「设置 → 隐私与更新」中控制。开启时仅调用只读用量接口，凭据失效时暂停重试，不触发模型推理或后台登录刷新；关闭后才允许后台调用本地 CLI 刷新令牌，或使用 Claude Messages API 响应头回退获取重置时间。
+- **不会执行的操作**：不向第三方服务器发送凭据、不上传本地项目文件、不直接改写 Codex `auth.json`、不写入 Windows 凭据管理器、不读取 Claude 桌面端登录态。
+
+### 供 AI 代理使用的本地 MCP 服务
+
+在「设置 → 隐私与更新」中可开启「本地 MCP 服务」（默认关闭）。开启后仅在本机回环地址 `http://127.0.0.1:46827/mcp` 监听，向支持 MCP Streamable HTTP 的客户端提供只读额度查询。
+
+- 当前提供 `get_codex_usage` 与 `get_claude_usage` 两个工具（覆盖 Codex 与 Claude Code，暂不包含 Antigravity）。
+- 工具调用直接读取内存中的最近一次快照，不发外部请求、不读取凭据，也不会消耗模型额度。
+- 客户端配置命令、自定义端口、返回字段与安全边界详见 [MCP 配置指南](docs/mcp.md)。
+
+### 诊断日志与配置文件
+
+所有设置保存在 `%APPDATA%\CodexUsage\settings.json`。如需排查启动、任务栏嵌入或轮询问题，可带 `--diagnose` 参数启动，日志会写入 `%TEMP%\codex-usage.log`（仅记录版本、渠道、错误分类与重试时间，不含令牌或凭据原文）：
 
 ```powershell
-codex-usage --diagnose
+# 按用户安装
+& "$env:LOCALAPPDATA\Programs\CodexUsage\codex-usage.exe" --diagnose
+
+# 便携版（在 codex-usage.exe 所在目录运行）
+.\codex-usage.exe --diagnose
 ```
 
-日志将写入：
+---
 
-```text
-%TEMP%\codex-usage.log
+## 常见问题
+
+### Windows 任务栏可以同时显示 Codex、Claude Code 和 Antigravity 的额度吗？
+
+可以。打开「设置 → 用量」，按需同时勾选 **Codex**、**Claude Code** 和 **Antigravity** 即可。三个服务相互独立，各自以独立列显示，互不影响刷新与报错。
+
+### 只登录 Claude 桌面端，能读取 Claude Code 的额度吗？
+
+不能。Claude 桌面端与 Claude Code CLI 使用相互独立的本地登录态，Codex Usage 不会读取 Claude 桌面端的认证数据。请在 Windows 或 WSL 环境中安装并登录 **Claude Code CLI**，再在「设置 → 用量」中开启 **Claude Code**。
+
+### 怎么查看 5 小时和每周额度具体在什么时间重置？
+
+将鼠标悬停在任务栏的对应服务列上，即可看到精确到分钟的本地重置日期与时间（`YYYY-MM-DD HH:MM`）。如果希望任务栏直接显示具体时刻而不是倒计时（`4h`、`6d`），可在「设置 → 外观 → 重置时间显示」中切换为「重置时刻」（显示如 `20:04`、`11/23 00:30`、`11/28`）。
+
+### 三个服务都开启时，怎么让任务栏组件更窄？
+
+在「设置 → 外观」中将「进度条样式」设为「电池」，把「百分比位置」设为「电池内」，并关闭「显示额度周期标签」（也可按需关闭「显示服务图标」）。保持「重置时间显示」为「倒计时」，或在「设置 → 用量」中只保留一行额度，可进一步缩小宽度。
+
+### 为什么开启了开机自动启动，登录 Windows 后还是没有运行？
+
+可能是该启动项在 Windows 系统「设置 → 应用 → 启动」中被禁用了。打开 Codex Usage 的「设置 → 常规」，若检测到被系统禁用，「开机自动启动」一栏会显示警告并提供「打开启动应用」按钮，点击即可直达系统页面重新启用。
+
+### 监控额度或启用本地 MCP 服务，会额外消耗模型额度或上传凭据吗？
+
+不会。「被动监控」默认开启，组件只请求官方额度接口，不会发起模型推理；本地 MCP 服务仅监听 `127.0.0.1` 并返回内存缓存，零额外网络请求、零额度消耗。所有凭据仅保留在本地，仅通过 TLS 向对应官方服务端点（或已配置代理）鉴权。
+
+---
+
+## 从源码构建与开源说明
+
+在 Windows 上安装 Rust（2021 edition）后运行：
+
+```powershell
+cargo build --release
 ```
 
-日志会记录应用版本、安装渠道、可执行文件路径、轮询失败类别和重试时间，但不会记录访问令牌或凭据内容。有关任务栏错误标签及恢复步骤，请参阅[故障排除](docs/troubleshooting.md)。
+编译生成的单文件可执行程序位于 `target\release\codex-usage.exe`。
 
-设置保存在：
-
-```text
-%APPDATA%\CodexUsage\settings.json
-```
-
-## 账户支持
-
-Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Code 监控功能支持 Claude Code 本身所支持的账户类型。
-
-截至 **2026 年 3 月 19 日**，Anthropic 的 Claude Code 设置文档说明：
-
-- **支持：** Pro、Max、Teams、Enterprise 和 Console 账户
-- **不支持：** 免费 Claude.ai 方案
-
-如果 Anthropic 以后调整 Claude Code 的可用范围，只要用量数据仍通过相同的身份验证端点提供，本应用会跟随 Claude Code 的支持范围。
-
-## 隐私与安全
-
-本项目是**开源软件**，你可以直接检查它的具体行为。
-
-应用读取的内容：
-
-- `~/.claude/.credentials.json` 中的本地 Claude Code OAuth 凭据
-- 如果设置了 `CLAUDE_CONFIG_DIR`，读取该目录中的 Claude Code 凭据文件
-- 必要时，已安装 WSL 发行版中的同一凭据文件
-- 启用 Codex 时，读取 `$CODEX_HOME/auth.json` 或 `~/.codex/auth.json` 中的本地 Codex 凭据
-- 启用 Antigravity 时，读取 Antigravity CLI 的 `/usage` 输出。CLI 无法查询时，读取 Windows 凭据管理器中目标为 `gemini:antigravity` 的本地 OAuth 令牌
-
-应用通过网络发送的请求：
-
-- 请求 Anthropic 的 Claude 端点，以读取用量和速率限制信息
-- 启用 Codex 时，请求 ChatGPT 的 Codex 用量端点，以读取 Codex 用量和速率限制信息
-- 启用 Antigravity 时，请求 Google Cloud Code / Antigravity 端点，以读取 Antigravity 配额信息
-- 仅在使用软件更新检查或自更新功能时请求 GitHub
-- 如果设置了 `HTTPS_PROXY`、`HTTP_PROXY` 或 `ALL_PROXY` 等代理环境变量，上述出站请求可能通过代理发送
-
-应用在本地保存的内容：
-
-- 组件位置
-- 选中的任务栏或屏幕
-- 组件显示状态
-- 轮询频率
-- 语言偏好
-- 上次更新检查时间
-- 可见的配额行和低配额提醒阈值
-- 用于避免重复提醒的配额窗口通知键
-- 显示模型偏好
-- 外观、所选显示器、左侧固定和加快刷新设置
-
-应用**不会**执行的操作：
-
-- 不会将凭据发送到其他服务器
-- 不使用独立的后端服务
-- 不收集分析数据或遥测信息
-- 不上传项目文件
-- 不直接修改 Codex 凭据文件
-- 不读取或复用 Claude 桌面客户端的认证数据
-
-注意：
-
-- 如果 Claude Code 令牌过期，应用可能会在后台调用本地 Claude CLI 进行刷新
-- 如果 Codex 令牌过期，应用可能会在后台调用本地 Codex CLI 进行刷新。监控器本身不会写入 `auth.json`，任何凭据更新都由 Codex CLI 完成
-- 如果 Antigravity 令牌过期，请打开 Antigravity 并重新登录。监控器不会写入 Windows 凭据管理器
-- 便携版可以从本仓库下载最新版本进行自更新
-- 代理必须可信，因为代理转发的用量请求会在 TLS 连接内包含 OAuth Bearer 令牌
-
-## 工作原理
-
-监控器会：
-
-1. 查找已启用模型的登录凭据
-2. 从 Anthropic、ChatGPT 和/或 Google Antigravity 端点读取当前用量
-3. 将结果直接显示在 Windows 任务栏中
-4. 保持组件与所选任务栏及托盘区域对齐
-5. 在后台定期刷新
-
-如果较新的用量端点不可用，应用可以回退为读取 Claude Messages API 返回的速率限制响应头。
-
-## 开源说明
-
-本项目采用 MIT License。原始 [LICENSE](LICENSE) 及版权声明均予以保留。
-
-Claude 和 OpenAI 标志来自 [Lobe Icons](https://github.com/lobehub/lobe-icons)，采用 MIT License，详见 [src/icons/providers](src/icons/providers)。品牌名称和标志归各自所有者所有。
-
-Codex Usage 是 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) 的持续维护衍生版本。感谢 Craig Constable 和上游贡献者创建原始项目。本仓库中的修改与上游维护者或 OpenAI 不存在隶属或背书关系。
-
-如果你想检查程序行为或审核代码，仓库中提供了全部源码。
+- **开源协议**：MIT License，完整版权声明见 [LICENSE](LICENSE)。
+- **服务图标**：Claude 与 OpenAI 标志来自 [Lobe Icons](https://github.com/lobehub/lobe-icons)（MIT License），详见 [src/icons/providers](src/icons/providers)；各品牌名称与图标归其各自权利人所有。
+- **上游致谢**：Codex Usage 是 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) 的持续维护衍生版本，感谢 Craig Constable 及上游贡献者的原始工作。本仓库修改与上游维护者、OpenAI、Anthropic 及 Google 无隶属或背书关系。
