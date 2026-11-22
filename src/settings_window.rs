@@ -8,38 +8,57 @@
 use super::*;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use windows::core::{w, PCSTR};
 use windows::Win32::Graphics::Dwm::{
-    DwmFlush, DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DwmExtendFrameIntoClientArea, DwmFlush, DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE,
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Threading::Sleep;
 use windows::Win32::UI::Controls::{
-    SetScrollInfo, SetWindowTheme, CDDS_PREPAINT, CDIS_DISABLED, CDIS_FOCUS, CDIS_HOT,
-    CDIS_SELECTED, CDIS_SHOWKEYBOARDCUES, CDRF_DODEFAULT, CDRF_SKIPDEFAULT, DRAWITEMSTRUCT,
-    NMCUSTOMDRAW, NMHDR, NM_CUSTOMDRAW, ODS_FOCUS, ODS_NOFOCUSRECT, ODS_SELECTED, WM_MOUSELEAVE,
+    CDDS_PREPAINT, CDIS_DISABLED, CDIS_FOCUS, CDIS_HOT, CDIS_SELECTED, CDIS_SHOWKEYBOARDCUES,
+    CDRF_DODEFAULT, CDRF_SKIPDEFAULT, DRAWITEMSTRUCT, MARGINS, NMCUSTOMDRAW, NMHDR, NM_CUSTOMDRAW,
+    ODS_FOCUS, ODS_NOFOCUSRECT, ODS_SELECTED, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetFocus, IsWindowEnabled, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    EnableWindow, GetFocus, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent,
+    TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 
+#[path = "settings_dropdown.rs"]
+mod dropdown;
 #[path = "settings_raster.rs"]
 mod raster;
 use raster::opaque;
 
 const CLASS: PCWSTR = w!("CodexUsageSettings");
+const CONTENT_CLASS: PCWSTR = w!("CodexUsageSettingsContent");
 const OVERLAY_CLASS: PCWSTR = w!("CodexUsageSettingsTransition");
 const NAV: u16 = 990;
 const FIRST_FIELD: u16 = 1000;
 const FIELDS_PER_ROW: u16 = 4;
 const REFRESH_TIMER: usize = 1;
-const SWITCH_DURATION: Duration = Duration::from_millis(150);
-const PAGE_DURATION: Duration = Duration::from_millis(180);
+const SCROLLBAR_FADE_TIMER: usize = 2;
+const SCROLLBAR_FADE_DELAY_MS: u32 = 1400;
+const SCROLLBAR_FADE_IN: Duration = Duration::from_millis(120);
+const SCROLLBAR_FADE_OUT: Duration = Duration::from_millis(300);
+const SCROLLBAR_EXPAND_DURATION: Duration = Duration::from_millis(120);
+const SCROLLBAR_HOT_WIDTH: i32 = 16;
+const SWITCH_DURATION: Duration = Duration::from_millis(160);
+const SWITCH_HOVER_DURATION: Duration = Duration::from_millis(110);
+const SWITCH_PRESS_DURATION: Duration = Duration::from_millis(90);
+const PAGE_DURATION: Duration = Duration::from_millis(210);
+const PAGE_OLD_FADE_DURATION: Duration = Duration::from_millis(75);
+const PAGE_TITLE_FADE_DURATION: Duration = Duration::from_millis(140);
+const PAGE_CONTENT_FADE_DELAY: Duration = Duration::from_millis(20);
+const PAGE_CONTENT_FADE_DURATION: Duration = Duration::from_millis(130);
+const NAV_INDICATOR_DURATION: Duration = Duration::from_millis(210);
+const THEME_DURATION: Duration = Duration::from_millis(180);
 const APPLY_SELECTION: u32 = WM_APP + 1;
 const ENSURE_VISIBLE: u32 = WM_APP + 2;
-const PLAY_ANIMATIONS: u32 = WM_APP + 3;
+const ANIMATION_TICK: u32 = WM_APP + 3;
 const SUBCLASS_ID: usize = 1;
 
 // Layout in 96-DPI pixels.
@@ -47,14 +66,17 @@ const WIDTH: i32 = 900;
 const HEIGHT: i32 = 640;
 const MIN_WIDTH: i32 = 720;
 const MIN_HEIGHT: i32 = 480;
+const CAPTION_HEIGHT: i32 = 44;
+const CAPTION_BTN_WIDTH: i32 = 46;
+const CAPTION_BTN_HEIGHT: i32 = 32;
 const NAV_WIDTH: i32 = 236;
-const NAV_TOP: i32 = 72;
+const NAV_TOP: i32 = 52;
 const NAV_ITEM: i32 = 40;
 const CONTENT_LEFT: i32 = 12;
-const CONTENT_RIGHT: i32 = 32;
+const CONTENT_RIGHT: i32 = 28;
 const CONTENT_MAX: i32 = 1000;
-const TOP: i32 = 24;
-const TITLE_HEIGHT: i32 = 44;
+const CONTENT_TOP: i32 = 4;
+const TITLE_HEIGHT: i32 = 42;
 const CARD_MIN: i32 = 56;
 const CARD_VPAD: i32 = 13;
 const CARD_PAD: i32 = 16;
@@ -65,13 +87,17 @@ const BUTTON_GAP: i32 = 8;
 const DROPDOWN_WIDTH: i32 = 240;
 const TOGGLE_WIDTH: i32 = 40;
 const TOGGLE_HEIGHT: i32 = 20;
-const CARD_RADIUS: f32 = 6.0;
+const CARD_RADIUS: f32 = 8.0;
 const CONTROL_RADIUS: f32 = 4.0;
 const WHEEL_STEP: i32 = 64;
 
 // Segoe Fluent Icons / Segoe MDL2 Assets code points.
 const GLYPH_CHEVRON_DOWN: char = '\u{E70D}';
 const GLYPH_ERROR: char = '\u{EA39}';
+const GLYPH_MINIMIZE: char = '\u{E921}';
+const GLYPH_MAXIMIZE: char = '\u{E922}';
+const GLYPH_RESTORE: char = '\u{E923}';
+const GLYPH_CLOSE: char = '\u{E8BB}';
 const PAGE_GLYPHS: [char; 5] = ['\u{E713}', '\u{E9D2}', '\u{E790}', '\u{EA8F}', '\u{E72E}'];
 
 thread_local! {
@@ -80,6 +106,7 @@ thread_local! {
     static BACKGROUND: Cell<u32> = const { Cell::new(0xF3_F3F3) };
     static REDRAW_PENDING: Cell<bool> = const { Cell::new(false) };
     static NAV_HOVER: Cell<i32> = const { Cell::new(-1) };
+    static NAV_PRESSED: Cell<i32> = const { Cell::new(-1) };
 }
 static SAVE_FAILED: AtomicBool = AtomicBool::new(false);
 
@@ -836,10 +863,16 @@ struct Theme {
     control_hover: u32,
     control_pressed: u32,
     control_border: u32,
+    control_elevation: u32,
     strong_stroke: u32,
     knob: u32,
     nav_selected: u32,
     nav_hover: u32,
+    nav_pressed: u32,
+    caption_hover: u32,
+    caption_pressed: u32,
+    close_hover: u32,
+    close_pressed: u32,
     caution: u32,
     critical: u32,
     critical_background: u32,
@@ -855,52 +888,67 @@ impl Theme {
         };
         if dark {
             let accent = palette.map_or(0x4C_C2FF, |palette| palette[1]);
+            // Subtle accent-tinted Mica backdrop while keeping opaque ClearType rendering.
+            let background = mix_color(0x20_2020, accent, 0.025);
             Self {
                 dark: true,
-                background: 0x20_2020,
+                background,
                 card: 0x2B_2B2B,
                 card_hover: 0x32_3232,
-                card_pressed: 0x27_2727,
-                card_border: 0x1D_1D1D,
+                card_pressed: 0x26_2626,
+                card_border: 0x35_3535,
                 text: 0xFF_FFFF,
                 secondary: 0xC5_C5C5,
                 disabled: 0x78_7878,
                 accent,
                 on_accent: readable_on(accent),
-                control: 0x2D_2D2D,
-                control_hover: 0x32_3232,
-                control_pressed: 0x27_2727,
-                control_border: 0x3A_3A3A,
+                control: 0x31_3131,
+                control_hover: 0x38_3838,
+                control_pressed: 0x2A_2A2A,
+                control_border: 0x3D_3D3D,
+                control_elevation: 0x4D_4D4D,
                 strong_stroke: 0x9A_9A9A,
                 knob: 0xCF_CFCF,
-                nav_selected: 0x2D_2D2D,
-                nav_hover: 0x29_2929,
+                nav_selected: mix_color(background, 0xFF_FFFF, 0.075),
+                nav_hover: mix_color(background, 0xFF_FFFF, 0.045),
+                nav_pressed: mix_color(background, 0xFF_FFFF, 0.025),
+                caption_hover: mix_color(background, 0xFF_FFFF, 0.075),
+                caption_pressed: mix_color(background, 0xFF_FFFF, 0.04),
+                close_hover: 0xC4_2B1C,
+                close_pressed: 0xB3_271C,
                 caution: 0xFC_E100,
                 critical: 0xFF_99A4,
                 critical_background: 0x44_2726,
             }
         } else {
             let accent = palette.map_or(0x00_5FB8, |palette| palette[4]);
+            let background = mix_color(0xF3_F3F3, accent, 0.03);
             Self {
                 dark: false,
-                background: 0xF3_F3F3,
-                card: 0xFB_FBFB,
-                card_hover: 0xF6_F6F6,
-                card_pressed: 0xF3_F3F3,
+                background,
+                card: 0xFF_FFFF,
+                card_hover: 0xF9_F9F9,
+                card_pressed: 0xF4_F4F4,
                 card_border: 0xE5_E5E5,
                 text: 0x1A_1A1A,
                 secondary: 0x5D_5D5D,
-                disabled: 0xA0_A0A0,
+                disabled: 0x9E_9E9E,
                 accent,
                 on_accent: readable_on(accent),
-                control: 0xFD_FDFD,
-                control_hover: 0xF7_F7F7,
-                control_pressed: 0xF3_F3F3,
-                control_border: 0xD9_D9D9,
+                control: 0xFF_FFFF,
+                control_hover: 0xF9_F9F9,
+                control_pressed: 0xF4_F4F4,
+                control_border: 0xE0_E0E0,
+                control_elevation: 0xC4_C4C4,
                 strong_stroke: 0x86_8686,
                 knob: 0x5F_5F5F,
-                nav_selected: 0xE9_E9E9,
-                nav_hover: 0xED_EDED,
+                nav_selected: mix_color(background, 0x00_0000, 0.055),
+                nav_hover: mix_color(background, 0x00_0000, 0.032),
+                nav_pressed: mix_color(background, 0x00_0000, 0.018),
+                caption_hover: mix_color(background, 0x00_0000, 0.055),
+                caption_pressed: mix_color(background, 0x00_0000, 0.09),
+                close_hover: 0xC4_2B1C,
+                close_pressed: 0xB2_2A1E,
                 caution: 0x9D_5D00,
                 critical: 0xC4_2B1C,
                 critical_background: 0xFD_E7E9,
@@ -1040,14 +1088,32 @@ struct Fonts {
     body: HFONT,
     strong: HFONT,
     caption: HFONT,
+    caption_title: HFONT,
     title: HFONT,
     icons: HFONT,
     small_icons: HFONT,
+    caption_icons: HFONT,
     has_icons: bool,
 }
 
+unsafe fn ui_font_face(language: LanguageId) -> PCWSTR {
+    let preferred: &[PCWSTR] = match language {
+        LanguageId::SimplifiedChinese => &[w!("Microsoft YaHei UI"), w!("Segoe UI")],
+        LanguageId::TraditionalChinese => &[w!("Microsoft JhengHei UI"), w!("Segoe UI")],
+        LanguageId::Japanese => &[w!("Yu Gothic UI"), w!("Segoe UI")],
+        LanguageId::Korean => &[w!("Malgun Gothic"), w!("Segoe UI")],
+        _ => &[w!("Segoe UI Variable Text"), w!("Segoe UI")],
+    };
+    preferred
+        .iter()
+        .copied()
+        .find(|face| font_installed(*face))
+        .unwrap_or(w!("Segoe UI"))
+}
+
 impl Fonts {
-    unsafe fn create(dpi: u32) -> Self {
+    unsafe fn create(dpi: u32, language: LanguageId) -> Self {
+        let ui_face = ui_font_face(language);
         let icon_face = [w!("Segoe Fluent Icons"), w!("Segoe MDL2 Assets")]
             .into_iter()
             .find(|face| font_installed(*face));
@@ -1057,12 +1123,14 @@ impl Fonts {
             })
         };
         Self {
-            body: make_font(w!("Segoe UI"), scale(14, dpi), FW_NORMAL.0),
-            strong: make_font(w!("Segoe UI"), scale(14, dpi), FW_SEMIBOLD.0),
-            caption: make_font(w!("Segoe UI"), scale(12, dpi), FW_NORMAL.0),
-            title: make_font(w!("Segoe UI"), scale(28, dpi), FW_SEMIBOLD.0),
+            body: make_font(ui_face, scale(14, dpi), FW_NORMAL.0),
+            strong: make_font(ui_face, scale(14, dpi), FW_SEMIBOLD.0),
+            caption: make_font(ui_face, scale(12, dpi), FW_NORMAL.0),
+            caption_title: make_font(ui_face, scale(13, dpi), FW_SEMIBOLD.0),
+            title: make_font(ui_face, scale(26, dpi), FW_SEMIBOLD.0),
             icons: icons(16),
             small_icons: icons(12),
+            caption_icons: icons(10),
             has_icons: icon_face.is_some(),
         }
     }
@@ -1072,9 +1140,11 @@ impl Fonts {
             self.body,
             self.strong,
             self.caption,
+            self.caption_title,
             self.title,
             self.icons,
             self.small_icons,
+            self.caption_icons,
         ] {
             if !font.is_invalid() {
                 let _ = DeleteObject(font);
@@ -1214,6 +1284,22 @@ impl Bitmap {
             bottom: self.height,
             ..Default::default()
         }
+    }
+
+    unsafe fn pixels(&self) -> &[u32] {
+        let _ = GdiFlush();
+        std::slice::from_raw_parts(self.bits.as_ptr(), (self.width * self.height) as usize)
+    }
+
+    unsafe fn pixels_mut(&mut self) -> &mut [u32] {
+        let _ = GdiFlush();
+        std::slice::from_raw_parts_mut(self.bits.as_ptr(), (self.width * self.height) as usize)
+    }
+
+    unsafe fn clone_bitmap(&self) -> Option<Self> {
+        let mut copy = Self::new(self.width, self.height)?;
+        copy.pixels_mut().copy_from_slice(self.pixels());
+        Some(copy)
     }
 
     unsafe fn blit(&self, target: HDC, area: RECT, x: i32, y: i32) -> bool {
@@ -1366,49 +1452,474 @@ struct Slot {
 }
 
 #[derive(Clone, Copy)]
-struct SwitchAnimation {
+struct ScalarAnim {
     from: f32,
     to: f32,
     start: Instant,
+    duration: Duration,
 }
 
-impl SwitchAnimation {
-    fn value(self, now: Instant) -> f32 {
-        self.from
-            + (self.to - self.from) * ease_out(now.duration_since(self.start), SWITCH_DURATION)
+impl ScalarAnim {
+    fn settled(value: f32, now: Instant, duration: Duration) -> Self {
+        Self {
+            from: value,
+            to: value,
+            start: now,
+            duration,
+        }
     }
+
+    fn value(self, now: Instant) -> f32 {
+        if (self.to - self.from).abs() < 1e-4 {
+            return self.to;
+        }
+        let t = ease_out(now.duration_since(self.start), self.duration);
+        self.from + (self.to - self.from) * t
+    }
+
+    fn is_active(self, now: Instant) -> bool {
+        (self.to - self.from).abs() >= 1e-4 && now.duration_since(self.start) < self.duration
+    }
+
+    fn retarget(&mut self, to: f32, now: Instant) -> bool {
+        self.retarget_with(to, self.duration, now)
+    }
+
+    fn retarget_with(&mut self, to: f32, duration: Duration, now: Instant) -> bool {
+        if (self.to - to).abs() < 1e-4 {
+            return false;
+        }
+        self.from = self.value(now);
+        self.to = to;
+        self.duration = duration;
+        self.start = now;
+        true
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SwitchState {
+    checked: ScalarAnim,
+    hover: ScalarAnim,
+    press: ScalarAnim,
+    hot: bool,
+    pressed: bool,
+}
+
+impl SwitchState {
+    fn new(checked: bool, now: Instant) -> Self {
+        Self {
+            checked: ScalarAnim::settled(f32::from(u8::from(checked)), now, SWITCH_DURATION),
+            hover: ScalarAnim::settled(0.0, now, SWITCH_HOVER_DURATION),
+            press: ScalarAnim::settled(0.0, now, SWITCH_PRESS_DURATION),
+            hot: false,
+            pressed: false,
+        }
+    }
+
+    fn set_checked(&mut self, checked: bool, now: Instant) -> bool {
+        self.checked.retarget(f32::from(u8::from(checked)), now)
+    }
+
+    fn update_interaction(&mut self, hot: bool, pressed: bool, disabled: bool, now: Instant) -> bool {
+        let hot = hot && !disabled;
+        let pressed = pressed && !disabled;
+        let mut changed = false;
+        if self.hot != hot {
+            self.hot = hot;
+            changed |= self.hover.retarget(if hot { 1.0 } else { 0.0 }, now);
+        }
+        if self.pressed != pressed {
+            self.pressed = pressed;
+            changed |= self.press.retarget(if pressed { 1.0 } else { 0.0 }, now);
+        }
+        changed
+    }
+
+    fn is_active(&self, now: Instant) -> bool {
+        self.checked.is_active(now) || self.hover.is_active(now) || self.press.is_active(now)
+    }
+}
+
+/// Fluent NavigationView indicator pill that glides and stretches smoothly
+/// between navigation items.
+#[derive(Clone, Copy)]
+struct NavIndicator {
+    from_top: f32,
+    from_bottom: f32,
+    to_top: f32,
+    to_bottom: f32,
+    start: Instant,
+    active: bool,
+}
+
+impl NavIndicator {
+    fn settled(top: f32, bottom: f32, now: Instant) -> Self {
+        Self {
+            from_top: top,
+            from_bottom: bottom,
+            to_top: top,
+            to_bottom: bottom,
+            start: now,
+            active: false,
+        }
+    }
+
+    fn move_to(&mut self, top: f32, bottom: f32, now: Instant) {
+        let (cur_top, cur_bottom) = self.bounds(now);
+        if (cur_top - top).abs() < 0.5 && (cur_bottom - bottom).abs() < 0.5 {
+            self.from_top = top;
+            self.from_bottom = bottom;
+            self.to_top = top;
+            self.to_bottom = bottom;
+            self.active = false;
+            return;
+        }
+        self.from_top = cur_top;
+        self.from_bottom = cur_bottom;
+        self.to_top = top;
+        self.to_bottom = bottom;
+        self.start = now;
+        self.active = true;
+    }
+
+    fn bounds(&self, now: Instant) -> (f32, f32) {
+        if !self.active {
+            return (self.to_top, self.to_bottom);
+        }
+        let elapsed = now.duration_since(self.start);
+        if elapsed >= NAV_INDICATOR_DURATION {
+            return (self.to_top, self.to_bottom);
+        }
+        let t = (elapsed.as_secs_f32() / NAV_INDICATOR_DURATION.as_secs_f32()).clamp(0.0, 1.0);
+        let lead = ease_out_quart_f(t);
+        let trail = ease_out_cubic_f(((t - 0.16) / 0.84).clamp(0.0, 1.0));
+        let moving_down = self.to_top >= self.from_top;
+        let (top_t, bottom_t) = if moving_down {
+            (trail, lead)
+        } else {
+            (lead, trail)
+        };
+        let top = self.from_top + (self.to_top - self.from_top) * top_t;
+        let bottom = self.from_bottom + (self.to_bottom - self.from_bottom) * bottom_t;
+        (top, bottom)
+    }
+
+    fn tick(&mut self, now: Instant) -> bool {
+        if self.active && now.duration_since(self.start) >= NAV_INDICATOR_DURATION {
+            self.from_top = self.to_top;
+            self.from_bottom = self.to_bottom;
+            self.active = false;
+        }
+        self.active
+    }
+}
+
+fn nav_indicator_rest(index: usize, dpi: u32) -> (f32, f32) {
+    let item_h = scale(NAV_ITEM, dpi) as f32;
+    let h = scale(16, dpi) as f32;
+    let top = index as f32 * item_h + (item_h - h) * 0.5;
+    (top, top + h)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScrollbarMetrics {
+    track_top: f32,
+    track_bottom: f32,
+    thumb_top: f32,
+    thumb_height: f32,
+}
+
+fn scrollbar_thumb_metrics(
+    client_h: i32,
+    content_h: i32,
+    scroll: i32,
+    dpi: u32,
+) -> Option<ScrollbarMetrics> {
+    if content_h <= client_h || client_h <= 0 {
+        return None;
+    }
+    let margin = scale(8, dpi) as f32;
+    let track_top = margin;
+    let track_bottom = (client_h as f32 - margin).max(track_top + 1.0);
+    let track_h = track_bottom - track_top;
+    let min_thumb = scale(32, dpi) as f32;
+    let thumb_height = (track_h * (client_h as f32 / content_h as f32))
+        .max(min_thumb)
+        .min(track_h);
+    let max_scroll = (content_h - client_h).max(1) as f32;
+    let ratio = (scroll as f32 / max_scroll).clamp(0.0, 1.0);
+    let thumb_top = track_top + (track_h - thumb_height) * ratio;
+    Some(ScrollbarMetrics {
+        track_top,
+        track_bottom,
+        thumb_top,
+        thumb_height,
+    })
+}
+
+struct OverlayScrollbar {
+    opacity: ScalarAnim,
+    expand: ScalarAnim,
+    hovered: bool,
+    dragging: bool,
+    drag_anchor_y: i32,
+    drag_start_scroll: i32,
+}
+
+impl OverlayScrollbar {
+    fn new(now: Instant) -> Self {
+        Self {
+            opacity: ScalarAnim::settled(0.0, now, SCROLLBAR_FADE_IN),
+            expand: ScalarAnim::settled(0.0, now, SCROLLBAR_EXPAND_DURATION),
+            hovered: false,
+            dragging: false,
+            drag_anchor_y: 0,
+            drag_start_scroll: 0,
+        }
+    }
+
+    fn show(&mut self, now: Instant) -> bool {
+        self.opacity.retarget_with(1.0, SCROLLBAR_FADE_IN, now)
+    }
+
+    fn fade_out(&mut self, now: Instant) -> bool {
+        if self.hovered || self.dragging {
+            return false;
+        }
+        self.opacity.retarget_with(0.0, SCROLLBAR_FADE_OUT, now)
+    }
+
+    fn set_expanded(&mut self, expanded: bool, now: Instant) -> bool {
+        let target = if expanded { 1.0 } else { 0.0 };
+        let mut changed = self.expand.retarget_with(target, SCROLLBAR_EXPAND_DURATION, now);
+        if expanded {
+            changed |= self.show(now);
+        }
+        changed
+    }
+
+    fn is_active(&self, now: Instant) -> bool {
+        self.opacity.is_active(now) || self.expand.is_active(now)
+    }
+}
+
+fn ease_out_cubic_f(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+fn ease_out_quart_f(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(4)
 }
 
 fn ease_out(elapsed: Duration, duration: Duration) -> f32 {
     let t = (elapsed.as_secs_f32() / duration.as_secs_f32()).min(1.0);
-    1.0 - (1.0 - t).powi(3)
+    ease_out_cubic_f(t)
 }
 
 fn page_slide(elapsed: Duration, distance: i32) -> i32 {
-    let remaining = 1.0 - (elapsed.as_secs_f32() / PAGE_DURATION.as_secs_f32()).min(1.0);
-    (distance as f32 * remaining * remaining).round() as i32
+    let t = (elapsed.as_secs_f32() / PAGE_DURATION.as_secs_f32()).clamp(0.0, 1.0);
+    (distance as f32 * (1.0 - ease_out_quart_f(t))).round() as i32
 }
 
-unsafe fn paint_slide(target: HDC, image: &Bitmap, slide: i32, background: u32) -> bool {
-    let bounds = image.bounds();
-    let top = slide.clamp(0, bounds.bottom);
-    if top > 0 {
-        fill_rect(
-            target,
-            RECT {
-                bottom: top,
-                ..bounds
-            },
-            background,
-        );
+fn page_alphas(elapsed: Duration) -> (u8, u8, u8) {
+    let old_t = (elapsed.as_secs_f32() / PAGE_OLD_FADE_DURATION.as_secs_f32()).clamp(0.0, 1.0);
+    let old_alpha = ((1.0 - old_t).powi(2) * 255.0).round() as u8;
+
+    let title_t =
+        (elapsed.as_secs_f32() / PAGE_TITLE_FADE_DURATION.as_secs_f32()).clamp(0.0, 1.0);
+    let title_alpha = (ease_out_cubic_f(title_t) * 255.0).round() as u8;
+
+    let content_elapsed = elapsed.saturating_sub(PAGE_CONTENT_FADE_DELAY);
+    let content_t =
+        (content_elapsed.as_secs_f32() / PAGE_CONTENT_FADE_DURATION.as_secs_f32()).clamp(0.0, 1.0);
+    let content_alpha = (ease_out_cubic_f(content_t) * 255.0).round() as u8;
+
+    (old_alpha, title_alpha, content_alpha)
+}
+
+/// Non-blocking DWM VSync pacer. Sleeps on a condition variable when idle,
+/// wakes only during active animations, and exits cleanly when Settings closes.
+struct VSyncState {
+    active: Mutex<bool>,
+    cond: Condvar,
+    stop: AtomicBool,
+    tick_pending: AtomicBool,
+    hwnd: AtomicUsize,
+}
+
+struct VSyncPacer {
+    state: Arc<VSyncState>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl VSyncPacer {
+    fn new(hwnd: HWND) -> Self {
+        let state = Arc::new(VSyncState {
+            active: Mutex::new(false),
+            cond: Condvar::new(),
+            stop: AtomicBool::new(false),
+            tick_pending: AtomicBool::new(false),
+            hwnd: AtomicUsize::new(hwnd.0 as usize),
+        });
+        let thread_state = Arc::clone(&state);
+        let handle = std::thread::Builder::new()
+            .name("settings-vsync".into())
+            .spawn(move || {
+                let mut use_dwm = true;
+                loop {
+                    {
+                        let mut active = match thread_state.active.lock() {
+                            Ok(guard) => guard,
+                            Err(_) => break,
+                        };
+                        while !*active && !thread_state.stop.load(Ordering::Acquire) {
+                            active = match thread_state.cond.wait(active) {
+                                Ok(guard) => guard,
+                                Err(_) => return,
+                            };
+                        }
+                    }
+                    if thread_state.stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    unsafe {
+                        if use_dwm {
+                            use_dwm = DwmFlush().is_ok();
+                        }
+                        if !use_dwm {
+                            Sleep(8);
+                        }
+                    }
+                    if thread_state.stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if !thread_state.tick_pending.swap(true, Ordering::AcqRel) {
+                        let raw = thread_state.hwnd.load(Ordering::Acquire);
+                        if raw != 0 {
+                            unsafe {
+                                if PostMessageW(
+                                    HWND(raw as *mut _),
+                                    ANIMATION_TICK,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                )
+                                .is_err()
+                                {
+                                    thread_state.tick_pending.store(false, Ordering::Release);
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .ok();
+        Self { state, handle }
     }
-    top == bounds.bottom || image.blit(target, RECT { top, ..bounds }, 0, 0)
+
+    fn set_active(&self, active: bool) {
+        if let Ok(mut guard) = self.state.active.lock() {
+            if *guard != active {
+                *guard = active;
+                if active {
+                    self.state.cond.notify_one();
+                }
+            }
+        }
+    }
+
+    fn clear_pending(&self) {
+        self.state.tick_pending.store(false, Ordering::Release);
+    }
+
+    fn stop(&mut self) {
+        self.state.stop.store(true, Ordering::Release);
+        self.state.hwnd.store(0, Ordering::Release);
+        if let Ok(mut guard) = self.state.active.lock() {
+            *guard = false;
+            self.state.cond.notify_one();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for VSyncPacer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptionButton {
+    Minimize,
+    Maximize,
+    Close,
+}
+
+fn caption_button_rect(client_width: i32, dpi: u32, button: CaptionButton) -> RECT {
+    let w = scale(CAPTION_BTN_WIDTH, dpi);
+    let h = scale(CAPTION_BTN_HEIGHT, dpi);
+    let slot = match button {
+        CaptionButton::Minimize => 3,
+        CaptionButton::Maximize => 2,
+        CaptionButton::Close => 1,
+    };
+    RECT {
+        left: client_width - slot * w,
+        top: 0,
+        right: client_width - (slot - 1) * w,
+        bottom: h,
+    }
+}
+
+fn caption_button_at(client_width: i32, dpi: u32, pt: POINT) -> Option<CaptionButton> {
+    for button in [
+        CaptionButton::Close,
+        CaptionButton::Maximize,
+        CaptionButton::Minimize,
+    ] {
+        let r = caption_button_rect(client_width, dpi, button);
+        if pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom {
+            return Some(button);
+        }
+    }
+    None
+}
+
+fn hit_test_caption(client: RECT, pt: POINT, dpi: u32, maximized: bool) -> i32 {
+    let resize = scale(5, dpi);
+    let corner = scale(12, dpi);
+    let caption_h = scale(CAPTION_HEIGHT, dpi);
+    if !maximized && pt.y >= 0 && pt.y < resize {
+        if pt.x < corner {
+            return HTTOPLEFT as i32;
+        }
+        if pt.x >= client.right - corner {
+            return HTTOPRIGHT as i32;
+        }
+        return HTTOP as i32;
+    }
+    if let Some(button) = caption_button_at(client.right, dpi, pt) {
+        return match button {
+            CaptionButton::Minimize => HTMINBUTTON as i32,
+            CaptionButton::Maximize => HTMAXBUTTON as i32,
+            CaptionButton::Close => HTCLOSE as i32,
+        };
+    }
+    if pt.y >= 0 && pt.y < caption_h && pt.x >= 0 && pt.x < client.right {
+        return HTCAPTION as i32;
+    }
+    HTCLIENT as i32
 }
 
 struct Overlay(HWND);
 
 impl Overlay {
-    unsafe fn new(parent: HWND, left: i32, bounds: RECT) -> Option<Self> {
+    unsafe fn new(parent: HWND, bounds: RECT) -> Option<Self> {
         let overlay = Self(
             CreateWindowExW(
                 WS_EX_NOPARENTNOTIFY,
@@ -1429,10 +1940,10 @@ impl Overlay {
         SetWindowPos(
             overlay.0,
             HWND_TOP,
-            left,
-            0,
-            bounds.right,
-            bounds.bottom,
+            bounds.left,
+            bounds.top,
+            bounds.right - bounds.left,
+            bounds.bottom - bounds.top,
             SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_DEFERERASE,
         )
         .ok()?;
@@ -1462,28 +1973,163 @@ impl Drop for Overlay {
     }
 }
 
+enum TransitionKind {
+    Page {
+        old_image: Option<Bitmap>,
+        new_image: Bitmap,
+        old_rows: Vec<Row>,
+        background: u32,
+        title_bottom: i32,
+        distance: i32,
+    },
+    Theme {
+        old_image: Bitmap,
+        new_image: Bitmap,
+    },
+}
+
 struct Transition {
     overlay: Overlay,
-    image: Bitmap,
-    old_rows: Vec<Row>,
-    background: u32,
-    distance: i32,
-    slide: i32,
+    composed: Bitmap,
+    kind: TransitionKind,
     start: Instant,
-    final_frame: bool,
     trace: Option<TransitionTrace>,
 }
 
 impl Transition {
-    unsafe fn draw(&mut self, now: Instant) -> bool {
+    fn duration(&self) -> Duration {
+        match &self.kind {
+            TransitionKind::Page { .. } => PAGE_DURATION,
+            TransitionKind::Theme { .. } => THEME_DURATION,
+        }
+    }
+
+    fn is_page(&self) -> bool {
+        matches!(self.kind, TransitionKind::Page { .. })
+    }
+
+    unsafe fn compose(&mut self, elapsed: Duration) {
+        let width = self.composed.width as usize;
+        let height = self.composed.height as usize;
+        match &self.kind {
+            TransitionKind::Page {
+                old_image,
+                new_image,
+                background,
+                title_bottom,
+                distance,
+                ..
+            } => {
+                let (old_alpha, title_alpha, content_alpha) = page_alphas(elapsed);
+                let slide = page_slide(elapsed, *distance).clamp(0, height as i32) as usize;
+                let title_h = (*title_bottom).clamp(0, height as i32) as usize;
+
+                let dst = self.composed.pixels_mut();
+                dst.fill(*background);
+
+                if old_alpha > 0 {
+                    if let Some(old) = old_image {
+                        let w = width.min(old.width as usize);
+                        let rows = height.min(old.height as usize);
+                        raster::blend_over_rows(
+                            dst,
+                            width,
+                            0,
+                            old.pixels(),
+                            old.width as usize,
+                            0,
+                            w,
+                            rows,
+                            old_alpha,
+                        );
+                    }
+                }
+
+                let nw = width.min(new_image.width as usize);
+                let nh = height.min(new_image.height as usize);
+                let new_px = new_image.pixels();
+
+                if title_alpha > 0 && title_h > 0 {
+                    let rows = title_h.min(nh);
+                    raster::blend_over_rows(
+                        dst,
+                        width,
+                        0,
+                        new_px,
+                        new_image.width as usize,
+                        0,
+                        nw,
+                        rows,
+                        title_alpha,
+                    );
+                }
+
+                if content_alpha > 0 && title_h < nh {
+                    let dst_y = title_h + slide;
+                    if dst_y < height {
+                        let avail_dst = height - dst_y;
+                        let avail_src = nh - title_h;
+                        let rows = avail_dst.min(avail_src);
+                        raster::blend_over_rows(
+                            dst,
+                            width,
+                            dst_y,
+                            new_px,
+                            new_image.width as usize,
+                            title_h,
+                            nw,
+                            rows,
+                            content_alpha,
+                        );
+                    }
+                }
+            }
+            TransitionKind::Theme {
+                old_image,
+                new_image,
+            } => {
+                let t = ease_out(elapsed, THEME_DURATION);
+                let alpha = (t * 255.0).round() as u8;
+                let dst = self.composed.pixels_mut();
+                let ow = width.min(old_image.width as usize);
+                let oh = height.min(old_image.height as usize);
+                raster::blend_over_rows(
+                    dst,
+                    width,
+                    0,
+                    old_image.pixels(),
+                    old_image.width as usize,
+                    0,
+                    ow,
+                    oh,
+                    255,
+                );
+                let nw = width.min(new_image.width as usize);
+                let nh = height.min(new_image.height as usize);
+                raster::blend_over_rows(
+                    dst,
+                    width,
+                    0,
+                    new_image.pixels(),
+                    new_image.width as usize,
+                    0,
+                    nw,
+                    nh,
+                    alpha,
+                );
+            }
+        }
+    }
+
+    unsafe fn draw(&mut self, now: Instant) -> (bool, bool) {
         let elapsed = now.duration_since(self.start);
-        self.slide = page_slide(elapsed, self.distance);
-        self.final_frame = elapsed >= PAGE_DURATION;
+        let finished = elapsed >= self.duration();
+        self.compose(elapsed);
         let dc = GetDC(self.overlay.0);
         if dc.is_invalid() {
-            return false;
+            return (false, true);
         }
-        let drew = paint_slide(dc, &self.image, self.slide, self.background);
+        let drew = self.composed.blit(dc, self.composed.bounds(), 0, 0);
         ReleaseDC(self.overlay.0, dc);
         let _ = GdiFlush();
         if let Some(trace) = &mut self.trace {
@@ -1491,7 +2137,11 @@ impl Transition {
                 .frames
                 .push((elapsed.as_micros(), now.elapsed().as_micros()));
         }
-        drew
+        (drew, finished)
+    }
+
+    unsafe fn repaint(&self, dc: HDC) {
+        let _ = self.composed.blit(dc, self.composed.bounds(), 0, 0);
     }
 }
 
@@ -1576,13 +2226,18 @@ impl Drop for SuspendRedraw {
 
 struct Panel {
     hwnd: HWND,
+    content: HWND,
     widget: HWND,
     nav: HWND,
+    pacer: VSyncPacer,
     theme: Theme,
     preference: SettingsTheme,
-    switches: Vec<Option<SwitchAnimation>>,
+    switches: RefCell<Vec<SwitchState>>,
+    nav_indicator: NavIndicator,
+    scrollbar: OverlayScrollbar,
     transition: Option<Transition>,
     page_buffer: RefCell<Option<Bitmap>>,
+    content_buffer: RefCell<Option<Bitmap>>,
     control_buffer: RefCell<Option<Bitmap>>,
     preview: RefCell<Option<(PreviewKey, Bitmap)>>,
     fonts: Fonts,
@@ -1590,6 +2245,9 @@ struct Panel {
     dpi: u32,
     language: Option<LanguageId>,
     save_failed: bool,
+    window_active: bool,
+    caption_hover: Option<CaptionButton>,
+    caption_pressed: Option<CaptionButton>,
     page: usize,
     rows: Vec<Row>,
     controls: Vec<Vec<HWND>>,
@@ -1602,13 +2260,16 @@ struct Panel {
     scroll: i32,
     pending: VecDeque<Option<Action>>,
     menu_open: bool,
+    last_dropdown_closed: Option<(u16, Instant)>,
 }
 
 impl Panel {
     unsafe fn new(hwnd: HWND, widget: HWND) -> Self {
-        let preference = lock_state()
+        let (preference, initial_lang) = lock_state()
             .as_ref()
-            .map_or(SettingsTheme::System, |s| s.settings_theme);
+            .map_or((SettingsTheme::System, LanguageId::English), |s| {
+                (s.settings_theme, s.language)
+            });
         let theme = Theme::current(preference);
         BACKGROUND.with(|color| color.set(theme.background));
         let nav = child(
@@ -1622,15 +2283,38 @@ impl Panel {
                 | LBS_NOINTEGRALHEIGHT as u32,
         );
         subclass(nav);
+        let content = CreateWindowExW(
+            WS_EX_CONTROLPARENT,
+            CONTENT_CLASS,
+            PCWSTR::null(),
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+            0,
+            0,
+            0,
+            0,
+            hwnd,
+            HMENU::default(),
+            GetModuleHandleW(None).unwrap_or_default(),
+            None,
+        )
+        .unwrap_or_default();
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        let now = Instant::now();
+        let (ind_top, ind_bottom) = nav_indicator_rest(0, dpi);
         let mut panel = Self {
             hwnd,
+            content,
             widget,
             nav,
+            pacer: VSyncPacer::new(hwnd),
             theme,
             preference,
-            switches: Vec::new(),
+            switches: RefCell::new(Vec::new()),
+            nav_indicator: NavIndicator::settled(ind_top, ind_bottom, now),
+            scrollbar: OverlayScrollbar::new(now),
             transition: None,
             page_buffer: RefCell::new(None),
+            content_buffer: RefCell::new(None),
             control_buffer: RefCell::new(None),
             preview: RefCell::new(None),
             fonts: Fonts::default(),
@@ -1638,6 +2322,9 @@ impl Panel {
             dpi: 0,
             language: None,
             save_failed: false,
+            window_active: true,
+            caption_hover: None,
+            caption_pressed: None,
             page: 0,
             rows: Vec::new(),
             controls: Vec::new(),
@@ -1650,8 +2337,9 @@ impl Panel {
             scroll: 0,
             pending: VecDeque::new(),
             menu_open: false,
+            last_dropdown_closed: None,
         };
-        panel.set_dpi(GetDpiForWindow(hwnd).max(96));
+        panel.set_dpi(dpi, initial_lang);
         panel.apply_theme(panel.theme);
         panel
     }
@@ -1664,9 +2352,9 @@ impl Panel {
         value * self.dpi as f32 / 96.0
     }
 
-    unsafe fn set_dpi(&mut self, dpi: u32) {
+    unsafe fn set_dpi(&mut self, dpi: u32, language: LanguageId) {
         self.preview.get_mut().take();
-        let old = std::mem::replace(&mut self.fonts, Fonts::create(dpi));
+        let old = std::mem::replace(&mut self.fonts, Fonts::create(dpi, language));
         self.dpi = dpi;
         set_font(self.nav, self.fonts.body);
         let _ = SendMessageW(
@@ -1675,13 +2363,15 @@ impl Panel {
             WPARAM(0),
             LPARAM(self.px(NAV_ITEM) as isize),
         );
+        let (ind_top, ind_bottom) = nav_indicator_rest(self.page, dpi);
+        self.nav_indicator = NavIndicator::settled(ind_top, ind_bottom, Instant::now());
         for controls in &self.controls {
             for &control in controls {
                 set_font(control, self.fonts.body);
             }
         }
         old.delete();
-        let size = self.px(24);
+        let size = self.px(20);
         let icon = GetModuleHandleW(None)
             .ok()
             .and_then(|module| {
@@ -1713,26 +2403,48 @@ impl Panel {
             &dark as *const BOOL as *const _,
             std::mem::size_of::<BOOL>() as u32,
         );
-        // Windows 11 only: blend the title bar into the page background.
-        let caption = colorref(self.theme.background);
-        let _ = DwmSetWindowAttribute(
-            self.hwnd,
-            DWMWA_CAPTION_COLOR,
-            &caption as *const COLORREF as *const _,
-            std::mem::size_of::<COLORREF>() as u32,
-        );
         if let Some(function) = uxtheme_export(133) {
             let allow_dark_mode: unsafe extern "system" fn(HWND, BOOL) -> BOOL =
                 std::mem::transmute(function);
             let _ = allow_dark_mode(self.hwnd, dark);
+            let _ = allow_dark_mode(self.content, dark);
         }
-        let scroll_theme = if self.theme.dark {
-            w!("DarkMode_Explorer")
-        } else {
-            w!("Explorer")
-        };
-        let _ = SetWindowTheme(self.hwnd, scroll_theme, PCWSTR::null());
         request_redraw();
+    }
+
+    unsafe fn start_theme_transition(&mut self, old_image: Option<Bitmap>) {
+        if !IsWindowVisible(self.hwnd).as_bool() {
+            return;
+        }
+        let Some(old_image) = old_image else {
+            return;
+        };
+        let Some(new_image) = self.capture_window() else {
+            return;
+        };
+        let bounds = new_image.bounds();
+        let Some(composed) = Bitmap::new(bounds.right, bounds.bottom) else {
+            return;
+        };
+        let Some(overlay) = Overlay::new(self.hwnd, bounds) else {
+            return;
+        };
+        let start = Instant::now();
+        let mut transition = Transition {
+            overlay,
+            composed,
+            kind: TransitionKind::Theme {
+                old_image,
+                new_image,
+            },
+            start,
+            trace: None,
+        };
+        let (drew, finished) = transition.draw(start);
+        if drew && !finished {
+            self.transition = Some(transition);
+            self.update_pacer(start);
+        }
     }
 
     unsafe fn sync(&mut self, force: bool) {
@@ -1766,6 +2478,16 @@ impl Panel {
             return;
         }
 
+        let new_theme = Theme::current(preference);
+        let animate_theme =
+            self.preference != preference && new_theme != self.theme && IsWindowVisible(self.hwnd).as_bool();
+        let old_theme_snapshot = if animate_theme {
+            self.finish_transition();
+            self.capture_window()
+        } else {
+            None
+        };
+
         let redraw = SuspendRedraw::new(self.hwnd);
         self.apply_model(language, preference, save_failed);
         let old_rows = std::mem::replace(&mut self.rows, next);
@@ -1773,9 +2495,10 @@ impl Panel {
         self.layout();
         drop(redraw);
         self.restore_focus(lost_focus);
-        if self.switches.iter().any(Option::is_some) && !self.queue_animation() {
-            self.switches.fill(None);
+        if animate_theme {
+            self.start_theme_transition(old_theme_snapshot);
         }
+        self.update_pacer(Instant::now());
     }
 
     unsafe fn apply_model(
@@ -1789,7 +2512,11 @@ impl Panel {
             self.apply_theme(Theme::current(preference));
         }
         if self.language != Some(language) {
+            let changed_from_existing = self.language.is_some();
             self.language = Some(language);
+            if changed_from_existing {
+                self.set_dpi(self.dpi, language);
+            }
             set_text(
                 self.hwnd,
                 &format!("Codex Usage — {}", language.strings().settings),
@@ -1816,7 +2543,8 @@ impl Panel {
         let old_controls = std::mem::take(&mut self.controls);
         let mut old_controls = old_controls.into_iter();
         let now = Instant::now();
-        self.switches.resize(self.rows.len(), None);
+        let mut switches = self.switches.borrow_mut();
+        switches.resize(self.rows.len(), SwitchState::new(false, now));
         for (index, row) in self.rows.iter().enumerate() {
             let old = old_rows.get(index);
             let (controls, reused) = match old_controls.next() {
@@ -1839,22 +2567,21 @@ impl Panel {
                 (
                     Some(Row::Check {
                         item: old_item,
-                        checked: old,
+                        checked: old_checked,
                         ..
                     }),
                     Row::Check { item, checked, .. },
                 ) if reused && old_item.action == item.action => {
-                    if old != checked {
-                        let from = self.switches[index]
-                            .map_or(f32::from(u8::from(*old)), |animation| animation.value(now));
-                        self.switches[index] = Some(SwitchAnimation {
-                            from,
-                            to: f32::from(u8::from(*checked)),
-                            start: now,
-                        });
+                    if old_checked != checked {
+                        switches[index].set_checked(*checked, now);
                     }
                 }
-                _ => self.switches[index] = None,
+                (_, Row::Check { checked, .. }) => {
+                    switches[index] = SwitchState::new(*checked, now);
+                }
+                _ => {
+                    switches[index] = SwitchState::new(false, now);
+                }
             }
             controls_changed |= !reused;
             if force || !reused || old != Some(row) {
@@ -1862,6 +2589,7 @@ impl Panel {
             }
             self.controls.push(controls);
         }
+        drop(switches);
         for controls in old_controls {
             if controls.contains(&focus) {
                 lost_focus = Some(self.rows.len());
@@ -1871,8 +2599,8 @@ impl Panel {
             }
         }
         if controls_changed {
-            // Dialog navigation uses HWND z-order, including controls retained across pages.
-            let mut previous = self.nav;
+            // Dialog navigation uses HWND z-order within the content container.
+            let mut previous = HWND_TOP;
             for &control in self.controls.iter().flatten() {
                 if SetWindowPos(
                     control,
@@ -1913,7 +2641,7 @@ impl Panel {
         (0..row.control_count())
             .map(|column| {
                 let control = child(
-                    self.hwnd,
+                    self.content,
                     w!("BUTTON"),
                     base + column as u16,
                     WS_TABSTOP.0 | style,
@@ -1928,6 +2656,12 @@ impl Panel {
     unsafe fn client(&self) -> RECT {
         let mut rect = RECT::default();
         let _ = GetClientRect(self.hwnd, &mut rect);
+        rect
+    }
+
+    unsafe fn content_client(&self) -> RECT {
+        let mut rect = RECT::default();
+        let _ = GetClientRect(self.content, &mut rect);
         rect
     }
 
@@ -1947,7 +2681,7 @@ impl Panel {
     }
 
     fn card_height(&self, text: TextMetrics, hint: Option<&Hint>) -> i32 {
-        let gap = if hint.is_some() { self.px(2) } else { 0 };
+        let gap = if hint.is_some() { self.px(3) } else { 0 };
         (text.label + text.hint + gap + 2 * self.px(CARD_VPAD)).max(self.px(CARD_MIN))
     }
 
@@ -1972,43 +2706,48 @@ impl Panel {
         {
             self.control_buffer.get_mut().take();
         }
-        self.measure_page();
-        self.place_controls();
+        let nav_w = self.px(NAV_WIDTH);
+        let cap_h = self.px(CAPTION_HEIGHT);
         let _ = SetWindowPos(
             self.nav,
-            HWND::default(),
+            HWND_TOP,
             self.px(8),
             self.px(NAV_TOP),
             self.px(NAV_WIDTH - 16),
             (client.bottom - self.px(NAV_TOP) - self.px(8)).max(0),
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOREDRAW,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOREDRAW,
         );
+        let _ = SetWindowPos(
+            self.content,
+            self.nav,
+            nav_w,
+            cap_h,
+            (client.right - nav_w).max(0),
+            (client.bottom - cap_h).max(0),
+            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOREDRAW,
+        );
+        self.measure_page();
+        self.place_controls();
 
         request_redraw();
     }
 
     unsafe fn measure_page(&mut self) {
-        // Showing or hiding the scroll bar changes the width available to the rows.
-        for _ in 0..2 {
-            let width = self.client().right;
-            self.measure();
-            self.update_scrollbar();
-            if self.client().right == width {
-                break;
-            }
-        }
+        self.measure();
+        self.update_scrollbar();
     }
 
     unsafe fn measure(&mut self) {
-        let client = self.client();
-        let dc = GetDC(self.hwnd);
-        let left = self.px(NAV_WIDTH + CONTENT_LEFT);
-        let right = (client.right - self.px(CONTENT_RIGHT))
+        let content_client = self.content_client();
+        let dc = GetDC(self.content);
+        let left = self.px(CONTENT_LEFT);
+        // Overlay scrollbar sits inside the right padding so card width is always identical.
+        let right = (content_client.right - self.px(CONTENT_RIGHT))
             .min(left + self.px(CONTENT_MAX))
             .max(left + self.px(240));
         let width = right - left;
         let pad = self.px(CARD_PAD);
-        let mut y = self.px(TOP + TITLE_HEIGHT) + self.px(12);
+        let mut y = self.px(CONTENT_TOP + TITLE_HEIGHT) + self.px(14);
         self.banner = self.save_failed.then(|| {
             let rect = RECT {
                 left,
@@ -2190,7 +2929,7 @@ impl Panel {
             frames.push(frame);
             slots.push(row_slots);
         }
-        ReleaseDC(self.hwnd, dc);
+        ReleaseDC(self.content, dc);
         self.frames = frames;
         self.slots = slots;
         self.content_left = left;
@@ -2199,22 +2938,169 @@ impl Panel {
     }
 
     unsafe fn update_scrollbar(&mut self) {
-        let client = self.client();
+        let client = self.content_client();
         let height = client.bottom - client.top;
         self.scroll = self
             .scroll
             .min((self.content_height - height).max(0))
             .max(0);
-        let scroll_info = SCROLLINFO {
-            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-            fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
-            nMin: 0,
-            nMax: (self.content_height - 1).max(0),
-            nPage: height.max(0) as u32,
-            nPos: self.scroll,
-            ..Default::default()
+        if self.content_height <= height {
+            self.scrollbar.hovered = false;
+            self.scrollbar.dragging = false;
+            let now = Instant::now();
+            self.scrollbar.opacity = ScalarAnim::settled(0.0, now, SCROLLBAR_FADE_IN);
+            self.scrollbar.expand = ScalarAnim::settled(0.0, now, SCROLLBAR_EXPAND_DURATION);
+            let _ = KillTimer(self.hwnd, SCROLLBAR_FADE_TIMER);
+        }
+    }
+
+    unsafe fn reveal_scrollbar(&mut self, now: Instant) {
+        let client_h = self.content_client().bottom;
+        if self.content_height <= client_h {
+            return;
+        }
+        let changed = self.scrollbar.show(now);
+        SetTimer(self.hwnd, SCROLLBAR_FADE_TIMER, SCROLLBAR_FADE_DELAY_MS, None);
+        if changed {
+            self.update_pacer(now);
+            self.invalidate_scrollbar();
+        }
+    }
+
+    unsafe fn scrollbar_strip(&self) -> RECT {
+        let client = self.content_client();
+        RECT {
+            left: (client.right - self.px(SCROLLBAR_HOT_WIDTH + 2)).max(0),
+            top: 0,
+            right: client.right,
+            bottom: client.bottom,
+        }
+    }
+
+    unsafe fn invalidate_scrollbar(&self) {
+        let strip = self.scrollbar_strip();
+        if has_area(strip) {
+            let _ = InvalidateRect(self.content, Some(&strip), false);
+        }
+    }
+
+    unsafe fn scrollbar_mouse_move(&mut self, x: i32, y: i32) {
+        let client = self.content_client();
+        let now = Instant::now();
+        if self.scrollbar.dragging {
+            if let Some(metrics) =
+                scrollbar_thumb_metrics(client.bottom, self.content_height, self.scroll, self.dpi)
+            {
+                let travel = (metrics.track_bottom - metrics.track_top - metrics.thumb_height)
+                    .max(1.0);
+                let max_scroll = (self.content_height - client.bottom).max(1) as f32;
+                let dy = (y - self.scrollbar.drag_anchor_y) as f32;
+                let target = self.scrollbar.drag_start_scroll + (dy * max_scroll / travel).round() as i32;
+                self.scroll_to(target);
+            }
+            return;
+        }
+        let in_zone = self.content_height > client.bottom
+            && x >= client.right - self.px(SCROLLBAR_HOT_WIDTH)
+            && x <= client.right;
+        if self.scrollbar.hovered != in_zone {
+            self.scrollbar.hovered = in_zone;
+            let changed = self.scrollbar.set_expanded(in_zone, now);
+            if in_zone {
+                let _ = KillTimer(self.hwnd, SCROLLBAR_FADE_TIMER);
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: self.content,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut tme);
+            } else {
+                SetTimer(self.hwnd, SCROLLBAR_FADE_TIMER, SCROLLBAR_FADE_DELAY_MS, None);
+            }
+            if changed {
+                self.update_pacer(now);
+                self.invalidate_scrollbar();
+            }
+        }
+    }
+
+    unsafe fn scrollbar_mouse_leave(&mut self) {
+        if self.scrollbar.dragging || !self.scrollbar.hovered {
+            return;
+        }
+        let now = Instant::now();
+        self.scrollbar.hovered = false;
+        let changed = self.scrollbar.set_expanded(false, now);
+        SetTimer(self.hwnd, SCROLLBAR_FADE_TIMER, SCROLLBAR_FADE_DELAY_MS, None);
+        if changed {
+            self.update_pacer(now);
+            self.invalidate_scrollbar();
+        }
+    }
+
+    unsafe fn scrollbar_mouse_down(&mut self, x: i32, y: i32) {
+        let client = self.content_client();
+        if self.transition.is_some()
+            || self.content_height <= client.bottom
+            || x < client.right - self.px(SCROLLBAR_HOT_WIDTH)
+        {
+            return;
+        }
+        let Some(metrics) =
+            scrollbar_thumb_metrics(client.bottom, self.content_height, self.scroll, self.dpi)
+        else {
+            return;
         };
-        SetScrollInfo(self.hwnd, SB_VERT, &scroll_info, false);
+        let yf = y as f32;
+        if yf >= metrics.thumb_top && yf <= metrics.thumb_top + metrics.thumb_height {
+            let now = Instant::now();
+            self.scrollbar.dragging = true;
+            self.scrollbar.hovered = true;
+            self.scrollbar.drag_anchor_y = y;
+            self.scrollbar.drag_start_scroll = self.scroll;
+            let _ = KillTimer(self.hwnd, SCROLLBAR_FADE_TIMER);
+            let _ = self.scrollbar.set_expanded(true, now);
+            SetCapture(self.content);
+            self.update_pacer(now);
+            self.invalidate_scrollbar();
+        } else {
+            // Track click: jump smoothly toward clicked position.
+            let travel =
+                (metrics.track_bottom - metrics.track_top - metrics.thumb_height).max(1.0);
+            let target_top = (yf - metrics.thumb_height * 0.5)
+                .clamp(metrics.track_top, metrics.track_bottom - metrics.thumb_height);
+            let ratio = (target_top - metrics.track_top) / travel;
+            let max_scroll = (self.content_height - client.bottom).max(0) as f32;
+            self.scroll_to((ratio * max_scroll).round() as i32);
+        }
+    }
+
+    unsafe fn scrollbar_end_drag(&mut self) {
+        if !self.scrollbar.dragging {
+            return;
+        }
+        let now = Instant::now();
+        self.scrollbar.dragging = false;
+        let _ = ReleaseCapture();
+        let mut pt = POINT::default();
+        let still_hot = GetCursorPos(&mut pt).is_ok() && {
+            let _ = ScreenToClient(self.content, &mut pt);
+            let client = self.content_client();
+            pt.x >= client.right - self.px(SCROLLBAR_HOT_WIDTH)
+                && pt.x <= client.right
+                && pt.y >= 0
+                && pt.y <= client.bottom
+        };
+        self.scrollbar.hovered = still_hot;
+        let changed = self.scrollbar.set_expanded(still_hot, now);
+        if !still_hot {
+            SetTimer(self.hwnd, SCROLLBAR_FADE_TIMER, SCROLLBAR_FADE_DELAY_MS, None);
+        }
+        if changed {
+            self.update_pacer(now);
+            self.invalidate_scrollbar();
+        }
     }
 
     /// Position controls in the suspended layout or scroll transaction.
@@ -2240,10 +3126,14 @@ impl Panel {
         if self.transition.is_some() {
             return;
         }
-        let height = self.client().bottom;
+        let height = self.content_client().bottom;
         let position = position.min((self.content_height - height).max(0)).max(0);
+        let now = Instant::now();
+        if self.content_height > height {
+            self.reveal_scrollbar(now);
+        }
         if position != self.scroll {
-            let _redraw = SuspendRedraw::new(self.hwnd);
+            let _redraw = SuspendRedraw::new(self.content);
             self.scroll = position;
             self.update_scrollbar();
             self.place_controls();
@@ -2262,7 +3152,7 @@ impl Panel {
         let Some(frame) = self.frames.get(row) else {
             return;
         };
-        let height = self.client().bottom;
+        let height = self.content_client().bottom;
         let margin = self.px(16);
         if frame.rect.top - margin < self.scroll {
             self.scroll_to(frame.rect.top - margin);
@@ -2275,46 +3165,87 @@ impl Panel {
         if page >= Page::ALL.len() || self.page == page || self.menu_open {
             return;
         }
-        self.finish_transition();
+        let now = Instant::now();
+        // If already transitioning between pages, carry over the current composed
+        // visual frame and original underlying HWNDs without rebuilding intermediate controls.
+        let carried = match self.transition.take() {
+            Some(mut previous) if previous.is_page() => {
+                let snapshot = previous.composed.clone_bitmap();
+                drop(previous.trace.take());
+                let old_rows = match previous.kind {
+                    TransitionKind::Page { old_rows, .. } => old_rows,
+                    TransitionKind::Theme { .. } => unreachable!(),
+                };
+                Some((snapshot, old_rows))
+            }
+            Some(previous) => {
+                self.transition = Some(previous);
+                self.finish_transition();
+                None
+            }
+            None => None,
+        };
+
         let Some((language, preference, next)) = lock_state()
             .as_ref()
             .map(|s| (s.language, s.settings_theme, rows(Page::ALL[page], s)))
         else {
+            if let Some((_, old_rows)) = carried {
+                self.install_page(&old_rows);
+            }
             return;
         };
+
+        let old_image = if let Some((snapshot, _)) = &carried {
+            snapshot.as_ref().and_then(|bmp| bmp.clone_bitmap())
+        } else {
+            self.capture_page()
+        };
         let restore_focus = IsChild(self.hwnd, GetFocus()).as_bool();
-        let redraw = SuspendRedraw::new(self.hwnd);
+        let (ind_top, ind_bottom) = nav_indicator_rest(page, self.dpi);
+        self.nav_indicator.move_to(ind_top, ind_bottom, now);
+
+        let redraw = SuspendRedraw::new(self.content);
         self.page = page;
         self.scroll = 0;
-        self.switches.clear();
+        self.switches.borrow_mut().clear();
         self.apply_model(language, preference, SAVE_FAILED.load(Ordering::Relaxed));
-        let old_rows = std::mem::replace(&mut self.rows, next);
+        let replaced_rows = std::mem::replace(&mut self.rows, next);
+        let old_rows = carried.map_or(replaced_rows, |(_, rows)| rows);
         self.measure_page();
-        // Rasterize from the model and layout. The old HWNDs keep their positions
-        // until the animated handoff, so no native creation is on the first-frame path.
-        let image = self.capture_page();
+        // Rasterize from the model and layout. Underlying HWNDs stay untouched
+        // until the transition finishes so page switches start immediately.
+        let new_image = self.capture_page();
         drop(redraw);
 
-        let prepared = image.and_then(|image| {
-            let overlay = Overlay::new(self.hwnd, self.px(NAV_WIDTH), image.bounds())?;
-            Some((overlay, image))
+        let prepared = new_image.and_then(|new_image| {
+            let bounds = new_image.bounds();
+            let composed = Bitmap::new(bounds.right, bounds.bottom)?;
+            let overlay = Overlay::new(self.content, bounds)?;
+            Some((overlay, composed, new_image))
         });
-        if let Some((overlay, image)) = prepared {
+        if let Some((overlay, composed, new_image)) = prepared {
             let start = Instant::now();
             let mut transition = Transition {
                 overlay,
-                image,
-                old_rows,
-                background: self.theme.background,
-                distance: self.px(24),
-                slide: 0,
+                composed,
+                kind: TransitionKind::Page {
+                    old_image,
+                    new_image,
+                    old_rows,
+                    background: self.theme.background,
+                    title_bottom: self.px(CONTENT_TOP + TITLE_HEIGHT),
+                    distance: self.px(14),
+                },
                 start,
-                final_frame: false,
                 trace: clicked.map(TransitionTrace::new),
             };
-            let displayed = transition.draw(start);
+            let (drew, finished) = transition.draw(start);
+            if let Some(trace) = transition.trace.as_mut() {
+                trace.first_frame_us = Some(Instant::now().duration_since(trace.clicked).as_micros());
+            }
             self.transition = Some(transition);
-            if !displayed || !self.queue_animation() {
+            if !drew || finished {
                 self.finish_transition();
             }
         } else {
@@ -2323,46 +3254,96 @@ impl Panel {
         if restore_focus {
             let _ = SetFocus(self.nav);
         }
+        self.update_pacer(Instant::now());
         request_redraw();
     }
 
     unsafe fn install_page(&mut self, old_rows: &[Row]) {
-        let _redraw = SuspendRedraw::new(self.hwnd);
+        let _redraw = SuspendRedraw::new(self.content);
         self.sync_controls(old_rows, true);
-        self.switches.fill(None);
+        let now = Instant::now();
+        let mut switches = self.switches.borrow_mut();
+        for (row, state) in self.rows.iter().zip(switches.iter_mut()) {
+            if let Row::Check { checked, .. } = row {
+                *state = SwitchState::new(*checked, now);
+            }
+        }
+        drop(switches);
         self.place_controls();
     }
 
     unsafe fn finish_transition(&mut self) {
+        let mut reveal = false;
         if let Some(mut transition) = self.transition.take() {
-            // Keep the final bitmap over the content as native HWNDs are
-            // created or reused, then reveal the new page in one redraw.
-            self.install_page(&transition.old_rows);
+            match &transition.kind {
+                TransitionKind::Page { old_rows, .. } => {
+                    let old_rows = old_rows.clone();
+                    // Keep the final bitmap over the content as native HWNDs are
+                    // created or reused, then reveal the new page in one redraw.
+                    self.install_page(&old_rows);
+                    reveal = true;
+                }
+                TransitionKind::Theme { .. } => {}
+            }
             drop(transition.trace.take());
             drop(transition);
             request_redraw();
         }
+        let now = Instant::now();
+        if reveal {
+            self.reveal_scrollbar(now);
+        }
+        self.update_pacer(now);
     }
 
-    unsafe fn queue_animation(&self) -> bool {
-        PostMessageW(self.hwnd, PLAY_ANIMATIONS, WPARAM(0), LPARAM(0)).is_ok()
+    fn animation_active(&self, now: Instant) -> bool {
+        self.transition.is_some()
+            || self.nav_indicator.active
+            || self.scrollbar.is_active(now)
+            || self.switches.borrow().iter().any(|s| s.is_active(now))
     }
 
-    fn animation_active(&self) -> bool {
-        self.transition.is_some() || self.switches.iter().any(Option::is_some)
+    fn update_pacer(&self, now: Instant) {
+        self.pacer.set_active(self.animation_active(now));
     }
 
-    fn switch_frames(&mut self, now: Option<Instant>, redraw: &mut Vec<HWND>) {
-        for (animation, controls) in self.switches.iter_mut().zip(&self.controls) {
-            if let Some(switch) = animation {
-                if now.is_none_or(|now| now.duration_since(switch.start) >= SWITCH_DURATION) {
-                    *animation = None;
-                }
-                if let Some(&control) = controls.first() {
-                    redraw.push(control);
+    unsafe fn tick_animations(
+        &mut self,
+        redraw_controls: &mut Vec<HWND>,
+        redraw_nav: &mut bool,
+        redraw_scrollbar: &mut bool,
+    ) {
+        self.pacer.clear_pending();
+        let now = Instant::now();
+
+        if let Some(transition) = self.transition.as_mut() {
+            let (drew, finished) = transition.draw(now);
+            if !drew || finished {
+                self.finish_transition();
+            }
+        }
+
+        if self.nav_indicator.active {
+            let _ = self.nav_indicator.tick(now);
+            *redraw_nav = true;
+        }
+
+        if self.scrollbar.is_active(now) {
+            *redraw_scrollbar = true;
+        }
+
+        if self.transition.is_none() {
+            let switches = self.switches.borrow();
+            for (state, controls) in switches.iter().zip(&self.controls) {
+                if state.is_active(now) {
+                    if let Some(&control) = controls.first() {
+                        redraw_controls.push(control);
+                    }
                 }
             }
         }
+
+        self.update_pacer(now);
     }
 
     fn locate(&self, id: u16, control: HWND) -> Option<(usize, usize)> {
@@ -2422,18 +3403,9 @@ impl Panel {
 
     // -- painting ---------------------------------------------------------
 
-    unsafe fn paint(&self, target: HDC, dirty: RECT) {
+    unsafe fn paint_frame(&self, target: HDC, dirty: RECT) {
         let client = self.client();
-        let header = RECT {
-            right: self.px(NAV_WIDTH),
-            ..client
-        };
-        let area = if self.transition.is_some() {
-            header
-        } else {
-            client
-        };
-        let dirty = intersection(area, dirty);
+        let dirty = intersection(client, dirty);
         if !has_area(dirty) {
             return;
         }
@@ -2447,20 +3419,100 @@ impl Panel {
         let drawing = Drawing::new(target, buffer.as_mut());
         let dc = drawing.dc;
         fill_rect(dc, dirty, self.theme.background);
-        if has_area(intersection(header, dirty)) {
-            self.paint_header(dc);
-        }
-        let content = RECT {
-            left: header.right,
+        let caption_rect = RECT {
+            bottom: self.px(CAPTION_HEIGHT),
             ..client
         };
-        let visible = intersection(content, dirty);
-        if self.transition.is_none() && has_area(visible) {
-            self.paint_page(drawing, visible, POINT::default());
+        if has_area(intersection(caption_rect, dirty)) {
+            self.paint_caption(dc, client.right);
         }
         if let Some(buffer) = buffer.as_ref() {
             buffer.blit(target, dirty, dirty.left, dirty.top);
         }
+    }
+
+    unsafe fn paint_content(&self, target: HDC, dirty: RECT) {
+        if self.transition.as_ref().is_some_and(Transition::is_page) {
+            return;
+        }
+        let client = self.content_client();
+        let dirty = intersection(client, dirty);
+        if !has_area(dirty) {
+            return;
+        }
+        let mut buffer = self.content_buffer.borrow_mut();
+        if buffer
+            .as_ref()
+            .is_none_or(|bitmap| bitmap.bounds() != client)
+        {
+            *buffer = Bitmap::new(client.right, client.bottom);
+        }
+        let drawing = Drawing::new(target, buffer.as_mut());
+        fill_rect(drawing.dc, dirty, self.theme.background);
+        self.paint_page(drawing, dirty, POINT::default());
+        if let Some(buffer) = buffer.as_mut() {
+            self.paint_scrollbar(Drawing::for_bitmap(buffer), client, dirty, Instant::now());
+            buffer.blit(target, dirty, dirty.left, dirty.top);
+        }
+    }
+
+    unsafe fn paint_scrollbar(
+        &self,
+        mut drawing: Drawing<'_>,
+        client: RECT,
+        dirty: RECT,
+        now: Instant,
+    ) {
+        let opacity = self.scrollbar.opacity.value(now);
+        if opacity <= 0.01 {
+            return;
+        }
+        let Some(metrics) =
+            scrollbar_thumb_metrics(client.bottom, self.content_height, self.scroll, self.dpi)
+        else {
+            return;
+        };
+        let expand = self.scrollbar.expand.value(now);
+        let Some(mut canvas) = drawing.canvas(dirty) else {
+            return;
+        };
+
+        // Subtle pill track fades in when hovered or dragging.
+        if expand > 0.02 {
+            let track_w = self.pxf(12.0);
+            let track_right = (client.right - self.px(2)) as f32;
+            let track_left = track_right - track_w;
+            let track_alpha = (expand * opacity * if self.theme.dark { 22.0 } else { 18.0 }).round() as u32;
+            let track_rgb = if self.theme.dark { 0xFF_FFFF } else { 0x00_0000 };
+            canvas.pill(
+                track_left,
+                metrics.track_top - self.pxf(2.0),
+                track_right,
+                metrics.track_bottom + self.pxf(2.0),
+                track_w * 0.5,
+                (track_alpha << 24) | track_rgb,
+            );
+        }
+
+        let thumb_w = self.pxf(3.0 + 3.0 * expand);
+        let inset_right = self.pxf(5.0);
+        let thumb_right = client.right as f32 - inset_right;
+        let thumb_left = thumb_right - thumb_w;
+        let base_alpha = if self.scrollbar.dragging {
+            225.0
+        } else {
+            135.0 + 65.0 * expand
+        };
+        let thumb_alpha = (base_alpha * opacity).round().clamp(0.0, 255.0) as u32;
+        let thumb_rgb = if self.theme.dark { 0xB8_B8B8 } else { 0x6E_6E6E };
+        canvas.pill(
+            thumb_left,
+            metrics.thumb_top,
+            thumb_right,
+            metrics.thumb_top + metrics.thumb_height,
+            thumb_w * 0.5,
+            (thumb_alpha << 24) | thumb_rgb,
+        );
     }
 
     unsafe fn paint_page(&self, mut drawing: Drawing<'_>, visible: RECT, origin: POINT) {
@@ -2501,9 +3553,9 @@ impl Panel {
             title,
             RECT {
                 left: self.content_left + x_offset,
-                top: self.px(TOP) - scroll,
+                top: self.px(CONTENT_TOP) - scroll,
                 right: self.content_right + x_offset,
-                bottom: self.px(TOP + TITLE_HEIGHT) - scroll,
+                bottom: self.px(CONTENT_TOP + TITLE_HEIGHT) - scroll,
             },
             DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
         );
@@ -2626,14 +3678,15 @@ impl Panel {
         }
     }
 
-    unsafe fn paint_header(&self, dc: HDC) {
-        let icon_size = self.px(24);
-        let top = self.px(22);
+    unsafe fn paint_caption(&self, dc: HDC, client_width: i32) {
+        let cap_h = self.px(CAPTION_HEIGHT);
+        let icon_size = self.px(20);
+        let icon_top = (cap_h - icon_size) / 2;
         if !self.icon.is_invalid() {
             let _ = DrawIconEx(
                 dc,
-                self.px(20),
-                top,
+                self.px(16),
+                icon_top,
                 self.icon,
                 icon_size,
                 icon_size,
@@ -2642,19 +3695,93 @@ impl Panel {
                 DI_NORMAL,
             );
         }
+        let title_color = if self.window_active {
+            self.theme.text
+        } else {
+            self.theme.secondary
+        };
+        let buttons_left = client_width - 3 * self.px(CAPTION_BTN_WIDTH);
         draw_text(
             dc,
-            self.fonts.strong,
-            self.theme.text,
+            self.fonts.caption_title,
+            title_color,
             "Codex Usage",
             RECT {
-                left: self.px(56),
-                top,
-                right: self.px(NAV_WIDTH),
-                bottom: top + icon_size,
+                left: self.px(46),
+                top: 0,
+                right: buttons_left.max(self.px(46)),
+                bottom: cap_h,
             },
             DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
         );
+
+        let maximized = IsZoomed(self.hwnd).as_bool();
+        for button in [
+            CaptionButton::Minimize,
+            CaptionButton::Maximize,
+            CaptionButton::Close,
+        ] {
+            let rect = caption_button_rect(client_width, self.dpi, button);
+            let hovered = self.caption_hover == Some(button);
+            let pressed = self.caption_pressed == Some(button);
+            let (bg, fg) = match (button, pressed, hovered) {
+                (CaptionButton::Close, true, _) => (Some(self.theme.close_pressed), 0xFF_FFFF),
+                (CaptionButton::Close, false, true) => (Some(self.theme.close_hover), 0xFF_FFFF),
+                (_, true, _) => (Some(self.theme.caption_pressed), self.theme.text),
+                (_, false, true) => (Some(self.theme.caption_hover), self.theme.text),
+                (_, false, false) => (
+                    None,
+                    if self.window_active {
+                        self.theme.text
+                    } else {
+                        self.theme.disabled
+                    },
+                ),
+            };
+            if let Some(bg) = bg {
+                fill_rect(dc, rect, bg);
+            }
+            let glyph = match button {
+                CaptionButton::Minimize => GLYPH_MINIMIZE,
+                CaptionButton::Maximize if maximized => GLYPH_RESTORE,
+                CaptionButton::Maximize => GLYPH_MAXIMIZE,
+                CaptionButton::Close => GLYPH_CLOSE,
+            };
+            if self.fonts.has_icons {
+                draw_text(
+                    dc,
+                    self.fonts.caption_icons,
+                    fg,
+                    &glyph.to_string(),
+                    rect,
+                    DT_SINGLELINE | DT_VCENTER | DT_CENTER,
+                );
+            } else {
+                let fallback = match button {
+                    CaptionButton::Minimize => "−",
+                    CaptionButton::Maximize if maximized => "❐",
+                    CaptionButton::Maximize => "□",
+                    CaptionButton::Close => "×",
+                };
+                draw_text(
+                    dc,
+                    self.fonts.body,
+                    fg,
+                    fallback,
+                    rect,
+                    DT_SINGLELINE | DT_VCENTER | DT_CENTER,
+                );
+            }
+        }
+    }
+
+    unsafe fn invalidate_caption(&self) {
+        let client = self.client();
+        let rect = RECT {
+            bottom: self.px(CAPTION_HEIGHT),
+            ..client
+        };
+        let _ = InvalidateRect(self.hwnd, Some(&rect), false);
     }
 
     unsafe fn draw_preview(
@@ -2730,20 +3857,15 @@ impl Panel {
     }
 
     unsafe fn capture_page(&self) -> Option<Bitmap> {
-        let client = self.client();
-        let left = self.px(NAV_WIDTH);
-        let mut bitmap = Bitmap::new(client.right - left, client.bottom)?;
+        let client = self.content_client();
+        let mut bitmap = Bitmap::new(client.right, client.bottom)?;
         let bounds = bitmap.bounds();
         fill_rect(bitmap.dc, bounds, self.theme.background);
-        self.paint_page(
-            Drawing::for_bitmap(&mut bitmap),
-            bounds,
-            POINT { x: -left, y: 0 },
-        );
+        self.paint_page(Drawing::for_bitmap(&mut bitmap), bounds, POINT::default());
         let now = Instant::now();
         for (row, (model, slots)) in self.rows.iter().zip(&self.slots).enumerate() {
             for (column, slot) in slots.iter().enumerate() {
-                let rect = translated(slot.rect, -left, -self.scroll);
+                let rect = translated(slot.rect, 0, -self.scroll);
                 if !has_area(intersection(bounds, rect)) {
                     continue;
                 }
@@ -2758,8 +3880,64 @@ impl Panel {
                     column,
                     state,
                     now,
+                    false,
                 );
             }
+        }
+        Some(bitmap)
+    }
+
+    unsafe fn capture_window(&self) -> Option<Bitmap> {
+        let client = self.client();
+        let mut bitmap = Bitmap::new(client.right, client.bottom)?;
+        let bounds = bitmap.bounds();
+        fill_rect(bitmap.dc, bounds, self.theme.background);
+        self.paint_caption(bitmap.dc, client.right);
+
+        // Paint navigation sidebar directly into the snapshot.
+        let nav_x = self.px(8);
+        let nav_y = self.px(NAV_TOP);
+        let nav_w = self.px(NAV_WIDTH - 16);
+        let item_h = self.px(NAV_ITEM);
+        let now = Instant::now();
+        let titles = page_titles(self.language.unwrap_or(LanguageId::English));
+        for (index, &title) in titles.iter().enumerate() {
+            let item_rect = RECT {
+                left: nav_x,
+                top: nav_y + index as i32 * item_h,
+                right: nav_x + nav_w,
+                bottom: nav_y + (index as i32 + 1) * item_h,
+            };
+            self.paint_nav_item(
+                Drawing::for_bitmap(&mut bitmap),
+                item_rect,
+                index * item_h as usize,
+                index,
+                title,
+                index == self.page,
+                false,
+                false,
+                false,
+                now,
+            );
+        }
+
+        if let Some(mut page) = self.capture_page() {
+            let page_bounds = page.bounds();
+            self.paint_scrollbar(Drawing::for_bitmap(&mut page), page_bounds, page_bounds, now);
+            let nav_w = self.px(NAV_WIDTH);
+            let cap_h = self.px(CAPTION_HEIGHT);
+            let _ = page.blit(
+                bitmap.dc,
+                RECT {
+                    left: nav_w,
+                    top: cap_h,
+                    right: (nav_w + page.width).min(client.right),
+                    bottom: (cap_h + page.height).min(client.bottom),
+                },
+                0,
+                0,
+            );
         }
         Some(bitmap)
     }
@@ -2778,7 +3956,7 @@ impl Panel {
             label: label_height,
             hint: hint_height,
         } = metrics;
-        let gap = if hint.is_some() { self.px(2) } else { 0 };
+        let gap = if hint.is_some() { self.px(3) } else { 0 };
         let mut top = area.top + (area.bottom - area.top - label_height - gap - hint_height) / 2;
         let theme = self.theme;
         draw_text(
@@ -2826,8 +4004,9 @@ impl Panel {
             focused: flags.0 & CDIS_FOCUS.0 != 0 && flags.0 & CDIS_SHOWKEYBOARDCUES.0 != 0,
             disabled: flags.0 & CDIS_DISABLED.0 != 0 || !IsWindowEnabled(control).as_bool(),
         };
+        let now = Instant::now();
         self.paint_control_buffered(draw.hdc, draw.rc, |drawing, area| {
-            self.draw_control_at(drawing, area, row, column, state, Instant::now());
+            self.draw_control_at(drawing, area, row, column, state, now, true);
         });
     }
 
@@ -2862,6 +4041,7 @@ impl Panel {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn draw_control_at(
         &self,
         drawing: Drawing<'_>,
@@ -2870,6 +4050,7 @@ impl Panel {
         column: usize,
         state: ControlState,
         now: Instant,
+        interactive: bool,
     ) {
         let (Some(model), Some(frame)) = (self.rows.get(row), self.frames.get(row)) else {
             return;
@@ -2881,14 +4062,23 @@ impl Panel {
                 hint,
                 ..
             } => {
-                let progress = self
-                    .switches
-                    .get(row)
-                    .copied()
-                    .flatten()
-                    .map_or(f32::from(u8::from(*checked)), |animation| {
-                        animation.value(now)
-                    });
+                let (progress, hover_t, press_t) = {
+                    let mut switches = self.switches.borrow_mut();
+                    if let Some(sw) = switches.get_mut(row) {
+                        if interactive
+                            && sw.update_interaction(state.hot, state.pressed, state.disabled, now)
+                        {
+                            self.pacer.set_active(true);
+                        }
+                        (
+                            sw.checked.value(now),
+                            if interactive { sw.hover.value(now) } else { 0.0 },
+                            if interactive { sw.press.value(now) } else { 0.0 },
+                        )
+                    } else {
+                        (f32::from(u8::from(*checked)), 0.0, 0.0)
+                    }
+                };
                 self.draw_switch_card(
                     drawing,
                     area,
@@ -2896,6 +4086,8 @@ impl Panel {
                     &item.label,
                     hint.as_ref(),
                     progress,
+                    hover_t,
+                    press_t,
                     state,
                 );
             }
@@ -2931,6 +4123,8 @@ impl Panel {
         label: &str,
         hint: Option<&Hint>,
         progress: f32,
+        hover_t: f32,
+        press_t: f32,
         state: ControlState,
     ) {
         let dc = drawing.dc;
@@ -2958,11 +4152,9 @@ impl Panel {
             let radius = self.pxf(CARD_RADIUS);
             canvas.card(rect, radius, fill, theme.card_border);
             let pill = toggle_height as f32 / 2.0;
-            let knob = self.pxf(if state.hot && !state.disabled {
-                14.0
-            } else {
-                12.0
-            });
+            let knob_h = self.pxf(12.0 + 2.0 * hover_t.max(press_t));
+            let stretch = self.pxf(3.5 * press_t);
+            let knob_w = knob_h + stretch;
             let center_y = toggle.top as f32 + pill;
             let (on_track, on_knob, off_stroke, off_knob) = if state.disabled {
                 (theme.disabled, theme.card, theme.disabled, theme.disabled)
@@ -2980,10 +4172,17 @@ impl Panel {
             canvas.stroke(toggle, pill, opaque(stroke), self.pxf(1.0));
             let travel = (toggle.right - toggle.left - toggle_height) as f32;
             let center_x = toggle.left as f32 + pill + travel * progress;
-            canvas.circle(
-                center_x,
-                center_y,
-                knob,
+            // Anchor stretch inward so the knob stays inside the track at both ends.
+            let min_left = toggle.left as f32 + (toggle_height as f32 - knob_h) * 0.5;
+            let max_right = toggle.right as f32 - (toggle_height as f32 - knob_h) * 0.5;
+            let knob_left = (center_x - knob_w * 0.5).clamp(min_left, (max_right - knob_w).max(min_left));
+            let knob_right = (knob_left + knob_w).min(max_right);
+            canvas.pill(
+                knob_left,
+                center_y - knob_h * 0.5,
+                knob_right,
+                center_y + knob_h * 0.5,
+                knob_h * 0.5,
                 opaque(mix_color(off_knob, on_knob, progress)),
             );
             if state.focused {
@@ -3024,6 +4223,11 @@ impl Panel {
         } else {
             theme.control
         };
+        let elevation = if state.disabled || state.pressed {
+            theme.control_border
+        } else {
+            theme.control_elevation
+        };
         let radius = self.pxf(CONTROL_RADIUS);
         let padding = self.px(12);
         let swatch_size = self.px(14);
@@ -3033,7 +4237,14 @@ impl Panel {
             text.left = rect.left + (rect.right - rect.left - content_width) / 2;
         }
         if let Some(mut canvas) = drawing.canvas(rect) {
-            canvas.card(rect, radius, fill, theme.control_border);
+            canvas.control(
+                rect,
+                radius,
+                fill,
+                theme.control_border,
+                elevation,
+                theme.dark,
+            );
             if let Some(color) = item.swatch {
                 let center_y = (rect.top + rect.bottom) as f32 / 2.0;
                 let diameter = swatch_size as f32;
@@ -3105,6 +4316,86 @@ impl Panel {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn paint_nav_item(
+        &self,
+        mut drawing: Drawing<'_>,
+        rect: RECT,
+        list_top_y: usize,
+        index: usize,
+        title: &str,
+        selected: bool,
+        hot: bool,
+        pressed: bool,
+        focused: bool,
+        now: Instant,
+    ) {
+        let dc = drawing.dc;
+        let theme = self.theme;
+        fill_rect(dc, rect, theme.background);
+        let pill = inset(rect, self.px(4), self.px(2));
+        let (ind_top, ind_bottom) = self.nav_indicator.bounds(now);
+        let item_top_f = list_top_y as f32;
+        let local_ind_top = rect.top as f32 + (ind_top - item_top_f);
+        let local_ind_bottom = rect.top as f32 + (ind_bottom - item_top_f);
+        let has_indicator = local_ind_bottom > rect.top as f32 && local_ind_top < rect.bottom as f32;
+
+        if let Some(mut canvas) = drawing.canvas(rect) {
+            let radius = self.pxf(CONTROL_RADIUS);
+            if selected || hot || pressed {
+                let bg = if pressed {
+                    theme.nav_pressed
+                } else if selected {
+                    theme.nav_selected
+                } else {
+                    theme.nav_hover
+                };
+                canvas.fill(pill, radius, opaque(bg));
+            }
+            if has_indicator {
+                let bar_w = self.pxf(3.0);
+                canvas.pill(
+                    pill.left as f32,
+                    local_ind_top,
+                    pill.left as f32 + bar_w,
+                    local_ind_bottom,
+                    bar_w * 0.5,
+                    opaque(theme.accent),
+                );
+            }
+            if focused {
+                canvas.stroke(pill, radius, opaque(theme.text), self.pxf(2.0));
+            }
+        }
+        let mut text = RECT {
+            left: pill.left + self.px(14),
+            right: pill.right - self.px(8),
+            ..pill
+        };
+        let fg = if pressed { theme.secondary } else { theme.text };
+        if self.fonts.has_icons {
+            if let Some(glyph) = PAGE_GLYPHS.get(index) {
+                draw_text(
+                    dc,
+                    self.fonts.icons,
+                    fg,
+                    &glyph.to_string(),
+                    text,
+                    DT_SINGLELINE | DT_VCENTER,
+                );
+            }
+            text.left += self.px(30);
+        }
+        draw_text(
+            dc,
+            if selected { self.fonts.strong } else { self.fonts.body },
+            fg,
+            title,
+            text,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+    }
+
     unsafe fn draw_nav(&self, item: &DRAWITEMSTRUCT) {
         let Some(title) = page_titles(self.language.unwrap_or(LanguageId::English))
             .get(item.itemID as usize)
@@ -3117,67 +4408,21 @@ impl Panel {
         let focused =
             item.itemState.0 & ODS_FOCUS.0 != 0 && item.itemState.0 & ODS_NOFOCUSRECT.0 == 0;
         let hot = NAV_HOVER.with(Cell::get) == index as i32;
-        let theme = self.theme;
-        self.paint_control_buffered(item.hDC, item.rcItem, |mut drawing, rect| {
-            let dc = drawing.dc;
-            fill_rect(dc, rect, theme.background);
-            let pill = inset(rect, self.px(4), self.px(2));
-            if let Some(mut canvas) = drawing.canvas(rect) {
-                let radius = self.pxf(CONTROL_RADIUS);
-                if selected || hot {
-                    canvas.fill(
-                        pill,
-                        radius,
-                        opaque(if selected {
-                            theme.nav_selected
-                        } else {
-                            theme.nav_hover
-                        }),
-                    );
-                }
-                if selected {
-                    let height = self.px(16);
-                    let top = (pill.top + pill.bottom - height) / 2;
-                    canvas.fill(
-                        RECT {
-                            left: pill.left,
-                            top,
-                            right: pill.left + self.px(3),
-                            bottom: top + height,
-                        },
-                        self.pxf(1.5),
-                        opaque(theme.accent),
-                    );
-                }
-                if focused {
-                    canvas.stroke(pill, radius, opaque(theme.text), self.pxf(2.0));
-                }
-            }
-            let mut text = RECT {
-                left: pill.left + self.px(14),
-                right: pill.right - self.px(8),
-                ..pill
-            };
-            if self.fonts.has_icons {
-                if let Some(glyph) = PAGE_GLYPHS.get(index) {
-                    draw_text(
-                        dc,
-                        self.fonts.icons,
-                        theme.text,
-                        &glyph.to_string(),
-                        text,
-                        DT_SINGLELINE | DT_VCENTER,
-                    );
-                }
-                text.left += self.px(30);
-            }
-            draw_text(
-                dc,
-                self.fonts.body,
-                theme.text,
+        let pressed = NAV_PRESSED.with(Cell::get) == index as i32;
+        let list_top_y = item.rcItem.top.max(0) as usize;
+        let now = Instant::now();
+        self.paint_control_buffered(item.hDC, item.rcItem, |drawing, rect| {
+            self.paint_nav_item(
+                drawing,
+                rect,
+                list_top_y,
+                index,
                 title,
-                text,
-                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                selected,
+                hot,
+                pressed,
+                focused,
+                now,
             );
         });
     }
@@ -3185,6 +4430,7 @@ impl Panel {
 
 impl Drop for Panel {
     fn drop(&mut self) {
+        self.pacer.stop();
         unsafe {
             self.fonts.delete();
             if !self.icon.is_invalid() {
@@ -3279,71 +4525,44 @@ unsafe fn update_row(row: &Row, controls: &[HWND]) {
     }
 }
 
-/// Show the items of a drop-down button as a menu below it.
-unsafe fn pick_from_menu(
-    owner: HWND,
-    items: &[OptionItem],
-    selected: usize,
-    anchor: RECT,
-    dpi: u32,
-) -> Option<usize> {
-    let menu = CreatePopupMenu().ok()?;
-    for (index, item) in items.iter().enumerate() {
-        let text = native_interop::wide_str(&item.label);
-        let flags = if item.action.is_some() {
-            MF_STRING
-        } else {
-            MF_STRING | MF_GRAYED
-        };
-        let _ = AppendMenuW(menu, flags, index + 1, PCWSTR(text.as_ptr()));
-    }
-    let _ = CheckMenuRadioItem(
-        menu,
-        1,
-        items.len() as u32,
-        selected as u32 + 1,
-        MF_BYCOMMAND.0,
-    );
-    let command = TrackPopupMenu(
-        menu,
-        TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY,
-        anchor.left,
-        anchor.bottom + scale(4, dpi),
-        0,
-        owner,
-        None,
-    )
-    .0;
-    let _ = DestroyMenu(menu);
-    (command > 0).then(|| command as usize - 1)
-}
-
 fn request_redraw() {
     REDRAW_PENDING.with(|pending| pending.set(true));
 }
 
 fn with_panel<T>(f: impl FnOnce(&mut Panel) -> T) -> Option<T> {
-    let (hwnd, nav, transitioning, result) = PANEL.with(|state| {
-        let mut state = state.try_borrow_mut().ok()?;
-        let panel = state.as_mut()?;
-        let result = f(panel);
-        Some((panel.hwnd, panel.nav, panel.transition.is_some(), result))
-    })?;
+    let (hwnd, nav, content, page_transitioning, theme_transitioning, result) =
+        PANEL.with(|state| {
+            let mut state = state.try_borrow_mut().ok()?;
+            let panel = state.as_mut()?;
+            let result = f(panel);
+            let page_t = panel.transition.as_ref().is_some_and(Transition::is_page);
+            let theme_t = panel.transition.as_ref().is_some_and(|t| !t.is_page());
+            Some((panel.hwnd, panel.nav, panel.content, page_t, theme_t, result))
+        })?;
     if REDRAW_PENDING.with(|pending| pending.replace(false)) {
         unsafe {
             let flags = RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW;
-            if transitioning {
-                // Layout may have changed the nonclient scroll bar and navigation.
+            if theme_transitioning {
+                // Theme cross-fade overlay covers the full client area.
+            } else if page_transitioning {
+                // Keep the caption bar and navigation sidebar crisp while the page overlay animates.
                 let _ = RedrawWindow(
                     hwnd,
                     None,
                     HRGN::default(),
-                    flags | RDW_NOCHILDREN | RDW_FRAME,
+                    flags | RDW_NOCHILDREN,
                 );
                 let _ = RedrawWindow(nav, None, HRGN::default(), flags);
             } else {
                 let _ = RedrawWindow(
                     hwnd,
+                    None,
+                    HRGN::default(),
+                    flags | RDW_NOCHILDREN,
+                );
+                let _ = RedrawWindow(nav, None, HRGN::default(), flags);
+                let _ = RedrawWindow(
+                    content,
                     None,
                     HRGN::default(),
                     flags | RDW_ALLCHILDREN | RDW_FRAME,
@@ -3388,7 +4607,7 @@ pub(super) unsafe fn close() {
 }
 
 fn window_style() -> WINDOW_STYLE {
-    WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VSCROLL
+    WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN
 }
 
 unsafe fn outer_size(width: i32, height: i32, dpi: u32) -> (i32, i32) {
@@ -3398,7 +4617,8 @@ unsafe fn outer_size(width: i32, height: i32, dpi: u32) -> (i32, i32) {
         ..Default::default()
     };
     let _ = AdjustWindowRectExForDpi(&mut rect, window_style(), false, WINDOW_EX_STYLE(0), dpi);
-    (rect.right - rect.left, rect.bottom - rect.top)
+    // The top caption is merged into the client area, so only side/bottom frames add outer size.
+    (rect.right - rect.left, rect.bottom)
 }
 
 pub(super) unsafe fn show(widget: HWND) {
@@ -3419,6 +4639,13 @@ pub(super) unsafe fn show(widget: HWND) {
         lpszClassName: CLASS,
         hCursor: cursor,
         hIcon: LoadIconW(instance, PCWSTR(1usize as *const u16)).unwrap_or_default(),
+        ..Default::default()
+    });
+    let _ = RegisterClassW(&WNDCLASSW {
+        lpfnWndProc: Some(content_proc),
+        hInstance: instance,
+        lpszClassName: CONTENT_CLASS,
+        hCursor: cursor,
         ..Default::default()
     });
     let _ = RegisterClassW(&WNDCLASSW {
@@ -3465,6 +4692,21 @@ pub(super) unsafe fn show(widget: HWND) {
         diagnose::log("unable to open settings window");
         return;
     };
+    // Preserve native Windows 11 drop shadow and rounded corners after removing the top caption.
+    let margins = MARGINS {
+        cyTopHeight: 1,
+        ..Default::default()
+    };
+    let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+    let _ = SetWindowPos(
+        hwnd,
+        HWND::default(),
+        0,
+        0,
+        0,
+        0,
+        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
     let panel = Panel::new(hwnd, widget);
     PANEL.with(|state| *state.borrow_mut() = Some(panel));
     with_panel(|panel| panel.sync(true));
@@ -3476,103 +4718,63 @@ pub(super) unsafe fn show(widget: HWND) {
     });
 }
 
-/// Keep input in the main message queue. It can end the animation, but
-/// navigation and dialog handling run later on the normal message stack.
-unsafe fn pump_animation_messages() -> bool {
-    let mut message = MSG::default();
-    for input in [
-        WM_KEYDOWN,
-        WM_SYSKEYDOWN,
-        WM_LBUTTONDOWN,
-        WM_RBUTTONDOWN,
-        WM_MBUTTONDOWN,
-        WM_XBUTTONDOWN,
-        WM_NCLBUTTONDOWN,
-        WM_NCRBUTTONDOWN,
-        WM_NCMBUTTONDOWN,
-        WM_NCXBUTTONDOWN,
-        WM_LBUTTONDBLCLK,
-        WM_NCLBUTTONDBLCLK,
-        WM_MOUSEWHEEL,
-        WM_MOUSEHWHEEL,
-        WM_POINTERDOWN,
-        WM_CLOSE,
-        WM_SYSCOMMAND,
-    ] {
-        if PeekMessageW(&mut message, HWND::default(), input, input, PM_NOREMOVE).as_bool() {
-            return false;
-        }
+fn caption_button_from_ht(ht: usize) -> Option<CaptionButton> {
+    match ht as u32 {
+        HTMINBUTTON => Some(CaptionButton::Minimize),
+        HTMAXBUTTON => Some(CaptionButton::Maximize),
+        HTCLOSE => Some(CaptionButton::Close),
+        _ => None,
     }
-
-    // Process a bounded number of paints per frame. Timer messages stay queued.
-    for _ in 0..4 {
-        if !PeekMessageW(&mut message, HWND::default(), WM_PAINT, WM_PAINT, PM_REMOVE).as_bool() {
-            break;
-        }
-        if message.message == WM_QUIT {
-            PostQuitMessage(message.wParam.0 as i32);
-            return false;
-        }
-        DispatchMessageW(&message);
-    }
-    true
 }
 
-unsafe fn play_animations(hwnd: HWND) {
-    let mut use_dwm = true;
-    let mut switches = Vec::new();
-    loop {
-        let Ok(Some((true, started))) = with_panel_ref(|panel| {
-            (
-                panel.hwnd == hwnd && panel.animation_active(),
-                panel.transition.as_ref().map(|transition| transition.start),
-            )
-        }) else {
-            break;
-        };
-        if use_dwm {
-            use_dwm = DwmFlush().is_ok();
-        }
-        if !use_dwm {
-            Sleep(8);
-        }
-        let presented_at = Instant::now();
-        // PeekMessage can dispatch sent messages, including close and DPI
-        // changes. Never hold the panel borrow or an overlay DC across it.
-        let continue_playing = pump_animation_messages();
-        with_panel(|panel| {
-            if panel.hwnd != hwnd {
-                return;
-            }
-            if let Some(transition) = panel.transition.as_mut() {
-                if Some(transition.start) != started {
-                    // A sent navigation message installed a new first frame.
-                    // Wait for its own compositor cycle before advancing it.
-                    return;
-                }
-                if let Some(trace) = transition.trace.as_mut() {
-                    trace.first_frame_us.get_or_insert_with(|| {
-                        presented_at.duration_since(trace.clicked).as_micros()
-                    });
-                }
-                if !continue_playing || transition.final_frame || !transition.draw(Instant::now()) {
-                    panel.finish_transition();
-                }
-            } else {
-                panel.switch_frames(continue_playing.then(Instant::now), &mut switches);
-            }
-        });
-        for control in switches.drain(..) {
-            let _ = RedrawWindow(
-                control,
-                None,
-                HRGN::default(),
-                RDW_INVALIDATE | RDW_NOCHILDREN | RDW_NOERASE | RDW_UPDATENOW,
-            );
-        }
-        if !continue_playing {
-            break;
-        }
+unsafe fn track_nc_leave(hwnd: HWND) {
+    let mut track = TRACKMOUSEEVENT {
+        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE | TME_NONCLIENT,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    let _ = TrackMouseEvent(&mut track);
+}
+
+unsafe fn show_system_menu(hwnd: HWND, x: i32, y: i32) {
+    let menu = GetSystemMenu(hwnd, false);
+    if menu.is_invalid() {
+        return;
+    }
+    let maximized = IsZoomed(hwnd).as_bool();
+    let _ = EnableMenuItem(
+        menu,
+        SC_RESTORE,
+        MF_BYCOMMAND | if maximized { MF_ENABLED } else { MF_GRAYED },
+    );
+    let _ = EnableMenuItem(
+        menu,
+        SC_MOVE,
+        MF_BYCOMMAND | if maximized { MF_GRAYED } else { MF_ENABLED },
+    );
+    let _ = EnableMenuItem(
+        menu,
+        SC_SIZE,
+        MF_BYCOMMAND | if maximized { MF_GRAYED } else { MF_ENABLED },
+    );
+    let _ = EnableMenuItem(
+        menu,
+        SC_MAXIMIZE,
+        MF_BYCOMMAND | if maximized { MF_GRAYED } else { MF_ENABLED },
+    );
+    let command = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+        x,
+        y,
+        0,
+        hwnd,
+        None,
+    )
+    .0;
+    if command > 0 {
+        let _ = PostMessageW(hwnd, WM_SYSCOMMAND, WPARAM(command as usize), LPARAM(0));
     }
 }
 
@@ -3583,6 +4785,123 @@ unsafe extern "system" fn settings_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_NCCALCSIZE if wparam.0 != 0 => {
+            let params = &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS);
+            let original_top = params.rgrc[0].top;
+            let _ = DefWindowProcW(hwnd, msg, wparam, lparam);
+            if IsZoomed(hwnd).as_bool() {
+                let dpi = GetDpiForWindow(hwnd).max(96);
+                let frame = GetSystemMetricsForDpi(SM_CYFRAME, dpi)
+                    + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                params.rgrc[0].top = original_top + frame;
+            } else {
+                params.rgrc[0].top = original_top;
+            }
+            return LRESULT(0);
+        }
+        WM_NCHITTEST => {
+            let mut pt = POINT {
+                x: (lparam.0 & 0xFFFF) as i16 as i32,
+                y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+            };
+            let _ = ScreenToClient(hwnd, &mut pt);
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            let dpi = GetDpiForWindow(hwnd).max(96);
+            let hit = hit_test_caption(client, pt, dpi, IsZoomed(hwnd).as_bool());
+            if hit != HTCLIENT as i32 {
+                return LRESULT(hit as isize);
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        WM_NCMOUSEMOVE => {
+            let hovered = caption_button_from_ht(wparam.0);
+            let changed = with_panel(|panel| {
+                if panel.caption_hover != hovered {
+                    panel.caption_hover = hovered;
+                    panel.invalidate_caption();
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+            if changed && hovered.is_some() {
+                track_nc_leave(hwnd);
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        WM_NCMOUSELEAVE => {
+            with_panel(|panel| {
+                if panel.caption_hover.is_some() || panel.caption_pressed.is_some() {
+                    panel.caption_hover = None;
+                    panel.caption_pressed = None;
+                    panel.invalidate_caption();
+                }
+            });
+            return LRESULT(0);
+        }
+        WM_MOUSEMOVE => {
+            with_panel(|panel| {
+                if panel.caption_hover.is_some() {
+                    panel.caption_hover = None;
+                    panel.invalidate_caption();
+                }
+            });
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        WM_NCLBUTTONDOWN => {
+            if let Some(button) = caption_button_from_ht(wparam.0) {
+                with_panel(|panel| {
+                    panel.caption_hover = Some(button);
+                    panel.caption_pressed = Some(button);
+                    panel.invalidate_caption();
+                });
+                return LRESULT(0);
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        WM_NCLBUTTONUP => {
+            let released = caption_button_from_ht(wparam.0);
+            let action = with_panel(|panel| {
+                let pressed = panel.caption_pressed.take();
+                if pressed.is_some() {
+                    panel.invalidate_caption();
+                }
+                pressed.filter(|&btn| Some(btn) == released)
+            })
+            .flatten();
+            if let Some(button) = action {
+                let command = match button {
+                    CaptionButton::Minimize => SC_MINIMIZE,
+                    CaptionButton::Maximize if IsZoomed(hwnd).as_bool() => SC_RESTORE,
+                    CaptionButton::Maximize => SC_MAXIMIZE,
+                    CaptionButton::Close => SC_CLOSE,
+                };
+                let _ = PostMessageW(hwnd, WM_SYSCOMMAND, WPARAM(command as usize), LPARAM(0));
+                return LRESULT(0);
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        WM_NCRBUTTONUP if wparam.0 == HTCAPTION as usize => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            show_system_menu(hwnd, x, y);
+            return LRESULT(0);
+        }
+        WM_ACTIVATE => {
+            let active = (wparam.0 & 0xFFFF) != 0;
+            with_panel(|panel| {
+                // Keep the settings title bar looking active while our own dropdown flyout has focus.
+                panel.window_active = active || panel.menu_open;
+                if !active {
+                    panel.caption_hover = None;
+                    panel.caption_pressed = None;
+                }
+                panel.invalidate_caption();
+            });
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
         WM_COMMAND => {
             let id = wparam.0 as u16;
             let code = (wparam.0 >> 16) as u16;
@@ -3594,19 +4913,37 @@ unsafe extern "system" fn settings_proc(
                 let page = SendMessageW(control, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
                 with_panel(|panel| panel.change_page(page as usize, clicked));
             } else if code == BN_CLICKED as u16 {
+                let suppressed = with_panel(|panel| {
+                    panel
+                        .last_dropdown_closed
+                        .take()
+                        .is_some_and(|(last_id, at)| {
+                            last_id == id && at.elapsed() < Duration::from_millis(200)
+                        })
+                })
+                .unwrap_or(false);
+                if suppressed {
+                    return LRESULT(0);
+                }
                 let request = with_panel(|panel| {
                     panel.finish_transition();
                     let request = panel.choice_request(id, control);
                     panel.menu_open = request.is_some();
-                    request.map(|request| (request, panel.dpi))
+                    request.map(|request| (request, panel.theme, panel.fonts, panel.dpi))
                 })
                 .flatten();
-                if let Some(((items, selected, anchor), dpi)) = request {
-                    // The menu runs a nested message loop: never hold the panel here.
-                    let picked = pick_from_menu(hwnd, &items, selected, anchor, dpi);
+                if let Some(((items, selected, anchor), theme, fonts, dpi)) = request {
+                    // The dropdown runs a nested message loop: never hold the panel here.
+                    let outcome = dropdown::pick(hwnd, &items, selected, anchor, theme, fonts, dpi);
                     with_panel(|panel| {
                         panel.menu_open = false;
-                        if let Some(item) = picked
+                        panel.window_active = true;
+                        panel.invalidate_caption();
+                        if outcome.closed_on_anchor {
+                            panel.last_dropdown_closed = Some((id, Instant::now()));
+                        }
+                        if let Some(item) = outcome
+                            .picked
                             .filter(|index| *index != selected)
                             .and_then(|index| items.get(index))
                         {
@@ -3651,9 +4988,59 @@ unsafe extern "system" fn settings_proc(
                 });
             }
         }
-        PLAY_ANIMATIONS => play_animations(hwnd),
+        ANIMATION_TICK => {
+            let mut redraw_controls = Vec::new();
+            let mut redraw_nav = false;
+            let mut redraw_scrollbar = false;
+            let handles = with_panel(|panel| {
+                if panel.hwnd == hwnd {
+                    panel.tick_animations(
+                        &mut redraw_controls,
+                        &mut redraw_nav,
+                        &mut redraw_scrollbar,
+                    );
+                }
+                (panel.nav, panel.content, panel.scrollbar_strip())
+            });
+            if let Some((nav, content, strip)) = handles {
+                if redraw_nav {
+                    let _ = RedrawWindow(
+                        nav,
+                        None,
+                        HRGN::default(),
+                        RDW_INVALIDATE | RDW_NOCHILDREN | RDW_NOERASE | RDW_UPDATENOW,
+                    );
+                }
+                if redraw_scrollbar && has_area(strip) {
+                    let _ = RedrawWindow(
+                        content,
+                        Some(&strip),
+                        HRGN::default(),
+                        RDW_INVALIDATE | RDW_NOCHILDREN | RDW_NOERASE | RDW_UPDATENOW,
+                    );
+                }
+            }
+            for control in redraw_controls {
+                let _ = RedrawWindow(
+                    control,
+                    None,
+                    HRGN::default(),
+                    RDW_INVALIDATE | RDW_NOCHILDREN | RDW_NOERASE | RDW_UPDATENOW,
+                );
+            }
+        }
         WM_TIMER if wparam.0 == REFRESH_TIMER => {
             with_panel(|panel| panel.sync(false));
+        }
+        WM_TIMER if wparam.0 == SCROLLBAR_FADE_TIMER => {
+            let _ = KillTimer(hwnd, SCROLLBAR_FADE_TIMER);
+            with_panel(|panel| {
+                let now = Instant::now();
+                if panel.scrollbar.fade_out(now) {
+                    panel.update_pacer(now);
+                    panel.invalidate_scrollbar();
+                }
+            });
         }
         WM_SIZE => {
             with_panel(|panel| {
@@ -3669,41 +5056,16 @@ unsafe extern "system" fn settings_proc(
                 y: height,
             };
         }
-        WM_VSCROLL => {
-            with_panel(|panel| {
-                let height = panel.client().bottom;
-                let line = panel.px(48);
-                let target = match SCROLLBAR_COMMAND(wparam.0 as u16 as i32) {
-                    SB_LINEUP => panel.scroll - line,
-                    SB_LINEDOWN => panel.scroll + line,
-                    SB_PAGEUP => panel.scroll - (height - line).max(line),
-                    SB_PAGEDOWN => panel.scroll + (height - line).max(line),
-                    SB_TOP => 0,
-                    SB_BOTTOM => i32::MAX,
-                    SB_THUMBTRACK | SB_THUMBPOSITION => {
-                        let mut info = SCROLLINFO {
-                            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-                            fMask: SIF_TRACKPOS,
-                            ..Default::default()
-                        };
-                        if GetScrollInfo(hwnd, SB_VERT, &mut info).is_err() {
-                            return;
-                        }
-                        info.nTrackPos
-                    }
-                    _ => return,
-                };
-                panel.scroll_to(target);
-            });
-            let _ = UpdateWindow(hwnd);
-        }
         WM_MOUSEWHEEL => {
             let delta = i32::from((wparam.0 >> 16) as u16 as i16);
-            with_panel(|panel| {
+            let content = with_panel(|panel| {
                 let step = panel.px(WHEEL_STEP);
                 panel.scroll_to(panel.scroll - delta * step / 120);
+                panel.content
             });
-            let _ = UpdateWindow(hwnd);
+            if let Some(content) = content {
+                let _ = UpdateWindow(content);
+            }
         }
         WM_DPICHANGED => {
             let dpi = wparam.0 as u16 as u32;
@@ -3711,7 +5073,8 @@ unsafe extern "system" fn settings_proc(
             with_panel(|panel| {
                 panel.finish_transition();
                 let _redraw = SuspendRedraw::new(hwnd);
-                panel.set_dpi(dpi);
+                let language = panel.language.unwrap_or(LanguageId::English);
+                panel.set_dpi(dpi, language);
                 let _ = SetWindowPos(
                     hwnd,
                     HWND::default(),
@@ -3729,8 +5092,11 @@ unsafe extern "system" fn settings_proc(
                 let theme = Theme::current(panel.preference);
                 if theme != panel.theme {
                     panel.finish_transition();
-                    let _redraw = SuspendRedraw::new(hwnd);
+                    let old_snapshot = panel.capture_window();
+                    let redraw = SuspendRedraw::new(hwnd);
                     panel.apply_theme(theme);
+                    drop(redraw);
+                    panel.start_theme_transition(old_snapshot);
                 }
             });
             return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -3769,11 +5135,11 @@ unsafe extern "system" fn settings_proc(
             let started = diagnose::is_enabled().then(Instant::now);
             let mut paint = PAINTSTRUCT::default();
             let dc = BeginPaint(hwnd, &mut paint);
-            let painted = with_panel_ref(|panel| panel.paint(dc, paint.rcPaint));
+            let painted = with_panel_ref(|panel| panel.paint_frame(dc, paint.rcPaint));
             let _ = EndPaint(hwnd, &paint);
             if let (Some(started), Ok(Some(()))) = (started, painted) {
                 diagnose::log(format!(
-                    "settings paint cost_us={}",
+                    "settings frame paint cost_us={}",
                     started.elapsed().as_micros()
                 ));
             }
@@ -3786,8 +5152,10 @@ unsafe extern "system" fn settings_proc(
         }
         WM_DESTROY => {
             let _ = KillTimer(hwnd, REFRESH_TIMER);
+            let _ = KillTimer(hwnd, SCROLLBAR_FADE_TIMER);
             PANEL.with(|state| {
                 if let Some(panel) = state.borrow_mut().as_mut() {
+                    panel.pacer.stop();
                     panel.transition.take();
                 }
             });
@@ -3799,11 +5167,77 @@ unsafe extern "system" fn settings_proc(
             let _ = GdiFlush();
             REDRAW_PENDING.with(|pending| pending.set(false));
             NAV_HOVER.with(|hover| hover.set(-1));
+            NAV_PRESSED.with(|pressed| pressed.set(-1));
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     LRESULT(0)
+}
+
+unsafe extern "system" fn content_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_COMMAND | WM_NOTIFY | ENSURE_VISIBLE => {
+            let parent = GetParent(hwnd).unwrap_or_default();
+            if !parent.is_invalid() {
+                return SendMessageW(parent, msg, wparam, lparam);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            with_panel(|panel| panel.scrollbar_mouse_move(x, y));
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            with_panel(|panel| panel.scrollbar_mouse_leave());
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            with_panel(|panel| panel.scrollbar_mouse_down(x, y));
+            LRESULT(0)
+        }
+        WM_LBUTTONUP | WM_CAPTURECHANGED => {
+            with_panel(|panel| panel.scrollbar_end_drag());
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            let delta = i32::from((wparam.0 >> 16) as u16 as i16);
+            with_panel(|panel| {
+                let step = panel.px(WHEEL_STEP);
+                panel.scroll_to(panel.scroll - delta * step / 120);
+            });
+            let _ = UpdateWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            let started = diagnose::is_enabled().then(Instant::now);
+            let mut paint = PAINTSTRUCT::default();
+            let dc = BeginPaint(hwnd, &mut paint);
+            let painted = with_panel_ref(|panel| panel.paint_content(dc, paint.rcPaint));
+            let _ = EndPaint(hwnd, &paint);
+            if let (Some(started), Ok(Some(()))) = (started, painted) {
+                diagnose::log(format!(
+                    "settings content paint cost_us={}",
+                    started.elapsed().as_micros()
+                ));
+            }
+            if painted.is_err() {
+                request_redraw();
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
 }
 
 unsafe extern "system" fn overlay_proc(
@@ -3816,8 +5250,7 @@ unsafe extern "system" fn overlay_proc(
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
-            // Restore the current pose if the OS exposes this window. The
-            // animation itself paints directly and never invalidates the overlay.
+            // Restore the current composed pose if the OS exposes this window.
             let mut paint = PAINTSTRUCT::default();
             let dc = BeginPaint(hwnd, &mut paint);
             if has_area(paint.rcPaint) {
@@ -3825,12 +5258,7 @@ unsafe extern "system" fn overlay_proc(
                     if let Some(transition) =
                         panel.transition.as_ref().filter(|t| t.overlay.0 == hwnd)
                     {
-                        paint_slide(
-                            dc,
-                            &transition.image,
-                            transition.slide,
-                            transition.background,
-                        );
+                        transition.repaint(dc);
                     }
                 });
             }
@@ -3841,7 +5269,7 @@ unsafe extern "system" fn overlay_proc(
     }
 }
 
-/// Navigation hover tracking, and scrolling focused settings into view.
+/// Navigation hover/press tracking, and scrolling focused settings into view.
 unsafe extern "system" fn control_proc(
     hwnd: HWND,
     msg: u32,
@@ -3873,9 +5301,27 @@ unsafe extern "system" fn control_proc(
                 let _ = TrackMouseEvent(&mut track);
             }
         }
+        WM_LBUTTONDOWN if is_nav => {
+            let point = lparam.0 as u32;
+            let hit = SendMessageW(hwnd, LB_ITEMFROMPOINT, WPARAM(0), LPARAM(point as isize)).0;
+            let index = if hit >> 16 & 0xFFFF == 0 {
+                (hit & 0xFFFF) as i32
+            } else {
+                -1
+            };
+            let previous = NAV_PRESSED.with(|pressed| pressed.replace(index));
+            invalidate_nav_item(hwnd, previous);
+            invalidate_nav_item(hwnd, index);
+        }
+        WM_LBUTTONUP | WM_CAPTURECHANGED if is_nav => {
+            let previous = NAV_PRESSED.with(|pressed| pressed.replace(-1));
+            invalidate_nav_item(hwnd, previous);
+        }
         WM_MOUSELEAVE if is_nav => {
             let previous = NAV_HOVER.with(|hover| hover.replace(-1));
             invalidate_nav_item(hwnd, previous);
+            let prev_pressed = NAV_PRESSED.with(|pressed| pressed.replace(-1));
+            invalidate_nav_item(hwnd, prev_pressed);
         }
         WM_SETFOCUS if !is_nav => {
             let _ = PostMessageW(
@@ -3917,51 +5363,95 @@ mod tests {
 
     #[test]
     fn page_slide_eases_into_the_final_position() {
-        let distance = scale(24, 192);
-        assert_eq!(page_slide(Duration::ZERO, distance), 48);
-        assert_eq!(page_slide(PAGE_DURATION / 2, distance), 12);
+        let distance = scale(14, 192);
+        assert_eq!(page_slide(Duration::ZERO, distance), 28);
+        assert!(page_slide(PAGE_DURATION / 2, distance) < 4);
         assert_eq!(page_slide(PAGE_DURATION, distance), 0);
         assert_eq!(page_slide(PAGE_DURATION * 2, distance), 0);
     }
 
     #[test]
-    fn reversing_a_switch_starts_at_its_interpolated_position() {
-        let start = Instant::now();
-        let forward = SwitchAnimation {
-            from: 0.0,
-            to: 1.0,
-            start,
-        };
-        let interrupted = start + SWITCH_DURATION / 2;
-        let reverse = SwitchAnimation {
-            from: forward.value(interrupted),
-            to: 0.0,
-            start: interrupted,
-        };
-        assert_eq!(reverse.value(interrupted), 0.875);
-        assert_eq!(reverse.value(interrupted + SWITCH_DURATION), 0.0);
+    fn page_alphas_fade_old_out_and_new_in() {
+        let (old0, title0, content0) = page_alphas(Duration::ZERO);
+        assert_eq!(old0, 255);
+        assert_eq!(title0, 0);
+        assert_eq!(content0, 0);
+
+        let (old_mid, title_mid, content_mid) = page_alphas(Duration::from_millis(80));
+        assert_eq!(old_mid, 0);
+        assert!(title_mid > 128);
+        assert!(content_mid > 0 && content_mid < 255);
+
+        let (old_end, title_end, content_end) = page_alphas(PAGE_DURATION);
+        assert_eq!((old_end, title_end, content_end), (0, 255, 255));
     }
 
     #[test]
-    fn bitmap_slide_fills_only_the_exposed_strip_and_crops_at_the_bottom() {
-        unsafe {
-            let page = Bitmap::new(2, 3).unwrap();
-            let output = Bitmap::new(2, 4).unwrap();
-            let bounds = page.bounds();
-            fill_rect(page.dc, bounds, 0x11_1111);
-            fill_rect(page.dc, RECT { top: 1, ..bounds }, 0x22_2222);
-            fill_rect(page.dc, RECT { top: 2, ..bounds }, 0x33_3333);
-            fill_rect(output.dc, output.bounds(), 0xFF_00FF);
-            assert!(paint_slide(output.dc, &page, 1, 0x00_00FF));
-            for x in 0..2 {
-                assert_eq!(GetPixel(output.dc, x, 0), colorref(0x00_00FF));
-                assert_eq!(GetPixel(output.dc, x, 1), colorref(0x11_1111));
-                assert_eq!(GetPixel(output.dc, x, 2), colorref(0x22_2222));
-                assert_eq!(GetPixel(output.dc, x, 3), colorref(0xFF_00FF));
-            }
-            assert!(paint_slide(output.dc, &page, 0, 0x00_00FF));
-            assert_eq!(GetPixel(output.dc, 0, 2), colorref(0x33_3333));
-        }
+    fn reversing_a_switch_starts_at_its_interpolated_position() {
+        let start = Instant::now();
+        let mut sw = SwitchState::new(false, start);
+        assert!(sw.set_checked(true, start));
+        let interrupted = start + SWITCH_DURATION / 2;
+        assert_eq!(sw.checked.value(interrupted), 0.875);
+        assert!(sw.set_checked(false, interrupted));
+        assert_eq!(sw.checked.value(interrupted), 0.875);
+        assert_eq!(sw.checked.value(interrupted + SWITCH_DURATION), 0.0);
+    }
+
+    #[test]
+    fn nav_indicator_stretches_leading_edge_before_settling() {
+        let start = Instant::now();
+        let (top0, bot0) = nav_indicator_rest(0, 96);
+        let (top2, bot2) = nav_indicator_rest(2, 96);
+        let mut ind = NavIndicator::settled(top0, bot0, start);
+        ind.move_to(top2, bot2, start);
+        let (mid_top, mid_bot) = ind.bounds(start + NAV_INDICATOR_DURATION / 3);
+        assert!(mid_bot - mid_top > (bot0 - top0) + 1.0);
+        let (end_top, end_bot) = ind.bounds(start + NAV_INDICATOR_DURATION);
+        assert_eq!((end_top, end_bot), (top2, bot2));
+    }
+
+    #[test]
+    fn caption_hit_test_routes_resize_buttons_and_drag_region() {
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: 900,
+            bottom: 640,
+        };
+        assert_eq!(
+            hit_test_caption(client, POINT { x: 400, y: 2 }, 96, false),
+            HTTOP as i32
+        );
+        assert_eq!(
+            hit_test_caption(client, POINT { x: 4, y: 2 }, 96, false),
+            HTTOPLEFT as i32
+        );
+        // Maximized windows disable the top resize strip so buttons reach screen top.
+        assert_eq!(
+            hit_test_caption(client, POINT { x: 890, y: 2 }, 96, true),
+            HTCLOSE as i32
+        );
+        assert_eq!(
+            hit_test_caption(client, POINT { x: 880, y: 16 }, 96, false),
+            HTCLOSE as i32
+        );
+        assert_eq!(
+            hit_test_caption(client, POINT { x: 830, y: 16 }, 96, false),
+            HTMAXBUTTON as i32
+        );
+        assert_eq!(
+            hit_test_caption(client, POINT { x: 780, y: 16 }, 96, false),
+            HTMINBUTTON as i32
+        );
+        assert_eq!(
+            hit_test_caption(client, POINT { x: 300, y: 20 }, 96, false),
+            HTCAPTION as i32
+        );
+        assert_eq!(
+            hit_test_caption(client, POINT { x: 300, y: 60 }, 96, false),
+            HTCLIENT as i32
+        );
     }
 
     fn service_label(name: &str, monitored: bool, error: Option<PollError>) -> String {
@@ -4038,5 +5528,282 @@ mod tests {
             2
         );
         assert!(!same_controls(&section("A"), &check("A", 1, true)));
+    }
+
+    #[test]
+    #[ignore = "set CODEX_SETTINGS_SNAPSHOT_DIR to render settings window snapshots"]
+    fn render_settings_snapshots() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("CODEX_SETTINGS_SNAPSHOT_DIR").expect("snapshot directory"),
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let save_bmp = |path: &std::path::Path, bitmap: &Bitmap| unsafe {
+            let pixels = bitmap.pixels();
+            let width = bitmap.width;
+            let height = bitmap.height;
+            let mut bmp = Vec::with_capacity(54 + pixels.len() * 4);
+            bmp.extend_from_slice(b"BM");
+            bmp.extend_from_slice(&(54u32 + pixels.len() as u32 * 4).to_le_bytes());
+            bmp.extend_from_slice(&[0u8; 4]);
+            bmp.extend_from_slice(&54u32.to_le_bytes());
+            bmp.extend_from_slice(&40u32.to_le_bytes());
+            bmp.extend_from_slice(&width.to_le_bytes());
+            bmp.extend_from_slice(&(-height).to_le_bytes());
+            bmp.extend_from_slice(&1u16.to_le_bytes());
+            bmp.extend_from_slice(&32u16.to_le_bytes());
+            bmp.extend_from_slice(&[0u8; 24]);
+            for &pixel in pixels {
+                bmp.extend_from_slice(&(0xFF00_0000 | (pixel & 0x00FF_FFFF)).to_le_bytes());
+            }
+            std::fs::write(path, bmp).unwrap();
+        };
+
+        unsafe {
+            {
+                let mut state = lock_state();
+                *state = Some(AppState {
+                    hwnd: SendHwnd::from_hwnd(HWND::default()),
+                    taskbar_hwnd: None,
+                    tray_notify_hwnd: None,
+                    win_event_hook: None,
+                    is_dark: false,
+                    embedded: false,
+                    language_override: Some(LanguageId::SimplifiedChinese),
+                    language: LanguageId::SimplifiedChinese,
+                    appearance: Appearance::default(),
+                    quota_display_mode: QuotaDisplayMode::Remaining,
+                    settings_theme: SettingsTheme::Light,
+                    install_channel: InstallChannel::Portable,
+                    session_percent: 25.0,
+                    session_text: "75% 3h".into(),
+                    weekly_percent: 40.0,
+                    weekly_text: "60% 4d".into(),
+                    codex_session_percent: 25.0,
+                    codex_session_text: "75% 3h".into(),
+                    codex_weekly_percent: 40.0,
+                    codex_weekly_text: "60% 4d".into(),
+                    antigravity_session_percent: 20.0,
+                    antigravity_session_text: "80% 3h".into(),
+                    antigravity_weekly_percent: 30.0,
+                    antigravity_weekly_text: "70% 4d".into(),
+                    show_claude_code: true,
+                    show_codex: true,
+                    show_antigravity: true,
+                    antigravity_quota_group: None,
+                    antigravity_groups: Vec::new(),
+                    show_session_window: true,
+                    show_weekly_window: true,
+                    alert_threshold_percent: 20,
+                    notified_quota_windows: BTreeSet::new(),
+                    notify_on_reset: true,
+                    reset_observations: Default::default(),
+                    mcp_enabled: false,
+                    mcp_port: None,
+                    mcp_unavailable: false,
+                    data: None,
+                    poll_interval_ms: POLL_15_MIN,
+                    adaptive_refresh: true,
+                    monitor: provider_poll::Monitor::new([true, true, true], Instant::now()),
+                    recovery_watch: None,
+                    recovery_debounce: recovery_events::Debounce::default(),
+                    has_poll_result: false,
+                    update_status: UpdateStatus::Idle,
+                    last_update_check_unix: None,
+                    taskbar_index: 0,
+                    monitor_device: None,
+                    tray_offset: 0,
+                    anchor_left: true,
+                    dragging: false,
+                    drag_start_mouse_x: 0,
+                    drag_start_client_x: 0,
+                    drag_start_offset: 0,
+                    widget_visible: true,
+                });
+            }
+
+            let module = GetModuleHandleW(None).unwrap();
+            let instance = HINSTANCE(module.0);
+            let cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
+            let _ = RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(settings_proc),
+                hInstance: instance,
+                lpszClassName: CLASS,
+                hCursor: cursor,
+                hIcon: LoadIconW(instance, PCWSTR(1usize as *const u16)).unwrap_or_default(),
+                ..Default::default()
+            });
+            let _ = RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(content_proc),
+                hInstance: instance,
+                lpszClassName: CONTENT_CLASS,
+                hCursor: cursor,
+                ..Default::default()
+            });
+            let _ = RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(overlay_proc),
+                hInstance: instance,
+                lpszClassName: OVERLAY_CLASS,
+                hCursor: cursor,
+                ..Default::default()
+            });
+            let (outer_w, outer_h) = outer_size(WIDTH, HEIGHT, 96);
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                CLASS,
+                w!("Codex Usage"),
+                window_style(),
+                -2000,
+                -2000,
+                outer_w,
+                outer_h,
+                HWND::default(),
+                HMENU::default(),
+                instance,
+                None,
+            )
+            .unwrap();
+            let _ = SetWindowPos(
+                hwnd,
+                HWND::default(),
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            let panel = Panel::new(hwnd, HWND::default());
+            PANEL.with(|s| *s.borrow_mut() = Some(panel));
+            with_panel(|p| p.sync(true));
+
+            // 1. Light General page
+            let light_general = with_panel(|p| p.capture_window()).flatten().unwrap();
+            save_bmp(&dir.join("01-general-light.bmp"), &light_general);
+            let width_general = with_panel(|p| p.content_right - p.content_left).unwrap();
+
+            // 2. Dark General page
+            if let Some(s) = lock_state().as_mut() {
+                s.settings_theme = SettingsTheme::Dark;
+                s.is_dark = true;
+            }
+            with_panel(|p| p.sync(true));
+            let dark_general = with_panel(|p| p.capture_window()).flatten().unwrap();
+            save_bmp(&dir.join("02-general-dark.bmp"), &dark_general);
+
+            // 3. Light Appearance page (scroll bar active, verify identical card width!)
+            if let Some(s) = lock_state().as_mut() {
+                s.settings_theme = SettingsTheme::Light;
+                s.is_dark = false;
+            }
+            with_panel(|p| {
+                p.page = 2;
+                let (t, b) = nav_indicator_rest(2, p.dpi);
+                p.nav_indicator = NavIndicator::settled(t, b, Instant::now());
+                p.sync(true);
+            });
+            let light_appearance = with_panel(|p| p.capture_window()).flatten().unwrap();
+            save_bmp(&dir.join("03-appearance-light.bmp"), &light_appearance);
+            let width_appearance = with_panel(|p| p.content_right - p.content_left).unwrap();
+            assert_eq!(
+                width_general, width_appearance,
+                "card width must not shift between short and scrollable pages"
+            );
+
+            // 4. Mid-transition frame (General -> Appearance at 70ms) + measure compose speed
+            let compose_us = with_panel(|p| {
+                p.page = 0;
+                p.sync(true);
+                let old_img = p.capture_page();
+                p.page = 2;
+                p.sync(true);
+                let new_img = p.capture_page().unwrap();
+                let bounds = new_img.bounds();
+                let composed = Bitmap::new(bounds.right, bounds.bottom).unwrap();
+                let overlay = Overlay::new(p.content, bounds).unwrap();
+                let mut tr = Transition {
+                    overlay,
+                    composed,
+                    kind: TransitionKind::Page {
+                        old_image: old_img,
+                        new_image: new_img,
+                        old_rows: Vec::new(),
+                        background: p.theme.background,
+                        title_bottom: p.px(CONTENT_TOP + TITLE_HEIGHT),
+                        distance: p.px(14),
+                    },
+                    start: Instant::now(),
+                    trace: None,
+                };
+                let t0 = Instant::now();
+                tr.compose(Duration::from_millis(65));
+                let us = t0.elapsed().as_micros();
+                save_bmp(&dir.join("04-transition-mid.bmp"), &tr.composed);
+                us
+            })
+            .unwrap();
+            eprintln!("page transition compose cost_us={compose_us}");
+
+            let _ = with_panel(|p| {
+                // 5. Fluent dropdown flyout with color swatches (Single color selector)
+                let strings = LanguageId::SimplifiedChinese.strings();
+                let swatch_items: Vec<OptionItem> = SingleColor::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, color)| {
+                        let name = match color {
+                            SingleColor::Glacier => strings.color_glacier,
+                            SingleColor::Lilac => strings.color_lilac,
+                            SingleColor::Clay => strings.color_clay,
+                            SingleColor::Rose => strings.color_rose,
+                            SingleColor::Neutral => strings.color_neutral,
+                        };
+                        OptionItem::command(name, IDM_SINGLE_COLOR_FIRST + i as u16)
+                            .with_swatch(color.bar(false))
+                    })
+                    .collect();
+                if let Some(bmp) = dropdown::render_preview_bitmap(
+                    &swatch_items,
+                    0,
+                    Some(2),
+                    p.px(DROPDOWN_WIDTH),
+                    p.theme,
+                    p.fonts,
+                    p.dpi,
+                ) {
+                    save_bmp(&dir.join("05-dropdown-swatch-light.bmp"), &bmp);
+                }
+
+                // 6. Appearance page with overlay scrollbar revealed & hovered
+                p.page = 2;
+                p.sync(true);
+                let now = Instant::now();
+                p.scrollbar.opacity = ScalarAnim::settled(1.0, now, SCROLLBAR_FADE_IN);
+                p.scrollbar.expand = ScalarAnim::settled(1.0, now, SCROLLBAR_EXPAND_DURATION);
+                p.scrollbar.hovered = true;
+                if let Some(bmp) = p.capture_window() {
+                    save_bmp(&dir.join("06-appearance-scrollbar-light.bmp"), &bmp);
+                }
+            });
+
+            let _ = DestroyWindow(hwnd);
+            *lock_state() = None;
+        }
+    }
+
+    #[test]
+    fn overlay_scrollbar_metrics_hide_short_content_and_clamp_thumb() {
+        assert!(scrollbar_thumb_metrics(500, 400, 0, 96).is_none());
+        assert!(scrollbar_thumb_metrics(500, 500, 0, 96).is_none());
+
+        let top = scrollbar_thumb_metrics(500, 1000, 0, 96).unwrap();
+        let mid = scrollbar_thumb_metrics(500, 1000, 250, 96).unwrap();
+        let bot = scrollbar_thumb_metrics(500, 1000, 500, 96).unwrap();
+        assert_eq!(top.thumb_top, top.track_top);
+        assert!((bot.thumb_top + bot.thumb_height - bot.track_bottom).abs() < 0.01);
+        assert!(mid.thumb_top > top.thumb_top && mid.thumb_top < bot.thumb_top);
+
+        // Very tall content keeps at least a 32px thumb.
+        let huge = scrollbar_thumb_metrics(500, 50_000, 0, 96).unwrap();
+        assert!(huge.thumb_height >= 32.0);
     }
 }

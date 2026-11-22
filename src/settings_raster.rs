@@ -117,8 +117,62 @@ impl<'a> Canvas<'a> {
         self.draw(RoundedRect::new(x - r, y - r, x + r, y + r, r), None, argb);
     }
 
+    pub(super) fn pill(&mut self, left: f32, top: f32, right: f32, bottom: f32, radius: f32, argb: u32) {
+        self.draw(RoundedRect::new(left, top, right, bottom, radius), None, argb);
+    }
+
     pub(super) fn card(&mut self, rect: RECT, radius: f32, fill: u32, border: u32) {
         self.fill(rect, radius, opaque(border));
+        self.fill(
+            RECT {
+                left: rect.left + 1,
+                top: rect.top + 1,
+                right: rect.right - 1,
+                bottom: rect.bottom - 1,
+            },
+            (radius - 1.0).max(0.0),
+            opaque(fill),
+        );
+    }
+
+    /// Fluent control surface with a 1px elevation accent on the bottom edge (light)
+    /// or top edge (dark).
+    pub(super) fn control(
+        &mut self,
+        rect: RECT,
+        radius: f32,
+        fill: u32,
+        border: u32,
+        elevation: u32,
+        dark: bool,
+    ) {
+        self.fill(rect, radius, opaque(border));
+        if elevation != border && rect.bottom - rect.top >= 3 {
+            let saved = self.clip;
+            let edge_band = if dark {
+                RECT {
+                    left: rect.left,
+                    top: rect.top,
+                    right: rect.right,
+                    bottom: (rect.top + 2).min(rect.bottom),
+                }
+            } else {
+                RECT {
+                    left: rect.left,
+                    top: (rect.bottom - 2).max(rect.top),
+                    right: rect.right,
+                    bottom: rect.bottom,
+                }
+            };
+            self.clip = RECT {
+                left: saved.left.max(edge_band.left),
+                top: saved.top.max(edge_band.top),
+                right: saved.right.min(edge_band.right),
+                bottom: saved.bottom.min(edge_band.bottom),
+            };
+            self.fill(rect, radius, opaque(elevation));
+            self.clip = saved;
+        }
         self.fill(
             RECT {
                 left: rect.left + 1,
@@ -191,6 +245,52 @@ impl<'a> Canvas<'a> {
 
 pub(super) fn opaque(rgb: u32) -> u32 {
     0xFF00_0000 | rgb
+}
+
+/// Alpha-composite `src` onto `dst` over a clipped rectangle with vertical offset `dst_y`.
+/// Both slices are top-down 32-bit BGRX buffers with widths `dst_stride` and `src_stride`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn blend_over_rows(
+    dst: &mut [u32],
+    dst_stride: usize,
+    dst_y: usize,
+    src: &[u32],
+    src_stride: usize,
+    src_y: usize,
+    width: usize,
+    rows: usize,
+    alpha: u8,
+) {
+    if alpha == 0 || width == 0 || rows == 0 {
+        return;
+    }
+    if alpha == 255 {
+        for r in 0..rows {
+            let d = &mut dst[(dst_y + r) * dst_stride..][..width];
+            let s = &src[(src_y + r) * src_stride..][..width];
+            d.copy_from_slice(s);
+        }
+        return;
+    }
+    let w = u32::from(alpha) + (u32::from(alpha) >> 7);
+    let inv = 256 - w;
+    for r in 0..rows {
+        let d = &mut dst[(dst_y + r) * dst_stride..][..width];
+        let s = &src[(src_y + r) * src_stride..][..width];
+        for (dp, &sp) in d.iter_mut().zip(s.iter()) {
+            let dst_px = *dp;
+            if (dst_px ^ sp) & 0x00FF_FFFF == 0 {
+                continue;
+            }
+            let s_rb = sp & 0x00FF_00FF;
+            let d_rb = dst_px & 0x00FF_00FF;
+            let rb = ((s_rb * w + d_rb * inv + 0x0080_0080) >> 8) & 0x00FF_00FF;
+            let s_g = sp & 0x0000_FF00;
+            let d_g = dst_px & 0x0000_FF00;
+            let g = ((s_g * w + d_g * inv + 0x0000_8000) >> 8) & 0x0000_FF00;
+            *dp = rb | g;
+        }
+    }
 }
 
 fn blend(pixel: &mut u32, color: u32, alpha: u8, coverage: f32) {
@@ -295,5 +395,44 @@ mod tests {
                 assert_eq!(memory[1 + 8 * y + x] == 0x12_3456, x < 2 || y >= 5);
             }
         }
+    }
+
+    #[test]
+    fn control_elevation_accents_bottom_in_light_and_top_in_dark() {
+        let mut light = [0; 64];
+        let mut dark = [0; 64];
+        let bounds = rect(0, 0, 8, 8);
+        Canvas::new(&mut light, 8, bounds).control(bounds, 2.0, 0xFF_FFFF, 0xE0_E0E0, 0xB0_B0B0, false);
+        Canvas::new(&mut dark, 8, bounds).control(bounds, 2.0, 0x30_3030, 0x3E_3E3E, 0x55_5555, true);
+        // Light mode: top edge uses border, bottom edge uses elevation.
+        assert_eq!(light[4], 0xE0_E0E0);
+        assert_eq!(light[7 * 8 + 4], 0xB0_B0B0);
+        assert_eq!(light[3 * 8 + 4], 0xFF_FFFF);
+        // Dark mode: top edge uses elevation, bottom edge uses border.
+        assert_eq!(dark[4], 0x55_5555);
+        assert_eq!(dark[7 * 8 + 4], 0x3E_3E3E);
+        assert_eq!(dark[3 * 8 + 4], 0x30_3030);
+    }
+
+    #[test]
+    fn blend_over_rows_interpolates_endpoints_and_midpoint() {
+        let src = [0x00_FF8040; 8];
+        let mut dst = [0x00_000000; 8];
+        blend_over_rows(&mut dst, 4, 0, &src, 4, 0, 4, 2, 0);
+        assert!(dst.iter().all(|&p| p == 0));
+
+        blend_over_rows(&mut dst, 4, 0, &src, 4, 0, 4, 2, 255);
+        assert!(dst.iter().all(|&p| p == 0x00_FF8040));
+
+        dst.fill(0x00_002080);
+        blend_over_rows(&mut dst, 4, 1, &src, 4, 0, 4, 1, 128);
+        assert_eq!(dst[0], 0x00_002080);
+        let blended = dst[4];
+        let r = (blended >> 16) & 0xFF;
+        let g = (blended >> 8) & 0xFF;
+        let b = blended & 0xFF;
+        assert!((r as i32 - 128).abs() <= 1);
+        assert!((g as i32 - 80).abs() <= 1);
+        assert!((b as i32 - 96).abs() <= 1);
     }
 }
