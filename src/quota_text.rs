@@ -1,4 +1,4 @@
-//! Fixed-column typography for the compact quota display.
+//! Fixed-column typography for the widget’s quota display.
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::*;
@@ -7,7 +7,7 @@ use crate::native_interop::{self, Color};
 
 const DIGIT_CELL: i32 = 8;
 const PERCENT_CELL: i32 = 12;
-const COLUMN_GAP: i32 = 8;
+const COLUMN_GAP: i32 = 5;
 /// Cell widths are tuned for 12 px text and grow with larger text.
 const BASE_FONT_PX: i32 = 12;
 
@@ -15,7 +15,7 @@ fn cell(width: i32, font_px: i32) -> i32 {
     (width * font_px + BASE_FONT_PX - 1) / BASE_FONT_PX
 }
 
-fn percent_width(font_px: i32) -> i32 {
+pub(super) fn percent_width(font_px: i32) -> i32 {
     cell(DIGIT_CELL, font_px) * 3 + cell(PERCENT_CELL, font_px)
 }
 
@@ -45,9 +45,18 @@ pub unsafe fn create_reset_font(height: i32) -> HFONT {
     )
 }
 
-fn parts(text: &str) -> (&str, &str) {
+/// The number before `%`: one to three digits, or `<1` for a positive value
+/// below 1%.
+fn is_percent_number(text: &str) -> bool {
+    match text.strip_prefix('<') {
+        Some(below) => below == "1",
+        None => !text.is_empty() && text.len() <= 3 && text.bytes().all(|b| b.is_ascii_digit()),
+    }
+}
+
+pub(crate) fn parts(text: &str) -> (&str, &str) {
     if let Some(end) = text.find('%') {
-        if text[..end].chars().all(|c| c.is_ascii_digit()) && end > 0 {
+        if is_percent_number(&text[..end]) {
             return (
                 &text[..=end],
                 text[end + 1..].trim_start_matches([' ', '·']),
@@ -59,7 +68,7 @@ fn parts(text: &str) -> (&str, &str) {
 
 fn percentage_cells(text: &str) -> Option<String> {
     let digits = text.strip_suffix('%')?;
-    if digits.is_empty() || digits.len() > 3 || !digits.chars().all(|c| c.is_ascii_digit()) {
+    if !is_percent_number(digits) {
         return None;
     }
     Some(format!("{digits:>3}%"))
@@ -93,6 +102,7 @@ pub fn draw(
     scale: impl Fn(i32) -> i32,
 ) {
     let (percentage, reset) = parts(value);
+    let cells = percentage_cells(percentage);
     let rect = RECT {
         left: x,
         top: y,
@@ -100,9 +110,10 @@ pub fn draw(
         bottom: y + height,
     };
     unsafe {
-        let _ = SetTextColor(hdc, COLORREF(primary.to_colorref()));
+        let color = if cells.is_some() { primary } else { secondary };
+        let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
     }
-    if let Some(cells) = percentage_cells(percentage) {
+    if let Some(cells) = cells {
         for (index, glyph) in cells.chars().enumerate() {
             if glyph == ' ' {
                 continue;
@@ -130,28 +141,39 @@ pub fn draw(
     } else {
         text(hdc, percentage, rect, DT_RIGHT);
     }
+    let reset_x = x + scale(reset_offset(font_px));
+    draw_reset(
+        hdc,
+        RECT {
+            left: reset_x,
+            right: x + width,
+            ..rect
+        },
+        reset,
+        secondary,
+        scale(font_px),
+    );
+}
+
+pub(super) fn draw_reset(hdc: HDC, rect: RECT, reset: &str, color: &Color, font_height: i32) {
     if reset.is_empty() {
         return;
     }
-
-    let reset_x = x + scale(reset_offset(font_px));
     unsafe {
-        let font = create_reset_font(scale(font_px));
+        let font = create_reset_font(font_height);
         let old_font = SelectObject(hdc, font);
-        let _ = SetTextColor(hdc, COLORREF(secondary.to_colorref()));
-        text(
-            hdc,
-            reset,
-            RECT {
-                left: reset_x,
-                right: x + width,
-                ..rect
-            },
-            DT_LEFT,
-        );
+        let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
+        text(hdc, reset, rect, DT_LEFT);
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
     }
+}
+
+pub(super) fn draw_centered(hdc: HDC, rect: RECT, value: &str, color: COLORREF) {
+    unsafe {
+        let _ = SetTextColor(hdc, color);
+    }
+    text(hdc, value, rect, DT_CENTER);
 }
 
 #[cfg(test)]
@@ -159,10 +181,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn larger_text_widens_cells_without_moving_standard_columns() {
-        assert_eq!(reset_offset(12), 8 * 3 + 12 + 8);
+    fn larger_text_widens_cells_and_keeps_the_reset_gap() {
+        assert_eq!(reset_offset(12), 8 * 3 + 12 + 5);
         assert_eq!(cell(DIGIT_CELL, 13), 9);
-        assert_eq!(reset_offset(13), 9 * 3 + 13 + 8);
+        assert_eq!(reset_offset(13), 9 * 3 + 13 + 5);
     }
 
     #[test]
@@ -170,7 +192,10 @@ mod tests {
         assert_eq!(percentage_cells("2%"), Some("  2%".into()));
         assert_eq!(percentage_cells("87%"), Some(" 87%".into()));
         assert_eq!(percentage_cells("100%"), Some("100%".into()));
+        assert_eq!(percentage_cells("<1%"), Some(" <1%".into()));
         assert_eq!(percentage_cells("--"), None);
+        assert_eq!(percentage_cells("<10%"), None);
+        assert_eq!(parts("<1%  01:59重置"), ("<1%", "01:59重置"));
     }
 
     #[test]

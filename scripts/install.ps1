@@ -3,6 +3,7 @@ param(
     [string]$SourcePath,
     [string]$ExpectedSha256,
     [string]$Version,
+    [switch]$Managed,
     [switch]$NoLaunch
 )
 
@@ -20,6 +21,11 @@ $DesktopShortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Code
 $UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexUsage'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $TempDirectory = Join-Path ([IO.Path]::GetTempPath()) ('codex-usage-install-' + [Guid]::NewGuid().ToString('N'))
+
+if ($Managed -and ([string]::IsNullOrWhiteSpace($SourcePath) -or $ExpectedSha256 -notmatch '^[0-9a-fA-F]{64}$')) {
+    throw 'Managed installation requires a local -SourcePath and an approved -ExpectedSha256.'
+}
+$SettingsPath = Join-Path $env:APPDATA 'CodexUsage\settings.json'
 
 $StartupWasEnabled = $false
 $ExistingStartup = $null
@@ -53,6 +59,37 @@ function Invoke-ReleaseDownload {
     )
 
     Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'CodexUsage-Installer' } -Uri $Url -OutFile $Destination
+}
+
+function Read-ManagedSettings {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (Test-Path -LiteralPath $Path) {
+        $settings = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($settings -isnot [pscustomobject]) { throw 'Existing settings must be a JSON object.' }
+    } else {
+        $settings = [pscustomobject]@{}
+    }
+    $settings | Add-Member -NotePropertyName passive_monitoring -NotePropertyValue $true -Force
+    $settings | Add-Member -NotePropertyName updates_enabled -NotePropertyValue $false -Force
+    return $settings
+}
+
+function Write-ManagedSettings {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $settings = Read-ManagedSettings -Path $Path
+    $directory = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Force -Path $directory | Out-Null
+    $temp = Join-Path $directory ('settings-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        [IO.File]::WriteAllText($temp, ($settings | ConvertTo-Json -Depth 32), [Text.UTF8Encoding]::new($false))
+        if (Test-Path -LiteralPath $Path) {
+            [IO.File]::Replace($temp, $Path, [System.Management.Automation.Language.NullString]::Value)
+        } else {
+            [IO.File]::Move($temp, $Path)
+        }
+    } finally {
+        Remove-Item -LiteralPath $temp -ErrorAction SilentlyContinue
+    }
 }
 
 New-Item -ItemType Directory -Force -Path $TempDirectory | Out-Null
@@ -100,6 +137,8 @@ try {
     if ($ExpectedSha256 -and $ActualSha256 -ne $ExpectedSha256.Trim().ToUpperInvariant()) {
         throw "SHA256 mismatch. Expected $ExpectedSha256 but downloaded $ActualSha256."
     }
+
+    if ($Managed) { $null = Read-ManagedSettings -Path $SettingsPath }
 
     New-Item -ItemType Directory -Force -Path $InstallDirectory | Out-Null
 
@@ -171,6 +210,7 @@ try {
         if (Test-Path -LiteralPath $IconRefreshTool -PathType Leaf) {
             Start-Process -FilePath $IconRefreshTool -ArgumentList '-show' -WindowStyle Hidden -Wait
         }
+        if ($Managed) { Write-ManagedSettings -Path $SettingsPath }
     }
     catch {
         if ($HadPreviousVersion -and (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {

@@ -172,28 +172,54 @@ pub fn get_window_rect_safe(hwnd: HWND) -> Option<RECT> {
     }
 }
 
-/// Embed our window as a child of the taskbar
-pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
+/// Embed the widget or move its existing layered child to another taskbar.
+pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) -> bool {
     unsafe {
-        // Preserve existing extended style, add tool window + no activate
-        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-        // Reset alpha mode used by the startup popup fallback before switching
-        // back to UpdateLayeredWindow rendering inside the taskbar.
-        if ex_style & WS_EX_LAYERED.0 as i32 != 0 {
-            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style & !(WS_EX_LAYERED.0 as i32));
+        if !IsWindow(hwnd).as_bool() || !IsWindow(taskbar_hwnd).as_bool() {
+            return false;
         }
-        let _ = SetWindowLongW(
-            hwnd,
-            GWL_EXSTYLE,
-            ex_style | WS_EX_TOOLWINDOW.0 as i32 | WS_EX_NOACTIVATE.0 as i32,
-        );
-
-        // Change from popup to child
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-        let new_style = (style & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE;
-        let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
-
+        let is_child = style & WS_CHILD_STYLE != 0;
+        if is_child && GetParent(hwnd).ok() == Some(taskbar_hwnd) {
+            return true;
+        }
+        let extended_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        if !is_child {
+            // Only the startup popup can be in SetLayeredWindowAttributes mode.
+            // Keep an existing child's UpdateLayeredWindow surface across SetParent.
+            if extended_style & WS_EX_LAYERED.0 as i32 != 0 {
+                let _ = SetWindowLongW(
+                    hwnd,
+                    GWL_EXSTYLE,
+                    extended_style & !(WS_EX_LAYERED.0 as i32),
+                );
+            }
+            let _ = SetWindowLongW(
+                hwnd,
+                GWL_EXSTYLE,
+                extended_style | WS_EX_TOOLWINDOW.0 as i32 | WS_EX_NOACTIVATE.0 as i32,
+            );
+            let child_style = (style & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE;
+            let _ = SetWindowLongW(hwnd, GWL_STYLE, child_style as i32);
+        }
+        // GetParent verifies the attachment even when the previous parent was null.
         let _ = SetParent(hwnd, taskbar_hwnd);
+        if GetParent(hwnd).ok() == Some(taskbar_hwnd) {
+            return true;
+        }
+        if !is_child {
+            let _ = SetWindowLongW(hwnd, GWL_STYLE, style as i32);
+            let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, extended_style);
+            if extended_style & WS_EX_LAYERED.0 as i32 != 0 {
+                let _ = SetLayeredWindowAttributes(
+                    hwnd,
+                    windows::Win32::Foundation::COLORREF(0),
+                    255,
+                    LWA_ALPHA,
+                );
+            }
+        }
+        false
     }
 }
 
@@ -205,7 +231,7 @@ mod attachment_tests {
     use windows::Win32::Graphics::Gdi::*;
 
     #[test]
-    fn startup_popup_can_switch_to_layered_child_rendering() {
+    fn startup_popup_and_repeatedly_reattached_child_can_render() {
         unsafe {
             let parent = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
@@ -213,6 +239,21 @@ mod attachment_tests {
                 w!("attachment-test"),
                 WS_POPUP,
                 0,
+                0,
+                20,
+                20,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let second_parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("second-taskbar-test"),
+                WS_POPUP,
+                48,
                 0,
                 20,
                 20,
@@ -238,8 +279,6 @@ mod attachment_tests {
             )
             .unwrap();
             SetLayeredWindowAttributes(child, COLORREF(0), 255, LWA_ALPHA).unwrap();
-            embed_in_taskbar(child, parent);
-            assert_eq!(GetParent(child).unwrap(), parent);
             let dc = CreateCompatibleDC(None);
             let info = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
@@ -264,26 +303,33 @@ mod attachment_tests {
                 AlphaFormat: AC_SRC_ALPHA as u8,
                 ..Default::default()
             };
-            let rendered = UpdateLayeredWindow(
-                child,
-                None,
-                Some(&point),
-                Some(&size),
-                dc,
-                Some(&point),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
+            for target in [parent, second_parent, parent, second_parent] {
+                assert!(embed_in_taskbar(child, target));
+                assert_eq!(GetParent(child).unwrap(), target);
+                UpdateLayeredWindow(
+                    child,
+                    None,
+                    Some(&point),
+                    Some(&size),
+                    dc,
+                    Some(&point),
+                    COLORREF(0),
+                    Some(&blend),
+                    ULW_ALPHA,
+                )
+                .expect("the widget must repaint after every reattachment");
+            }
+            assert!(!embed_in_taskbar(child, HWND::default()));
+            assert_eq!(GetParent(child).unwrap(), second_parent);
             let _ = SelectObject(dc, old);
             let _ = DeleteObject(bitmap);
             let _ = DeleteDC(dc);
-            let _ = DestroyWindow(child);
-            let _ = DestroyWindow(parent);
+            DestroyWindow(second_parent).unwrap();
             assert!(
-                rendered.is_ok(),
-                "fallback alpha mode must not prevent taskbar rendering: {rendered:?}"
+                !IsWindow(child).as_bool(),
+                "removing the host also destroys its child"
             );
+            DestroyWindow(parent).unwrap();
         }
     }
 }

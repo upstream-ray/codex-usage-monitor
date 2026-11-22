@@ -209,16 +209,9 @@ mod tests {
 
     fn usage(session: f64, weekly: f64) -> UsageData {
         UsageData {
-            session: UsageSection {
-                percentage: session,
-                resets_at: None,
-                reported: true,
-            },
-            weekly: UsageSection {
-                percentage: weekly,
-                resets_at: None,
-                reported: true,
-            },
+            session: UsageSection::reported(session, None),
+            weekly: UsageSection::reported(weekly, None),
+            ..Default::default()
         }
     }
     #[test]

@@ -19,7 +19,11 @@ Authentication failures pause provider polling until the credential source chang
 Run:
 
 ```powershell
-codex-usage.exe --diagnose
+# Per-user installation
+& "$env:LOCALAPPDATA\Programs\CodexUsage\codex-usage.exe" --diagnose
+
+# Portable copy (from the folder containing codex-usage.exe)
+.\codex-usage.exe --diagnose
 ```
 
 The log is written to `%TEMP%\codex-usage.log`. It includes:
@@ -37,7 +41,11 @@ Direct installations and portable copies download only the exact `codex-usage.ex
 
 ## Reset local position without deleting settings
 
-Right-click the taskbar component and choose **Settings > Reset Position**. Settings are stored at `%APPDATA%\CodexUsage\settings.json`.
+Right-click the taskbar widget or tray icon, open **Settings → General**, and click **Reset position** under **Widget position**. Settings are stored at `%APPDATA%\CodexUsage\settings.json`.
+
+## Start with Windows did not launch after sign-in
+
+If **Start with Windows** was enabled but Codex Usage did not launch after signing in, check whether Windows disabled the entry in **Settings → Apps → Startup**. Open **Codex Usage → Settings → General**: when the entry is blocked by Windows, the **Start with Windows** row displays a warning and an **Open Startup apps** button that opens Windows Startup settings directly.
 
 ## Reinstall while preserving settings
 
