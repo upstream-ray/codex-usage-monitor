@@ -1,4 +1,4 @@
-//! Fixed-column typography for the compact quota display.
+//! Fixed-column typography for the widget’s quota display.
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::*;

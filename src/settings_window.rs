@@ -1,8 +1,8 @@
 //! Modeless settings for the taskbar widget. Controls reflect the live app state.
 //!
 //! The window is drawn in the Windows 11 settings style: grouped cards with
-//! switches, drop-down buttons and push buttons, and it follows the system app
-//! theme and accent color. Native buttons keep keyboard and accessibility
+//! switches, drop-down buttons and push buttons. It follows the selected app
+//! theme and Windows accent color. Native buttons keep keyboard and accessibility
 //! behavior; only their painting is customized. The existing widget command
 //! handlers own validation, rendering, and persistence.
 use super::*;
@@ -16,7 +16,7 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::GdiPlus as gp;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::UI::Controls::{
-    SetScrollInfo, SetWindowTheme, BST_CHECKED, CDDS_PREPAINT, CDIS_DISABLED, CDIS_FOCUS, CDIS_HOT,
+    SetScrollInfo, SetWindowTheme, CDDS_PREPAINT, CDIS_DISABLED, CDIS_FOCUS, CDIS_HOT,
     CDIS_SELECTED, CDIS_SHOWKEYBOARDCUES, CDRF_DODEFAULT, CDRF_SKIPDEFAULT, DRAWITEMSTRUCT,
     NMCUSTOMDRAW, NMHDR, NM_CUSTOMDRAW, ODS_FOCUS, ODS_NOFOCUSRECT, ODS_SELECTED, WM_MOUSELEAVE,
 };
@@ -30,6 +30,9 @@ const NAV: u16 = 990;
 const FIRST_FIELD: u16 = 1000;
 const FIELDS_PER_ROW: u16 = 4;
 const REFRESH_TIMER: usize = 1;
+const ANIMATION_TIMER: usize = 2;
+const SWITCH_DURATION: Duration = Duration::from_millis(150);
+const PAGE_DURATION: Duration = Duration::from_millis(180);
 const APPLY_SELECTION: u32 = WM_APP + 1;
 const ENSURE_VISIBLE: u32 = WM_APP + 2;
 const SUBCLASS_ID: usize = 1;
@@ -69,7 +72,8 @@ const PAGE_GLYPHS: [char; 5] = ['\u{E713}', '\u{E9D2}', '\u{E790}', '\u{EA8F}', 
 thread_local! {
     static PANEL: RefCell<Option<Panel>> = const { RefCell::new(None) };
     // Kept outside the panel so control colors never wait on a panel borrow.
-    static BACKGROUND: Cell<HBRUSH> = const { Cell::new(HBRUSH(std::ptr::null_mut())) };
+    static BACKGROUND: Cell<u32> = const { Cell::new(0xF3_F3F3) };
+    static REDRAW_PENDING: Cell<bool> = const { Cell::new(false) };
     static NAV_HOVER: Cell<i32> = const { Cell::new(-1) };
 }
 static SAVE_FAILED: AtomicBool = AtomicBool::new(false);
@@ -94,14 +98,6 @@ impl OptionItem {
         Self {
             label: label.into(),
             action: Some(Action::Command(id)),
-            swatch: None,
-        }
-    }
-
-    fn placeholder(label: impl Into<String>) -> Self {
-        Self {
-            label: label.into(),
-            action: None,
             swatch: None,
         }
     }
@@ -135,6 +131,10 @@ fn info(text: impl Into<String>) -> Option<Hint> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Row {
     Section(String),
+    Preview {
+        appearance: Appearance,
+        system_dark: bool,
+    },
     Check {
         item: OptionItem,
         checked: bool,
@@ -163,7 +163,7 @@ impl Row {
             Self::Check { hint, .. } | Self::Choice { hint, .. } | Self::Action { hint, .. } => {
                 *hint = value;
             }
-            Self::Section(_) | Self::Note(_) => {}
+            Self::Section(_) | Self::Note(_) | Self::Preview { .. } => {}
         }
         self
     }
@@ -172,7 +172,7 @@ impl Row {
         match self {
             Self::Check { .. } | Self::Choice { .. } => 1,
             Self::Action { buttons, .. } => buttons.len(),
-            Self::Section(_) | Self::Note(_) => 0,
+            Self::Section(_) | Self::Note(_) | Self::Preview { .. } => 0,
         }
     }
 }
@@ -384,6 +384,19 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                 .iter()
                 .position(|bar| Some(bar.hwnd) == s.taskbar_hwnd);
             let mut result = vec![
+                choice(
+                    strings.settings_theme,
+                    &[
+                        (IDM_THEME_SYSTEM, strings.palette_system),
+                        (IDM_THEME_LIGHT, strings.palette_light),
+                        (IDM_THEME_DARK, strings.palette_dark),
+                    ],
+                    match s.settings_theme {
+                        SettingsTheme::System => IDM_THEME_SYSTEM,
+                        SettingsTheme::Light => IDM_THEME_LIGHT,
+                        SettingsTheme::Dark => IDM_THEME_DARK,
+                    },
+                ),
                 choice(strings.language, &values, selected_language),
                 check(
                     strings.start_with_windows,
@@ -556,44 +569,18 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
         }
         Page::Appearance => {
             let a = s.appearance;
-            let dark = a.is_dark(s.is_dark);
-            let library = s.color_presets.entries();
-            let mut colors = vec![OptionItem::placeholder(strings.custom_option)];
-            colors.extend(ColorPreset::ALL.iter().enumerate().map(|(index, preset)| {
-                OptionItem::command(
-                    preset.label(s.language == LanguageId::SimplifiedChinese),
-                    IDM_CODEX_PRESET_FIRST + index as u16,
-                )
-            }));
-            colors.extend(library.iter().enumerate().map(|(index, preset)| {
-                OptionItem::command(&preset.name, IDM_USER_PRESET_FIRST + index as u16)
-            }));
-            let selected = ColorPreset::ALL
-                .iter()
-                .position(|preset| a.codex_colors.is_preset(*preset))
-                .map(|index| index + 1)
-                .or_else(|| {
-                    library
-                        .iter()
-                        .position(|preset| a.codex_colors == preset.colors)
-                        .map(|index| index + ColorPreset::ALL.len() + 1)
-                })
-                .unwrap_or(0);
-            let mut deletions = vec![OptionItem::placeholder(strings.select_preset)];
-            deletions.extend(library.iter().enumerate().map(|(index, preset)| {
-                OptionItem::command(&preset.name, IDM_DELETE_PRESET_FIRST + index as u16)
-            }));
-            let swatch = |label, id, role| {
-                OptionItem::command(label, id).with_swatch(a.codex_colors.color(role, dark))
-            };
-            vec![
+            let mut result = vec![
+                Row::Preview {
+                    appearance: a,
+                    system_dark: s.is_dark,
+                },
                 section(strings.widget_style_section),
                 choice(
                     strings.background_style,
                     &[
                         (IDM_PALETTE_SYSTEM, strings.palette_system),
-                        (IDM_PALETTE_DARK, strings.palette_high_contrast_dark),
-                        (IDM_PALETTE_LIGHT, strings.palette_high_contrast_light),
+                        (IDM_PALETTE_DARK, strings.palette_dark),
+                        (IDM_PALETTE_LIGHT, strings.palette_light),
                     ],
                     match a.palette {
                         Palette::System => IDM_PALETTE_SYSTEM,
@@ -606,34 +593,40 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                     &[
                         (IDM_BAR_CONTINUOUS, strings.bar_continuous),
                         (IDM_BAR_SEGMENTED, strings.bar_segmented),
-                        (IDM_BAR_CLASSIC, strings.bar_classic_segmented),
+                        (IDM_BAR_DOTS, strings.bar_dots),
+                        (IDM_BAR_BATTERY, strings.bar_battery),
                     ],
                     match a.bar_style {
                         BarStyle::Continuous => IDM_BAR_CONTINUOUS,
                         BarStyle::Segmented => IDM_BAR_SEGMENTED,
-                        BarStyle::ClassicSegmented => IDM_BAR_CLASSIC,
+                        BarStyle::Dots => IDM_BAR_DOTS,
+                        BarStyle::Battery => IDM_BAR_BATTERY,
                     },
                 ),
                 choice(
                     strings.bar_thickness,
                     &[
-                        (IDM_BAR_STANDARD, strings.bar_standard),
-                        (IDM_BAR_SLIM, strings.bar_slim),
+                        (IDM_BAR_THIN, strings.bar_thin),
+                        (IDM_BAR_MEDIUM, strings.bar_medium),
+                        (IDM_BAR_THICK, strings.bar_thick),
                     ],
                     match a.bar_thickness {
-                        BarThickness::Standard => IDM_BAR_STANDARD,
-                        BarThickness::Slim => IDM_BAR_SLIM,
+                        BarThickness::Thin => IDM_BAR_THIN,
+                        BarThickness::Medium => IDM_BAR_MEDIUM,
+                        BarThickness::Thick => IDM_BAR_THICK,
                     },
                 ),
                 choice(
                     strings.text_size,
                     &[
-                        (IDM_FONT_STANDARD, strings.text_standard),
-                        (IDM_FONT_LARGE, strings.text_larger),
+                        (IDM_FONT_12, strings.text_12_px),
+                        (IDM_FONT_14, strings.text_14_px),
+                        (IDM_FONT_16, strings.text_16_px),
                     ],
                     match a.font_size {
-                        FontSize::Standard => IDM_FONT_STANDARD,
-                        FontSize::Large => IDM_FONT_LARGE,
+                        FontSize::Px12 => IDM_FONT_12,
+                        FontSize::Px14 => IDM_FONT_14,
+                        FontSize::Px16 => IDM_FONT_16,
                     },
                 ),
                 check(
@@ -641,48 +634,50 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                     IDM_PROVIDER_LOGOS,
                     !a.hide_provider_logos,
                 ),
-                check(strings.compact_layout, IDM_COMPACT_LAYOUT, a.compact_layout)
-                    .hint(info(strings.compact_layout_hint)),
-                section(strings.codex_colors_section),
-                Row::Choice {
-                    label: strings.color_scheme.into(),
-                    items: colors,
+                section(strings.colors_section),
+                choice(
+                    strings.color_mode,
+                    &[
+                        (IDM_COLOR_BRAND, strings.color_brand),
+                        (IDM_COLOR_REMAINING, strings.color_remaining),
+                        (IDM_COLOR_SINGLE, strings.color_single),
+                    ],
+                    match a.color_mode {
+                        ColorMode::Brand => IDM_COLOR_BRAND,
+                        ColorMode::Remaining => IDM_COLOR_REMAINING,
+                        ColorMode::Single => IDM_COLOR_SINGLE,
+                    },
+                ),
+            ];
+            if a.color_mode == ColorMode::Single {
+                let mut selected = 0;
+                let items = SingleColor::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, color)| {
+                        if color == a.single_color {
+                            selected = index;
+                        }
+                        let name = match color {
+                            SingleColor::Glacier => strings.color_glacier,
+                            SingleColor::Lilac => strings.color_lilac,
+                            SingleColor::Clay => strings.color_clay,
+                            SingleColor::Rose => strings.color_rose,
+                            SingleColor::Neutral => strings.color_neutral,
+                        };
+                        OptionItem::command(name, IDM_SINGLE_COLOR_FIRST + index as u16)
+                            .with_swatch(color.bar(a.is_dark(s.is_dark)))
+                    })
+                    .collect();
+                result.push(Row::Choice {
+                    label: strings.single_color.into(),
+                    items,
                     selected,
                     enabled: true,
                     hint: None,
-                },
-                action(
-                    strings.custom_colors,
-                    info(strings.custom_colors_hint),
-                    vec![
-                        swatch(strings.color_icon, IDM_CODEX_ICON_COLOR, ColorRole::Icon),
-                        swatch(strings.color_bar, IDM_CODEX_BAR_COLOR, ColorRole::Bar),
-                        swatch(
-                            strings.color_percentage,
-                            IDM_CODEX_PERCENT_COLOR,
-                            ColorRole::Percentage,
-                        ),
-                    ],
-                ),
-                action(
-                    strings.save_as_preset,
-                    info(strings.save_as_preset_hint),
-                    vec![OptionItem::command(
-                        strings.save_preset_button,
-                        IDM_SAVE_COLOR_PRESET,
-                    )],
-                ),
-                Row::Choice {
-                    label: strings.delete_custom_preset.into(),
-                    items: deletions,
-                    selected: 0,
-                    enabled: !library.is_empty(),
-                    hint: info(if library.is_empty() {
-                        strings.no_custom_presets_hint
-                    } else {
-                        strings.delete_preset_confirm_hint
-                    }),
-                },
+                });
+            }
+            result.extend([
                 section(strings.reset_section),
                 action(
                     strings.quick_looks,
@@ -692,7 +687,8 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                         OptionItem::command(strings.restore_defaults, IDM_APPEARANCE_RESET),
                     ],
                 ),
-            ]
+            ]);
+            result
         }
         Page::Alerts => {
             let alert_10 = strings
@@ -835,9 +831,14 @@ struct Theme {
 }
 
 impl Theme {
-    fn current() -> Self {
+    fn current(preference: SettingsTheme) -> Self {
         let palette = accent_palette();
-        if apps_use_dark_theme() {
+        let dark = match effective_preference(preference) {
+            SettingsTheme::Light => false,
+            SettingsTheme::Dark => true,
+            SettingsTheme::System => apps_use_dark_theme(),
+        };
+        if dark {
             let accent = palette.map_or(0x4C_C2FF, |palette| palette[1]);
             Self {
                 dark: true,
@@ -907,13 +908,18 @@ fn colorref(color: u32) -> COLORREF {
     COLORREF((color & 0xFF) << 16 | (color & 0xFF00) | (color >> 16) & 0xFF)
 }
 
-fn apps_use_dark_theme() -> bool {
-    // Debug builds can force a theme for screenshots without touching system settings.
-    if cfg!(debug_assertions) {
-        if let Ok(theme) = std::env::var("CODEX_USAGE_SETTINGS_THEME") {
-            return theme.eq_ignore_ascii_case("dark");
+fn effective_preference(preference: SettingsTheme) -> SettingsTheme {
+    if cfg!(debug_assertions) && preference == SettingsTheme::System {
+        match std::env::var("CODEX_USAGE_SETTINGS_THEME").as_deref() {
+            Ok(theme) if theme.eq_ignore_ascii_case("dark") => return SettingsTheme::Dark,
+            Ok(theme) if theme.eq_ignore_ascii_case("light") => return SettingsTheme::Light,
+            _ => {}
         }
     }
+    preference
+}
+
+fn apps_use_dark_theme() -> bool {
     let mut value = 1u32;
     let mut size = std::mem::size_of::<u32>() as u32;
     let status = unsafe {
@@ -977,39 +983,37 @@ fn windows_build() -> u32 {
     String::from_utf16_lossy(&data[..end]).parse().unwrap_or(0)
 }
 
-/// Let menus and scroll bars of `hwnd` use the dark theme when the system
-/// app theme is dark. These uxtheme exports have no names; they are stable
-/// ordinals since Windows 10 1903 and are skipped on older builds.
-unsafe fn allow_dark_controls(hwnd: HWND) {
+// Ordinal 135 changed signature before Windows 10 1903.
+fn uxtheme_export(ordinal: usize) -> windows::Win32::Foundation::FARPROC {
     static UXTHEME: OnceLock<usize> = OnceLock::new();
-    let module = *UXTHEME.get_or_init(|| {
+    let module = *UXTHEME.get_or_init(|| unsafe {
         if windows_build() < 18362 {
             return 0;
         }
         LoadLibraryW(w!("uxtheme.dll")).map_or(0, |module| module.0 as usize)
     });
     if module == 0 {
-        return;
+        return None;
     }
-    let module = HMODULE(module as *mut _);
-    let export = |ordinal: usize| GetProcAddress(module, PCSTR(ordinal as *const u8));
-    static APP_MODE: std::sync::Once = std::sync::Once::new();
-    APP_MODE.call_once(|| {
-        if let Some(function) = export(135) {
-            // SetPreferredAppMode(AllowDark)
-            let function: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(function);
-            function(1);
+    unsafe { GetProcAddress(HMODULE(module as *mut _), PCSTR(ordinal as *const u8)) }
+}
+
+pub(super) fn apply_menu_theme(preference: SettingsTheme) {
+    let mode = match effective_preference(preference) {
+        SettingsTheme::System => 1, // AllowDark
+        SettingsTheme::Dark => 2,   // ForceDark
+        SettingsTheme::Light => 3,  // ForceLight
+    };
+    unsafe {
+        if let Some(function) = uxtheme_export(135) {
+            let set_preferred_app_mode: unsafe extern "system" fn(i32) -> i32 =
+                std::mem::transmute(function);
+            set_preferred_app_mode(mode);
         }
-    });
-    if let Some(function) = export(133) {
-        // AllowDarkModeForWindow
-        let function: unsafe extern "system" fn(HWND, BOOL) -> BOOL = std::mem::transmute(function);
-        let _ = function(hwnd, TRUE);
-    }
-    if let Some(function) = export(136) {
-        // FlushMenuThemes
-        let function: unsafe extern "system" fn() = std::mem::transmute(function);
-        function();
+        if let Some(function) = uxtheme_export(136) {
+            let flush_menu_themes: unsafe extern "system" fn() = std::mem::transmute(function);
+            flush_menu_themes();
+        }
     }
 }
 
@@ -1346,13 +1350,68 @@ struct Frame {
     text_right: i32,
 }
 
+#[derive(Clone, Copy)]
+struct SwitchAnimation {
+    from: f32,
+    to: f32,
+    start: Instant,
+}
+
+impl SwitchAnimation {
+    fn value(self, now: Instant) -> f32 {
+        self.from
+            + (self.to - self.from) * ease_out(now.duration_since(self.start), SWITCH_DURATION)
+    }
+}
+
+fn ease_out(elapsed: Duration, duration: Duration) -> f32 {
+    let t = (elapsed.as_secs_f32() / duration.as_secs_f32()).min(1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+fn mix_color(from: u32, to: u32, t: f32) -> u32 {
+    let channel = |shift: u32| {
+        let from = ((from >> shift) & 255) as f32;
+        let to = ((to >> shift) & 255) as f32;
+        ((from + (to - from) * t).round() as u32) << shift
+    };
+    channel(16) | channel(8) | channel(0)
+}
+
+struct SuspendRedraw(HWND);
+
+impl SuspendRedraw {
+    unsafe fn new(hwnd: HWND) -> Self {
+        if IsWindowVisible(hwnd).as_bool() {
+            let _ = SendMessageW(hwnd, WM_SETREDRAW, WPARAM(0), LPARAM(0));
+            Self(hwnd)
+        } else {
+            // WM_SETREDRAW(TRUE) would set WS_VISIBLE on an initially hidden window.
+            Self(HWND::default())
+        }
+    }
+}
+
+impl Drop for SuspendRedraw {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = SendMessageW(self.0, WM_SETREDRAW, WPARAM(1), LPARAM(0));
+            }
+        }
+    }
+}
+
 struct Panel {
     hwnd: HWND,
     widget: HWND,
     nav: HWND,
     theme: Theme,
+    preference: SettingsTheme,
+    switches: Vec<Option<SwitchAnimation>>,
+    page_animation: Option<Instant>,
+    page_offset: i32,
     fonts: Fonts,
-    background: HBRUSH,
     icon: HICON,
     dpi: u32,
     language: Option<LanguageId>,
@@ -1373,6 +1432,11 @@ struct Panel {
 
 impl Panel {
     unsafe fn new(hwnd: HWND, widget: HWND) -> Self {
+        let preference = lock_state()
+            .as_ref()
+            .map_or(SettingsTheme::System, |s| s.settings_theme);
+        let theme = Theme::current(preference);
+        BACKGROUND.with(|color| color.set(theme.background));
         let nav = child(
             hwnd,
             w!("LISTBOX"),
@@ -1388,9 +1452,12 @@ impl Panel {
             hwnd,
             widget,
             nav,
-            theme: Theme::current(),
+            theme,
+            preference,
+            switches: Vec::new(),
+            page_animation: None,
+            page_offset: 0,
             fonts: Fonts::default(),
-            background: HBRUSH::default(),
             icon: HICON::default(),
             dpi: 0,
             language: None,
@@ -1409,7 +1476,7 @@ impl Panel {
             menu_open: false,
         };
         panel.set_dpi(GetDpiForWindow(hwnd).max(96));
-        panel.apply_theme();
+        panel.apply_theme(panel.theme);
         panel
     }
 
@@ -1458,15 +1525,9 @@ impl Panel {
         }
     }
 
-    /// Follow the system app theme and accent color.
-    unsafe fn apply_theme(&mut self) {
-        self.theme = Theme::current();
-        let brush = CreateSolidBrush(colorref(self.theme.background));
-        let old = std::mem::replace(&mut self.background, brush);
-        BACKGROUND.with(|cell| cell.set(brush));
-        if !old.is_invalid() {
-            let _ = DeleteObject(old);
-        }
+    unsafe fn apply_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+        BACKGROUND.with(|color| color.set(theme.background));
         let dark = BOOL::from(self.theme.dark);
         let _ = DwmSetWindowAttribute(
             self.hwnd,
@@ -1482,33 +1543,47 @@ impl Panel {
             &caption as *const COLORREF as *const _,
             std::mem::size_of::<COLORREF>() as u32,
         );
-        allow_dark_controls(self.hwnd);
+        if let Some(function) = uxtheme_export(133) {
+            let allow_dark_mode: unsafe extern "system" fn(HWND, BOOL) -> BOOL =
+                std::mem::transmute(function);
+            let _ = allow_dark_mode(self.hwnd, dark);
+        }
         let scroll_theme = if self.theme.dark {
             w!("DarkMode_Explorer")
         } else {
             w!("Explorer")
         };
         let _ = SetWindowTheme(self.hwnd, scroll_theme, PCWSTR::null());
-        let _ = RedrawWindow(
-            self.hwnd,
-            None,
-            HRGN::default(),
-            RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME,
-        );
+        request_redraw();
     }
 
     unsafe fn sync(&mut self, force: bool) {
         if self.menu_open {
             return;
         }
-        let Some((language, next)) = lock_state()
+        let Some((language, preference, next)) = lock_state()
             .as_ref()
-            .map(|s| (s.language, rows(Page::ALL[self.page], s)))
+            .map(|s| (s.language, s.settings_theme, rows(Page::ALL[self.page], s)))
         else {
             return;
         };
 
-        let mut relayout = force;
+        let save_failed = SAVE_FAILED.load(Ordering::Relaxed);
+        if !force
+            && self.language == Some(language)
+            && self.preference == preference
+            && self.save_failed == save_failed
+            && self.rows == next
+        {
+            return;
+        }
+
+        let focus = GetFocus();
+        let redraw = SuspendRedraw::new(self.hwnd);
+        if self.preference != preference {
+            self.preference = preference;
+            self.apply_theme(Theme::current(preference));
+        }
         if self.language != Some(language) {
             self.language = Some(language);
             set_text(
@@ -1526,54 +1601,100 @@ impl Panel {
                 );
             }
             let _ = SendMessageW(self.nav, LB_SETCURSEL, WPARAM(self.page), LPARAM(0));
-            let _ = InvalidateRect(self.nav, None, false);
-            relayout = true;
         }
-        let save_failed = SAVE_FAILED.load(Ordering::Relaxed);
-        if save_failed != self.save_failed {
-            self.save_failed = save_failed;
-            relayout = true;
+        self.save_failed = save_failed;
+        let mut lost_focus = None;
+        let mut controls_changed = self.controls.len() != next.len();
+        let old_controls = std::mem::take(&mut self.controls);
+        let mut old_controls = old_controls.into_iter();
+        let now = Instant::now();
+        self.switches.resize(next.len(), None);
+        for (index, row) in next.iter().enumerate() {
+            let old = self.rows.get(index);
+            let (controls, reused) = match old_controls.next() {
+                Some(controls) if old.is_some_and(|old| same_controls(old, row)) => {
+                    (controls, true)
+                }
+                removed => {
+                    if let Some(controls) = removed {
+                        if controls.contains(&focus) {
+                            lost_focus = Some(index);
+                        }
+                        for control in controls {
+                            let _ = DestroyWindow(control);
+                        }
+                    }
+                    (self.create_row(index, row), false)
+                }
+            };
+            match (old, row) {
+                (
+                    Some(Row::Check {
+                        item: old_item,
+                        checked: old,
+                        ..
+                    }),
+                    Row::Check { item, checked, .. },
+                ) if reused && old_item.action == item.action => {
+                    if old != checked {
+                        let from = self.switches[index]
+                            .map_or(f32::from(u8::from(*old)), |animation| animation.value(now));
+                        self.switches[index] = Some(SwitchAnimation {
+                            from,
+                            to: f32::from(u8::from(*checked)),
+                            start: now,
+                        });
+                    }
+                }
+                _ => self.switches[index] = None,
+            }
+            controls_changed |= !reused;
+            if force || !reused || old != Some(row) {
+                update_row(row, &controls);
+            }
+            self.controls.push(controls);
         }
-        if !relayout && self.rows == next {
-            return;
-        }
-        if self.rows.len() != next.len()
-            || self
-                .rows
-                .iter()
-                .zip(&next)
-                .any(|(old, new)| !same_controls(old, new))
-        {
-            let focus = GetFocus();
-            let focused_row = self
-                .controls
-                .iter()
-                .position(|controls| controls.contains(&focus));
-            for control in self.controls.drain(..).flatten() {
+        for controls in old_controls {
+            if controls.contains(&focus) {
+                lost_focus = Some(next.len());
+            }
+            for control in controls {
                 let _ = DestroyWindow(control);
-            }
-            self.controls = next
-                .iter()
-                .enumerate()
-                .map(|(index, row)| self.create_row(index, row))
-                .collect();
-            self.rows.clear();
-            if let Some(control) = focused_row.and_then(|index| {
-                self.controls
-                    .get(index)
-                    .and_then(|controls| controls.last())
-                    .copied()
-            }) {
-                let _ = SetFocus(control);
-            }
-        }
-        for (index, (row, controls)) in next.iter().zip(&self.controls).enumerate() {
-            if force || self.rows.get(index) != Some(row) {
-                update_row(row, controls);
             }
         }
         self.rows = next;
+        if controls_changed {
+            // Dialog navigation uses HWND z-order, including controls retained across pages.
+            let mut previous = self.nav;
+            for &control in self.controls.iter().flatten() {
+                if SetWindowPos(
+                    control,
+                    previous,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_DEFERERASE,
+                )
+                .is_ok()
+                {
+                    previous = control;
+                }
+            }
+        }
         self.layout();
+        drop(redraw);
+        if let Some(index) = lost_focus {
+            let replacement = self
+                .controls
+                .get(index)
+                .and_then(|controls| controls.first())
+                .copied();
+            let _ = SetFocus(replacement.unwrap_or(self.nav));
+        }
+        if self.switches.iter().any(Option::is_some) {
+            SetTimer(self.hwnd, ANIMATION_TIMER, 15, None);
+        }
     }
 
     unsafe fn create_row(&self, index: usize, row: &Row) -> Vec<HWND> {
@@ -1650,7 +1771,7 @@ impl Panel {
             self.px(NAV_TOP),
             self.px(NAV_WIDTH - 16),
             (client.bottom - self.px(NAV_TOP) - self.px(8)).max(0),
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOREDRAW,
         );
 
         let dc = GetDC(self.hwnd);
@@ -1686,6 +1807,22 @@ impl Panel {
                         bottom: y + self.px(32),
                     };
                     y = rect.bottom;
+                    (
+                        Frame {
+                            rect,
+                            text_right: right,
+                        },
+                        Vec::new(),
+                    )
+                }
+                Row::Preview { .. } => {
+                    let rect = RECT {
+                        left,
+                        top: y,
+                        right,
+                        bottom: y + self.px(WIDGET_HEIGHT + 54),
+                    };
+                    y = rect.bottom + self.px(CARD_GAP);
                     (
                         Frame {
                             rect,
@@ -1810,25 +1947,44 @@ impl Panel {
             .min((self.content_height - height).max(0))
             .max(0);
         let count = self.controls.iter().map(Vec::len).sum::<usize>();
-        let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS;
-        let mut batch = BeginDeferWindowPos(count as i32).ok();
-        for (controls, slots) in self.controls.iter().zip(&self.slots) {
-            for (&control, slot) in controls.iter().zip(slots) {
-                let (x, y) = (slot.left, slot.top - self.scroll);
-                let (cx, cy) = (slot.right - slot.left, slot.bottom - slot.top);
-                batch = match batch {
-                    Some(info) => {
-                        DeferWindowPos(info, control, HWND::default(), x, y, cx, cy, flags).ok()
-                    }
-                    None => {
-                        let _ = SetWindowPos(control, HWND::default(), x, y, cx, cy, flags);
-                        None
-                    }
-                };
+        let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOREDRAW | SWP_DEFERERASE;
+        let positions = || {
+            self.controls
+                .iter()
+                .zip(&self.slots)
+                .flat_map(|(controls, slots)| controls.iter().copied().zip(slots.iter().copied()))
+        };
+        if count > 0 {
+            let dy = self.page_offset - self.scroll;
+            let result = BeginDeferWindowPos(count as i32)
+                .and_then(|batch| {
+                    positions().try_fold(batch, |batch, (control, slot)| {
+                        DeferWindowPos(
+                            batch,
+                            control,
+                            HWND::default(),
+                            slot.left,
+                            slot.top + dy,
+                            slot.right - slot.left,
+                            slot.bottom - slot.top,
+                            flags,
+                        )
+                    })
+                })
+                .and_then(|batch| EndDeferWindowPos(batch));
+            if result.is_err() {
+                for (control, slot) in positions() {
+                    let _ = SetWindowPos(
+                        control,
+                        HWND::default(),
+                        slot.left,
+                        slot.top + dy,
+                        slot.right - slot.left,
+                        slot.bottom - slot.top,
+                        flags,
+                    );
+                }
             }
-        }
-        if let Some(info) = batch {
-            let _ = EndDeferWindowPos(info);
         }
         let scroll_info = SCROLLINFO {
             cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
@@ -1839,17 +1995,8 @@ impl Panel {
             nPos: self.scroll,
             ..Default::default()
         };
-        SetScrollInfo(self.hwnd, SB_VERT, &scroll_info, true);
-        let content = RECT {
-            left: self.px(NAV_WIDTH),
-            ..client
-        };
-        let _ = RedrawWindow(
-            self.hwnd,
-            Some(&content),
-            HRGN::default(),
-            RDW_INVALIDATE | RDW_ALLCHILDREN,
-        );
+        SetScrollInfo(self.hwnd, SB_VERT, &scroll_info, false);
+        request_redraw();
     }
 
     unsafe fn scroll_to(&mut self, position: i32) {
@@ -1885,7 +2032,41 @@ impl Panel {
         if page < Page::ALL.len() && self.page != page {
             self.page = page;
             self.scroll = 0;
+            self.switches.clear();
+            self.page_animation = Some(Instant::now());
+            self.page_offset = self.px(24);
             self.sync(true);
+            SetTimer(self.hwnd, ANIMATION_TIMER, 15, None);
+        }
+    }
+
+    unsafe fn animate(&mut self) {
+        let now = Instant::now();
+        let mut active = false;
+        if let Some(start) = self.page_animation {
+            let progress = ease_out(now.duration_since(start), PAGE_DURATION);
+            self.page_offset = (self.px(24) as f32 * (1.0 - progress)).round() as i32;
+            if progress == 1.0 {
+                self.page_animation = None;
+            } else {
+                active = true;
+            }
+            self.place();
+        }
+        for (animation, controls) in self.switches.iter_mut().zip(&self.controls) {
+            if let Some(switch) = animation {
+                if now.duration_since(switch.start) >= SWITCH_DURATION {
+                    *animation = None;
+                } else {
+                    active = true;
+                }
+                if let Some(control) = controls.first() {
+                    let _ = InvalidateRect(*control, None, false);
+                }
+            }
+        }
+        if !active {
+            let _ = KillTimer(self.hwnd, ANIMATION_TIMER);
         }
     }
 
@@ -1951,7 +2132,7 @@ impl Panel {
         buffered(target, client, |dc, client| {
             let theme = self.theme;
             fill_rect(dc, client, theme.background);
-            let scroll = self.scroll;
+            let scroll = self.scroll - self.page_offset;
 
             // Shapes first; GDI text follows once the canvas is released.
             if let Some(canvas) = Canvas::new(dc) {
@@ -1965,7 +2146,10 @@ impl Panel {
                     );
                 }
                 for (row, frame) in self.rows.iter().zip(&self.frames) {
-                    if matches!(row, Row::Choice { .. } | Row::Action { .. }) {
+                    if matches!(
+                        row,
+                        Row::Choice { .. } | Row::Action { .. } | Row::Preview { .. }
+                    ) {
                         let rect = offset(frame.rect, -scroll);
                         if rect.bottom >= 0 && rect.top <= client.bottom {
                             canvas.card(rect, radius, theme.card, theme.card_border);
@@ -2066,6 +2250,36 @@ impl Panel {
                         },
                         DT_SINGLELINE | DT_BOTTOM | DT_END_ELLIPSIS,
                     ),
+                    Row::Preview {
+                        appearance,
+                        system_dark,
+                    } => {
+                        draw_text(
+                            dc,
+                            self.fonts.strong,
+                            theme.text,
+                            language.strings().appearance_preview,
+                            RECT {
+                                left: rect.left + self.px(CARD_PAD),
+                                right: rect.right - self.px(CARD_PAD),
+                                top: rect.top + self.px(12),
+                                bottom: rect.top + self.px(32),
+                            },
+                            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                        );
+                        appearance_preview::draw(
+                            dc,
+                            RECT {
+                                left: rect.left + self.px(CARD_PAD),
+                                right: rect.right - self.px(CARD_PAD),
+                                top: rect.top + self.px(34),
+                                bottom: rect.bottom - self.px(12),
+                            },
+                            *appearance,
+                            *system_dark,
+                            language,
+                        );
+                    }
                     Row::Note(hint) => draw_text(
                         dc,
                         self.fonts.caption,
@@ -2153,14 +2367,15 @@ impl Panel {
         }
     }
 
-    /// Custom-draw a settings button. Returns false to let the control draw itself.
-    unsafe fn draw_control(&self, draw: &NMCUSTOMDRAW) -> bool {
+    /// Paint using the last applied row model so native input cannot skip the animation.
+    unsafe fn draw_control(&self, draw: &NMCUSTOMDRAW) {
         let control = draw.hdr.hwndFrom;
         let Some((row, column)) = self.locate(draw.hdr.idFrom as u16, control) else {
-            return false;
+            return;
         };
-        let (Some(row), Some(frame)) = (self.rows.get(row), self.frames.get(row)) else {
-            return false;
+        let index = row;
+        let (Some(row), Some(frame)) = (self.rows.get(index), self.frames.get(index)) else {
+            return;
         };
         let flags = draw.uItemState;
         let state = ControlState {
@@ -2171,9 +2386,16 @@ impl Panel {
         };
         let area = draw.rc;
         match row {
-            Row::Check { item, hint, .. } => {
-                let checked = SendMessageW(control, BM_GETCHECK, WPARAM(0), LPARAM(0)).0
-                    == BST_CHECKED.0 as isize;
+            Row::Check {
+                item,
+                checked,
+                hint,
+                ..
+            } => {
+                let progress = self.switches[index]
+                    .map_or(f32::from(u8::from(*checked)), |animation| {
+                        animation.value(Instant::now())
+                    });
                 let text_right = frame.text_right - frame.rect.left;
                 buffered(draw.hdc, area, |dc, rect| {
                     self.draw_switch_card(
@@ -2182,7 +2404,7 @@ impl Panel {
                         text_right,
                         &item.label,
                         hint.as_ref(),
-                        checked,
+                        progress,
                         state,
                     )
                 });
@@ -2190,22 +2412,22 @@ impl Panel {
             Row::Choice {
                 items, selected, ..
             } => {
-                let value = items.get(*selected).map_or("", |item| item.label.as_str());
-                buffered(draw.hdc, area, |dc, rect| {
-                    self.draw_button(dc, rect, value, None, true, state)
-                });
+                if let Some(item) = items.get(*selected) {
+                    buffered(draw.hdc, area, |dc, rect| {
+                        self.draw_button(dc, rect, &item.label, item.swatch, true, state)
+                    });
+                }
             }
             Row::Action { buttons, .. } => {
                 let Some(item) = buttons.get(column) else {
-                    return false;
+                    return;
                 };
                 buffered(draw.hdc, area, |dc, rect| {
                     self.draw_button(dc, rect, &item.label, item.swatch, false, state)
                 });
             }
-            Row::Section(_) | Row::Note(_) => return false,
+            Row::Section(_) | Row::Note(_) | Row::Preview { .. } => {}
         }
-        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2216,7 +2438,7 @@ impl Panel {
         text_right: i32,
         label: &str,
         hint: Option<&Hint>,
-        checked: bool,
+        progress: f32,
         state: ControlState,
     ) {
         let theme = self.theme;
@@ -2248,33 +2470,28 @@ impl Panel {
                 12.0
             });
             let center_y = toggle.top as f32 + pill;
-            if checked {
-                let track = if state.disabled {
-                    theme.disabled
-                } else {
-                    theme.accent
-                };
-                let knob_color = if state.disabled {
-                    theme.card
-                } else {
-                    theme.on_accent
-                };
-                canvas.fill(toggle, pill, track);
-                canvas.circle(toggle.right as f32 - pill, center_y, knob, knob_color);
+            let (on_track, on_knob, off_stroke, off_knob) = if state.disabled {
+                (theme.disabled, theme.card, theme.disabled, theme.disabled)
             } else {
-                let stroke = if state.disabled {
-                    theme.disabled
-                } else {
-                    theme.strong_stroke
-                };
-                let knob_color = if state.disabled {
-                    theme.disabled
-                } else {
-                    theme.knob
-                };
-                canvas.stroke(toggle, pill, stroke, self.pxf(1.0));
-                canvas.circle(toggle.left as f32 + pill, center_y, knob, knob_color);
-            }
+                (
+                    theme.accent,
+                    theme.on_accent,
+                    theme.strong_stroke,
+                    theme.knob,
+                )
+            };
+            let track = mix_color(fill, on_track, progress);
+            let stroke = mix_color(off_stroke, on_track, progress);
+            canvas.fill(toggle, pill, track);
+            canvas.stroke(toggle, pill, stroke, self.pxf(1.0));
+            let travel = (toggle.right - toggle.left - toggle_height) as f32;
+            let center_x = toggle.left as f32 + pill + travel * progress;
+            canvas.circle(
+                center_x,
+                center_y,
+                knob,
+                mix_color(off_knob, on_knob, progress),
+            );
             if state.focused {
                 canvas.stroke(rect, radius, theme.text, self.pxf(2.0));
             }
@@ -2479,10 +2696,6 @@ impl Drop for Panel {
     fn drop(&mut self) {
         unsafe {
             self.fonts.delete();
-            BACKGROUND.with(|cell| cell.set(HBRUSH::default()));
-            if !self.background.is_invalid() {
-                let _ = DeleteObject(self.background);
-            }
             if !self.icon.is_invalid() {
                 let _ = DestroyIcon(self.icon);
             }
@@ -2572,10 +2785,7 @@ unsafe fn update_row(row: &Row, controls: &[HWND]) {
                 let _ = EnableWindow(control, item.action.is_some());
             }
         }
-        Row::Section(_) | Row::Note(_) => {}
-    }
-    for &control in controls {
-        let _ = InvalidateRect(control, None, false);
+        Row::Section(_) | Row::Note(_) | Row::Preview { .. } => {}
     }
 }
 
@@ -2618,13 +2828,27 @@ unsafe fn pick_from_menu(
     (command > 0).then(|| command as usize - 1)
 }
 
+fn request_redraw() {
+    REDRAW_PENDING.with(|pending| pending.set(true));
+}
+
 fn with_panel<T>(f: impl FnOnce(&mut Panel) -> T) -> Option<T> {
-    PANEL.with(|state| {
-        state
-            .try_borrow_mut()
-            .ok()
-            .and_then(|mut state| state.as_mut().map(f))
-    })
+    let (hwnd, result) = PANEL.with(|state| {
+        let mut state = state.try_borrow_mut().ok()?;
+        let panel = state.as_mut()?;
+        Some((panel.hwnd, f(panel)))
+    })?;
+    if REDRAW_PENDING.with(|pending| pending.replace(false)) {
+        unsafe {
+            let _ = RedrawWindow(
+                hwnd,
+                None,
+                HRGN::default(),
+                RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_NOERASE | RDW_UPDATENOW,
+            );
+        }
+    }
+    Some(result)
 }
 
 /// Read-only access for painting. `Err` means the panel is busy and the
@@ -2644,15 +2868,6 @@ fn current_window() -> HWND {
 
 pub(super) fn note_save_result(saved: bool) {
     SAVE_FAILED.store(!saved, Ordering::Relaxed);
-}
-
-pub(super) fn dialog_owner(widget: HWND) -> HWND {
-    let settings = current_window();
-    if settings.is_invalid() {
-        widget
-    } else {
-        settings
-    }
 }
 
 pub(super) unsafe fn handle_dialog_message(message: &MSG) -> bool {
@@ -2814,7 +3029,10 @@ unsafe extern "system" fn settings_proc(
         ENSURE_VISIBLE => {
             with_panel(|panel| panel.ensure_visible(HWND(wparam.0 as *mut _)));
         }
-        WM_TIMER => {
+        WM_TIMER if wparam.0 == ANIMATION_TIMER => {
+            with_panel(|panel| panel.animate());
+        }
+        WM_TIMER if wparam.0 == REFRESH_TIMER => {
             with_panel(|panel| panel.sync(false));
         }
         WM_SIZE => {
@@ -2867,57 +3085,59 @@ unsafe extern "system" fn settings_proc(
         WM_DPICHANGED => {
             let dpi = wparam.0 as u16 as u32;
             let suggested = *(lparam.0 as *const RECT);
-            with_panel(|panel| panel.set_dpi(dpi));
-            let _ = SetWindowPos(
-                hwnd,
-                HWND::default(),
-                suggested.left,
-                suggested.top,
-                suggested.right - suggested.left,
-                suggested.bottom - suggested.top,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-            with_panel(|panel| panel.layout());
+            with_panel(|panel| {
+                let _redraw = SuspendRedraw::new(hwnd);
+                panel.set_dpi(dpi);
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND::default(),
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+                );
+                panel.layout();
+            });
         }
         WM_SETTINGCHANGE | WM_THEMECHANGED | WM_DWMCOLORIZATIONCOLORCHANGED => {
             with_panel(|panel| {
-                let theme = Theme::current();
+                let theme = Theme::current(panel.preference);
                 if theme != panel.theme {
-                    panel.apply_theme();
+                    let _redraw = SuspendRedraw::new(hwnd);
+                    panel.apply_theme(theme);
                 }
             });
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
         WM_NOTIFY => {
             let header = &*(lparam.0 as *const NMHDR);
-            if header.code == NM_CUSTOMDRAW {
+            if header.code == NM_CUSTOMDRAW && header.idFrom >= usize::from(FIRST_FIELD) {
                 let draw = &*(lparam.0 as *const NMCUSTOMDRAW);
-                if draw.dwDrawStage == CDDS_PREPAINT {
-                    match with_panel_ref(|panel| panel.draw_control(draw)) {
-                        Ok(Some(true)) => return LRESULT(CDRF_SKIPDEFAULT as isize),
-                        Err(()) => {
-                            let _ = InvalidateRect(draw.hdr.hwndFrom, None, false);
-                        }
-                        _ => {}
-                    }
+                // Buttons send CDDS_PREERASE first; skipping it would also skip
+                // the CDDS_PREPAINT notification that draws the control.
+                if draw.dwDrawStage != CDDS_PREPAINT {
+                    return LRESULT(CDRF_DODEFAULT as isize);
                 }
-                return LRESULT(CDRF_DODEFAULT as isize);
+                if with_panel_ref(|panel| panel.draw_control(draw)).is_err() {
+                    request_redraw();
+                }
+                // A control can request a paint while its HWND or row is being changed.
+                return LRESULT(CDRF_SKIPDEFAULT as isize);
             }
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
         WM_DRAWITEM if wparam.0 == NAV as usize => {
             let item = &*(lparam.0 as *const DRAWITEMSTRUCT);
             if with_panel_ref(|panel| panel.draw_nav(item)).is_err() {
-                let _ = InvalidateRect(item.hwndItem, None, false);
+                request_redraw();
             }
             return LRESULT(1);
         }
         WM_CTLCOLORLISTBOX => {
-            let brush = BACKGROUND.with(Cell::get);
-            if !brush.is_invalid() {
-                return LRESULT(brush.0 as isize);
-            }
-            return DefWindowProcW(hwnd, msg, wparam, lparam);
+            let dc = HDC(wparam.0 as *mut _);
+            let _ = SetDCBrushColor(dc, colorref(BACKGROUND.with(Cell::get)));
+            return LRESULT(GetStockObject(DC_BRUSH).0 as isize);
         }
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => {
@@ -2926,7 +3146,7 @@ unsafe extern "system" fn settings_proc(
             let painted = with_panel_ref(|panel| panel.paint(dc));
             let _ = EndPaint(hwnd, &paint);
             if painted.is_err() {
-                let _ = InvalidateRect(hwnd, None, false);
+                request_redraw();
             }
         }
         WM_CLOSE => {
@@ -2934,6 +3154,7 @@ unsafe extern "system" fn settings_proc(
         }
         WM_DESTROY => {
             let _ = KillTimer(hwnd, REFRESH_TIMER);
+            let _ = KillTimer(hwnd, ANIMATION_TIMER);
         }
         WM_NCDESTROY => {
             PANEL.with(|state| {

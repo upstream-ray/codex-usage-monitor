@@ -17,7 +17,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::codex_colors::{CodexColors, ColorPreset, ColorRole};
+use crate::codex_colors::{codex_brand_color, SingleColor};
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::mcp_server;
@@ -37,7 +37,6 @@ use crate::settings_store;
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
-use crate::user_presets::{UserPresets, MAX_USER_PRESETS};
 
 #[path = "settings_window.rs"]
 mod settings_window;
@@ -69,7 +68,7 @@ struct AppState {
     language: LanguageId,
     appearance: Appearance,
     quota_display_mode: QuotaDisplayMode,
-    color_presets: UserPresets,
+    settings_theme: SettingsTheme,
     install_channel: InstallChannel,
 
     session_percent: f64,
@@ -181,25 +180,25 @@ const IDM_PALETTE_DARK: u16 = 91;
 const IDM_PALETTE_LIGHT: u16 = 92;
 const IDM_BAR_CONTINUOUS: u16 = 93;
 const IDM_BAR_SEGMENTED: u16 = 94;
-const IDM_BAR_STANDARD: u16 = 95;
-const IDM_BAR_SLIM: u16 = 96;
-const IDM_FONT_STANDARD: u16 = 97;
-const IDM_FONT_LARGE: u16 = 98;
+const IDM_PROVIDER_LOGOS: u16 = 121;
+const IDM_BAR_MEDIUM: u16 = 95;
+const IDM_BAR_THIN: u16 = 96;
+const IDM_FONT_12: u16 = 97;
+const IDM_FONT_14: u16 = 98;
 const IDM_APPEARANCE_RECOMMENDED: u16 = 99;
 const IDM_APPEARANCE_RESET: u16 = 100;
-const IDM_BAR_CLASSIC: u16 = 101;
-const IDM_CODEX_ICON_COLOR: u16 = 102;
-const IDM_CODEX_BAR_COLOR: u16 = 103;
-const IDM_CODEX_PERCENT_COLOR: u16 = 104;
-const IDM_CODEX_PRESET_FIRST: u16 = 110;
-const IDM_CODEX_PRESET_LAST: u16 = 115;
-const IDM_SAVE_COLOR_PRESET: u16 = 118;
-const IDM_USER_PRESET_FIRST: u16 = 400;
-const IDM_USER_PRESET_LAST: u16 = IDM_USER_PRESET_FIRST + MAX_USER_PRESETS as u16 - 1;
-const IDM_DELETE_PRESET_FIRST: u16 = 500;
-const IDM_DELETE_PRESET_LAST: u16 = IDM_DELETE_PRESET_FIRST + MAX_USER_PRESETS as u16 - 1;
-const IDM_COMPACT_LAYOUT: u16 = 120;
-const IDM_PROVIDER_LOGOS: u16 = 121;
+const IDM_BAR_DOTS: u16 = 101;
+const IDM_BAR_BATTERY: u16 = 102;
+const IDM_BAR_THICK: u16 = 103;
+const IDM_FONT_16: u16 = 104;
+const IDM_COLOR_BRAND: u16 = 105;
+const IDM_COLOR_REMAINING: u16 = 106;
+const IDM_COLOR_SINGLE: u16 = 107;
+const IDM_SINGLE_COLOR_FIRST: u16 = 110;
+const IDM_SINGLE_COLOR_LAST: u16 = IDM_SINGLE_COLOR_FIRST + SingleColor::ALL.len() as u16 - 1;
+const IDM_THEME_SYSTEM: u16 = 122;
+const IDM_THEME_LIGHT: u16 = 123;
+const IDM_THEME_DARK: u16 = 124;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
@@ -419,24 +418,81 @@ enum Palette {
 enum BarStyle {
     #[default]
     Continuous,
+    #[serde(alias = "classic_segmented")]
     Segmented,
-    ClassicSegmented,
+    Dots,
+    Battery,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum BarThickness {
+    #[serde(alias = "slim")]
+    Thin,
     #[default]
-    Standard,
-    Slim,
+    #[serde(alias = "standard")]
+    Medium,
+    Thick,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum FontSize {
     #[default]
-    Standard,
-    Large,
+    #[serde(rename = "12", alias = "standard")]
+    Px12,
+    #[serde(rename = "14", alias = "large")]
+    Px14,
+    #[serde(rename = "16")]
+    Px16,
+}
+
+impl FontSize {
+    fn px(self) -> i32 {
+        match self {
+            Self::Px12 => 12,
+            Self::Px14 => 14,
+            Self::Px16 => 16,
+        }
+    }
+
+    fn fit(self, height: i32, rows: i32, scale: impl Fn(i32) -> i32) -> Self {
+        let fits = |size: Self| rows * scale(size.px() + 6) <= height;
+        match self {
+            Self::Px16 if fits(Self::Px16) => Self::Px16,
+            Self::Px14 | Self::Px16 if fits(Self::Px14) => Self::Px14,
+            _ => Self::Px12,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SettingsTheme {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ColorMode {
+    #[default]
+    Brand,
+    Remaining,
+    Single,
+}
+
+fn remaining_bar_color(remaining: f64, dark: bool) -> Color {
+    let (light, dark_color) = if remaining > 50.0 {
+        ("#137A46", "#4ADE80")
+    } else if remaining >= 20.0 {
+        ("#8A5900", "#FBBF24")
+    } else {
+        ("#BA3039", "#FB7185")
+    };
+    Color::from_hex(if dark { dark_color } else { light })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,8 +502,8 @@ struct Appearance {
     bar_style: BarStyle,
     bar_thickness: BarThickness,
     font_size: FontSize,
-    codex_colors: CodexColors,
-    compact_layout: bool,
+    color_mode: ColorMode,
+    single_color: SingleColor,
     hide_provider_logos: bool,
 }
 
@@ -456,11 +512,9 @@ impl Appearance {
         Self {
             palette: Palette::HighContrastDark,
             bar_style: BarStyle::Continuous,
-            bar_thickness: BarThickness::Slim,
-            font_size: FontSize::Large,
-            codex_colors: CodexColors::default(),
-            compact_layout: false,
-            hide_provider_logos: false,
+            bar_thickness: BarThickness::Thin,
+            font_size: FontSize::Px14,
+            ..Self::default()
         }
     }
     fn is_dark(self, system_is_dark: bool) -> bool {
@@ -472,25 +526,32 @@ impl Appearance {
     }
 
     fn font_px(self) -> i32 {
-        match self.font_size {
-            FontSize::Standard => 12,
-            FontSize::Large => 13,
-        }
+        self.font_size.px()
     }
 
-    /// Physical row height; large text needs one more pixel of line height.
     fn row_height(self) -> i32 {
-        sc(match self.font_size {
-            FontSize::Standard => ROW_HEIGHT,
-            FontSize::Large => ROW_HEIGHT + 1,
-        })
+        sc(self.font_px() + 6)
     }
 
-    fn bar_height(self) -> i32 {
+    fn bar_height(self, row_height: i32) -> i32 {
         sc(match self.bar_thickness {
-            BarThickness::Standard => SEGMENT_H,
-            BarThickness::Slim => 8,
+            BarThickness::Thin => 4,
+            BarThickness::Medium => 7,
+            BarThickness::Thick => 10,
         })
+        .min((row_height - sc(2)).max(1))
+    }
+
+    fn bar_color(self, provider: Provider, used: f64, dark: bool) -> Color {
+        match self.color_mode {
+            ColorMode::Remaining => remaining_bar_color(poller::remaining_percentage(used), dark),
+            ColorMode::Single => self.single_color.bar(dark),
+            ColorMode::Brand => match provider {
+                Provider::Claude => claude_accent_color(),
+                Provider::Codex => codex_brand_color(dark),
+                Provider::Antigravity => antigravity_accent_color(),
+            },
+        }
     }
 }
 
@@ -513,7 +574,7 @@ struct SettingsFile {
     #[serde(default)]
     appearance: Appearance,
     #[serde(default)]
-    color_presets: UserPresets,
+    settings_theme: SettingsTheme,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quota_display_mode: Option<QuotaDisplayMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -562,7 +623,7 @@ impl Default for SettingsFile {
             language: None,
             appearance: Appearance::default(),
             quota_display_mode: Some(QuotaDisplayMode::Remaining),
-            color_presets: UserPresets::default(),
+            settings_theme: SettingsTheme::default(),
             last_update_check_unix: None,
             widget_visible: true,
             show_claude_code: false,
@@ -716,7 +777,7 @@ fn save_state_settings() {
                 .map(|language| language.code().to_string()),
             appearance: s.appearance,
             quota_display_mode: Some(s.quota_display_mode),
-            color_presets: s.color_presets.clone(),
+            settings_theme: s.settings_theme,
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
             show_claude_code: s.show_claude_code,
@@ -1791,9 +1852,7 @@ fn set_startup_enabled(enable: bool) {
 
 // Dimensions matching the C# version
 const SEGMENT_W: i32 = 10;
-const COMPACT_SEGMENT_W: i32 = 8;
-const SEGMENT_H: i32 = 9;
-const ROW_HEIGHT: i32 = 18;
+const MULTI_PROVIDER_SEGMENT_W: i32 = 8;
 const SEGMENT_GAP: i32 = 1;
 const SEGMENT_COUNT: i32 = 10;
 
@@ -1808,123 +1867,6 @@ const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 138;
 const MODEL_RIGHT_MARGIN: i32 = 9;
 const RIGHT_MARGIN: i32 = 4;
 const WIDGET_HEIGHT: i32 = 46;
-
-fn preferred_widget_height_for(
-    active_models: i32,
-    language: LanguageId,
-    show_session: bool,
-    show_weekly: bool,
-    appearance: Appearance,
-) -> i32 {
-    if uses_compact_layout(active_models, language, appearance) {
-        if show_session && show_weekly {
-            64
-        } else {
-            32
-        }
-    } else {
-        WIDGET_HEIGHT
-    }
-}
-
-fn preferred_widget_height_for_state(state: &AppState) -> i32 {
-    sc(preferred_widget_height_for(
-        active_model_count(
-            state.show_claude_code,
-            state.show_codex,
-            state.show_antigravity,
-        ),
-        state.language,
-        state.show_session_window,
-        state.show_weekly_window,
-        state.appearance,
-    ))
-}
-
-fn preferred_widget_height() -> i32 {
-    lock_state()
-        .as_ref()
-        .map(preferred_widget_height_for_state)
-        .unwrap_or(sc(WIDGET_HEIGHT))
-}
-
-fn uses_compact_layout(active_models: i32, language: LanguageId, appearance: Appearance) -> bool {
-    appearance.compact_layout && active_models == 1 && language == LanguageId::SimplifiedChinese
-}
-
-/// Measure the widest display values so quota changes do not move the widget.
-fn compact_widget_width(appearance: Appearance) -> i32 {
-    compact_measured_width(
-        appearance,
-        "100% 23:59重置 *",
-        "100% 12/31重置 *",
-        true,
-        true,
-    )
-}
-fn compact_measured_width(
-    appearance: Appearance,
-    session: &str,
-    weekly: &str,
-    show_session: bool,
-    show_weekly: bool,
-) -> i32 {
-    unsafe {
-        let dc = GetDC(HWND::default());
-        if dc.is_invalid() {
-            return sc(200);
-        }
-        let font = create_widget_font(appearance);
-        let reset_font = quota_text::create_reset_font(sc(appearance.font_px() - 1));
-        let old = SelectObject(dc, font);
-        let measure = |font: HFONT, value: &str| {
-            SelectObject(dc, font);
-            let wide: Vec<u16> = value.encode_utf16().collect();
-            let mut size = SIZE::default();
-            if !wide.is_empty() {
-                let _ = GetTextExtentPoint32W(dc, &wide, &mut size);
-            }
-            size.cx
-        };
-        let mut content_width = 0;
-        for (visible, label, value) in [(show_session, "5h", session), (show_weekly, "7d", weekly)]
-        {
-            if !visible {
-                continue;
-            }
-            let (percentage, reset) = quota_text::parts(value);
-            let mut row_width = measure(font, label) + sc(8) + measure(font, percentage);
-            if !reset.is_empty() {
-                row_width += sc(8) + measure(reset_font, &reset.replace("重置", " 重置"));
-            }
-            content_width = content_width.max(row_width);
-        }
-        SelectObject(dc, old);
-        let _ = DeleteObject(font);
-        let _ = DeleteObject(reset_font);
-        ReleaseDC(HWND::default(), dc);
-        sc(24) + content_width
-    }
-}
-
-/// Available height controls vertical spacing; both quota windows remain inside
-/// short taskbars instead of drawing a 64 px design into a clipped window.
-fn compact_row_geometry(height: i32, rows: i32) -> (i32, i32, i32, i32) {
-    compact_row_geometry_scaled(height, rows, sc)
-}
-
-fn compact_row_geometry_scaled(
-    height: i32,
-    rows: i32,
-    scale: impl Fn(i32) -> i32,
-) -> (i32, i32, i32, i32) {
-    let row_height = height / rows.max(1);
-    let text_height = scale(18).min((row_height - scale(8)).max(scale(12)));
-    let bar_height = scale(8).min((row_height - text_height - scale(2)).max(1));
-    let gap = scale(3).min((row_height - text_height - bar_height).max(0));
-    let inset = ((row_height - text_height - gap - bar_height) / 2).max(0);
-    (row_height, text_height, bar_height, inset)
-}
 
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
     let divider_h = sc(25);
@@ -2071,9 +2013,6 @@ fn usage_layout_widths(language: LanguageId, appearance: Appearance) -> (i32, i3
 }
 
 fn total_widget_width_for(active_models: i32, language: LanguageId, appearance: Appearance) -> i32 {
-    if uses_compact_layout(active_models, language, appearance) {
-        return compact_widget_width(appearance);
-    }
     let bar_segments = row_bar_segment_count(active_models);
     let (label_width, text_width) = usage_layout_widths(language, appearance);
     let model_width = model_usage_width(bar_segments, text_width, appearance);
@@ -2236,6 +2175,7 @@ pub fn run() {
         }
 
         let settings = load_settings();
+        settings_window::apply_menu_theme(settings.settings_theme);
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
@@ -2255,13 +2195,7 @@ pub fn run() {
             0,
             0,
             total_widget_width_for(initial_model_count, language, settings.appearance),
-            sc(preferred_widget_height_for(
-                initial_model_count,
-                language,
-                settings.show_session_window,
-                settings.show_weekly_window,
-                settings.appearance,
-            )),
+            sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
             hinstance,
@@ -2304,7 +2238,7 @@ pub fn run() {
                 language,
                 appearance: settings.appearance,
                 quota_display_mode: settings.quota_display_mode.unwrap_or_default(),
-                color_presets: settings.color_presets.clone(),
+                settings_theme: settings.settings_theme,
                 install_channel,
                 session_percent: 0.0,
                 session_text: "--".to_string(),
@@ -2516,19 +2450,11 @@ fn update_quota_tooltips() {
             let chinese = s.language == LanguageId::SimplifiedChinese;
             let count = active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity);
             let (label_width, text_width) = usage_layout_widths(s.language, s.appearance);
-            let compact = uses_compact_layout(count, s.language, s.appearance);
-            let width = if compact {
-                total_widget_width_for_state(s) - sc(12)
-            } else {
-                model_usage_width(row_bar_segment_count(count), text_width, s.appearance)
-            };
+            let width = model_usage_width(row_bar_segment_count(count), text_width, s.appearance);
             let mut left = sc(LEFT_DIVIDER_W)
                 + sc(DIVIDER_RIGHT_MARGIN)
                 + label_width
                 + sc(LABEL_RIGHT_MARGIN);
-            if compact {
-                left = sc(12);
-            }
             let antigravity_name = antigravity_label(s);
             for (id, visible, name, session) in [
                 (0, s.show_claude_code, "Claude Code", &s.session_text),
@@ -2569,7 +2495,7 @@ fn update_quota_tooltips() {
                         left,
                         top: 0,
                         right: left + width,
-                        bottom: preferred_widget_height_for_state(s),
+                        bottom: sc(WIDGET_HEIGHT),
                     },
                     text,
                 ));
@@ -2582,79 +2508,76 @@ fn update_quota_tooltips() {
 }
 
 /// Render opaque taskbar content with ClearType via UpdateLayeredWindow.
+struct WidgetContent<'a> {
+    system_dark: bool,
+    appearance: Appearance,
+    language: LanguageId,
+    mode: QuotaDisplayMode,
+    // Provider column order: Claude Code, Codex, Antigravity.
+    providers: [bool; 3],
+    visible_rows: [bool; 2],
+    used: [[f64; 3]; 2],
+    text: [[std::borrow::Cow<'a, str>; 3]; 2],
+}
+
+const WIDGET_PROVIDERS: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::Antigravity];
+
+impl WidgetContent<'static> {
+    fn from_state(s: &AppState) -> Self {
+        let values = |texts: [&String; 3]| texts.map(|text| text.clone().into());
+        Self {
+            system_dark: s.is_dark,
+            appearance: s.appearance,
+            language: s.language,
+            mode: s.quota_display_mode,
+            providers: [s.show_claude_code, s.show_codex, s.show_antigravity],
+            visible_rows: [s.show_session_window, s.show_weekly_window],
+            used: [
+                [
+                    s.session_percent,
+                    s.codex_session_percent,
+                    s.antigravity_session_percent,
+                ],
+                [
+                    s.weekly_percent,
+                    s.codex_weekly_percent,
+                    s.antigravity_weekly_percent,
+                ],
+            ],
+            text: [
+                values([
+                    &s.session_text,
+                    &s.codex_session_text,
+                    &s.antigravity_session_text,
+                ]),
+                values([
+                    &s.weekly_text,
+                    &s.codex_weekly_text,
+                    &s.antigravity_weekly_text,
+                ]),
+            ],
+        }
+    }
+}
+
 fn render_layered() {
-    refresh_dpi();
     let needs_resize = {
         let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| unsafe {
-                let mut rect = RECT::default();
-                GetClientRect(s.hwnd.to_hwnd(), &mut rect).is_ok()
-                    && rect.right - rect.left != total_widget_width_for_state(s)
-            })
-            .unwrap_or(false)
+        state.as_ref().is_some_and(|s| unsafe {
+            let mut rect = RECT::default();
+            GetClientRect(s.hwnd.to_hwnd(), &mut rect).is_ok()
+                && rect.right - rect.left != total_widget_width_for_state(s)
+        })
     };
     if needs_resize {
         position_at_taskbar();
     }
     update_quota_tooltips();
-    let (
-        hwnd_val,
-        is_dark,
-        embedded,
-        language,
-        appearance,
-        strings,
-        session_pct,
-        session_text,
-        weekly_pct,
-        weekly_text,
-        codex_session_pct,
-        codex_session_text,
-        codex_weekly_pct,
-        codex_weekly_text,
-        antigravity_session_pct,
-        antigravity_session_text,
-        antigravity_weekly_pct,
-        antigravity_weekly_text,
-        show_claude_code,
-        show_codex,
-        show_antigravity,
-        show_session_window,
-        show_weekly_window,
-    ) = {
+
+    let (hwnd_val, embedded, content) = {
         let state = lock_state();
-        match state.as_ref() {
-            Some(s) => (
-                s.hwnd,
-                s.is_dark,
-                s.embedded,
-                s.language,
-                s.appearance,
-                s.language.strings(),
-                s.quota_display_mode.percentage(s.session_percent),
-                s.session_text.clone(),
-                s.quota_display_mode.percentage(s.weekly_percent),
-                s.weekly_text.clone(),
-                s.quota_display_mode.percentage(s.codex_session_percent),
-                s.codex_session_text.clone(),
-                s.quota_display_mode.percentage(s.codex_weekly_percent),
-                s.codex_weekly_text.clone(),
-                s.quota_display_mode
-                    .percentage(s.antigravity_session_percent),
-                s.antigravity_session_text.clone(),
-                s.quota_display_mode
-                    .percentage(s.antigravity_weekly_percent),
-                s.antigravity_weekly_text.clone(),
-                s.show_claude_code,
-                s.show_codex,
-                s.show_antigravity,
-                s.show_session_window,
-                s.show_weekly_window,
-            ),
-            None => return,
-        }
+        let Some(s) = state.as_ref() else { return };
+        (s.hwnd, s.embedded, WidgetContent::from_state(s))
     };
 
     let hwnd = hwnd_val.to_hwnd();
@@ -2676,14 +2599,6 @@ fn render_layered() {
     if width <= 0 || height <= 0 {
         return;
     }
-
-    let accent = claude_accent_color();
-    let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
-    let codex_accent = appearance
-        .codex_colors
-        .resolve(appearance.is_dark(is_dark))
-        .bar;
-    let antigravity_accent = antigravity_accent_color();
 
     unsafe {
         let screen_dc = GetDC(hwnd);
@@ -2718,56 +2633,10 @@ fn render_layered() {
         // Render once with the actual taskbar background colour.
         // Using an opaque background lets us use CLEARTYPE_QUALITY for
         // sub-pixel font rendering that matches the rest of the OS.
-        paint_content(
-            mem_dc,
-            width,
-            height,
-            is_dark,
-            appearance,
-            &bg_color,
-            &text_color,
-            &accent,
-            &track,
-            language,
-            strings,
-            session_pct,
-            &session_text,
-            weekly_pct,
-            &weekly_text,
-            codex_session_pct,
-            &codex_session_text,
-            codex_weekly_pct,
-            &codex_weekly_text,
-            antigravity_session_pct,
-            &antigravity_session_text,
-            antigravity_weekly_pct,
-            &antigravity_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            show_session_window,
-            show_weekly_window,
-            &codex_accent,
-            &antigravity_accent,
-        );
-
-        // System mode blends with the taskbar. High contrast modes use a solid
-        // backdrop, so text stays legible even over translucent wallpapers.
-        let bg_bgr = bg_color.to_colorref();
-        let bg_alpha = if appearance.palette == Palette::System {
-            1u32
-        } else {
-            255u32
-        };
-        let pixel_data = std::slice::from_raw_parts_mut(bits as *mut u32, pixel_count);
-        for px in pixel_data.iter_mut() {
-            let rgb = *px & 0x00FFFFFF;
-            if rgb == bg_bgr {
-                *px = (bg_alpha << 24) | if bg_alpha == 1 { 0 } else { rgb };
-            } else {
-                *px = rgb | 0xFF000000;
-            }
-        }
+        paint_content(mem_dc, width, height, &content);
+        let _ = GdiFlush();
+        let pixels = std::slice::from_raw_parts_mut(bits.cast::<u32>(), pixel_count);
+        apply_widget_alpha(pixels, content.appearance, content.system_dark);
 
         // Push to window via UpdateLayeredWindow
         let pt_src = POINT { x: 0, y: 0 };
@@ -2805,43 +2674,44 @@ fn render_layered() {
     }
 }
 
-/// Paint all widget content onto a DC with a given background color.
-fn paint_content(
-    hdc: HDC,
-    width: i32,
-    height: i32,
-    is_dark: bool,
-    appearance: Appearance,
-    bg: &Color,
-    text_color: &Color,
-    accent: &Color,
-    track: &Color,
-    language: LanguageId,
-    strings: Strings,
-    session_pct: f64,
-    session_text: &str,
-    weekly_pct: f64,
-    weekly_text: &str,
-    codex_session_pct: f64,
-    codex_session_text: &str,
-    codex_weekly_pct: f64,
-    codex_weekly_text: &str,
-    antigravity_session_pct: f64,
-    antigravity_session_text: &str,
-    antigravity_weekly_pct: f64,
-    antigravity_weekly_text: &str,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    show_session_window: bool,
-    show_weekly_window: bool,
-    codex_accent: &Color,
-    antigravity_accent: &Color,
-) {
-    unsafe {
-        let is_dark = appearance.is_dark(is_dark);
-        let (label_width, text_width) = usage_layout_widths(language, appearance);
+fn apply_widget_alpha(pixels: &mut [u32], appearance: Appearance, system_dark: bool) {
+    let (background, _, _) = appearance_colors(appearance, system_dark);
+    let background =
+        u32::from(background.r) << 16 | u32::from(background.g) << 8 | u32::from(background.b);
+    for pixel in pixels {
+        let rgb = *pixel & 0x00FFFFFF;
+        // System mode uses the underlying taskbar for the backdrop.
+        *pixel = if appearance.palette == Palette::System && rgb == background {
+            0x01000000
+        } else {
+            rgb | 0xFF000000
+        };
+    }
+}
 
+/// Paint all widget content onto a DC with a given background color.
+fn paint_content(hdc: HDC, width: i32, height: i32, content: &WidgetContent<'_>) {
+    let WidgetContent {
+        system_dark,
+        mut appearance,
+        language,
+        mode,
+        providers,
+        visible_rows,
+        used,
+        ref text,
+    } = *content;
+    let rows = visible_rows
+        .into_iter()
+        .filter(|visible| *visible)
+        .count()
+        .max(1) as i32;
+    let is_dark = appearance.is_dark(system_dark);
+    let (bg, text_color, track) = appearance_colors(appearance, system_dark);
+    let (label_width, text_width) = usage_layout_widths(language, appearance);
+    appearance.font_size = appearance.font_size.fit(height, rows, sc);
+
+    unsafe {
         let client_rect = RECT {
             left: 0,
             top: 0,
@@ -2854,7 +2724,7 @@ fn paint_content(
         let _ = DeleteObject(bg_brush);
 
         // Left divider
-        let divider_h = sc(25);
+        let divider_h = sc(25).min(height);
         let divider_top = (height - divider_h) / 2;
         let divider_bottom = divider_top + divider_h;
 
@@ -2890,154 +2760,93 @@ fn paint_content(
         FillRect(hdc, &right_rect, right_brush);
         let _ = DeleteObject(right_brush);
 
-        if uses_compact_layout(
-            active_model_count(show_claude_code, show_codex, show_antigravity),
-            language,
-            appearance,
-        ) {
-            let (session_percent, session_value, weekly_percent, weekly_value, color) =
-                if show_codex {
-                    (
-                        codex_session_pct,
-                        codex_session_text,
-                        codex_weekly_pct,
-                        codex_weekly_text,
-                        codex_accent,
-                    )
-                } else if show_claude_code {
-                    (session_pct, session_text, weekly_pct, weekly_text, accent)
-                } else {
-                    (
-                        antigravity_session_pct,
-                        antigravity_session_text,
-                        antigravity_weekly_pct,
-                        antigravity_weekly_text,
-                        antigravity_accent,
-                    )
-                };
-            paint_compact_quota_rows(
-                hdc,
-                width,
-                height,
-                appearance,
-                is_dark,
-                text_color,
-                color,
-                track,
-                session_percent,
-                session_value,
-                weekly_percent,
-                weekly_value,
-                show_session_window,
-                show_weekly_window,
-            );
-            return;
-        }
-
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
-        let row_gap = if height < sc(WIDGET_HEIGHT) {
-            sc(2)
+        let row_height = appearance.row_height().min((height / rows).max(1));
+        let row_gap = if rows == 2 {
+            (height - 2 * row_height).clamp(0, sc(5))
         } else {
-            sc(5)
+            0
         };
-        let row1_y = (height - 2 * appearance.row_height() - row_gap).max(0) / 2;
-        let row2_y = row1_y + appearance.row_height() + row_gap;
-        let single_row_y = (height - appearance.row_height()) / 2;
+        let mut row_y = ((height - rows * row_height - (rows - 1) * row_gap) / 2).max(0);
 
         let _ = SetBkMode(hdc, TRANSPARENT);
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-
         let font = create_widget_font(appearance);
         let old_font = SelectObject(hdc, font);
 
-        // One provider mark per column, centered across the visible quota rows.
-        let icon_size = sc(provider_icons::SIZE);
-        let icon_y = (height - icon_size) / 2;
-        let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+        let active_models = providers
+            .into_iter()
+            .filter(|visible| *visible)
+            .count()
+            .max(1) as i32;
+        let segment_count = row_bar_segment_count(active_models);
         let model_width =
-            model_usage_width(row_bar_segment_count(active_models), text_width, appearance)
-                + sc(MODEL_RIGHT_MARGIN);
-        let mut icon_x = content_x + label_width + sc(LABEL_RIGHT_MARGIN);
-        for (visible, provider) in [
-            (show_claude_code, Provider::Claude),
-            (show_codex, Provider::Codex),
-            (show_antigravity, Provider::Antigravity),
-        ] {
-            if visible && !appearance.hide_provider_logos {
-                if matches!(provider, Provider::Codex) {
-                    provider_icons::draw_codex(
-                        hdc,
-                        icon_x,
-                        icon_y,
-                        icon_size,
-                        appearance.codex_colors.icon_tint(is_dark),
-                    );
-                } else {
-                    provider_icons::draw(hdc, icon_x, icon_y, icon_size, provider);
+            model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
+        let model_left = content_x + label_width + sc(LABEL_RIGHT_MARGIN);
+        if !appearance.hide_provider_logos {
+            let size = sc(provider_icons::SIZE).min(height);
+            let mut icon_x = model_left;
+            for (provider, visible) in WIDGET_PROVIDERS.into_iter().zip(providers) {
+                if visible {
+                    provider_icons::draw(hdc, icon_x, (height - size) / 2, size, provider);
+                    icon_x += model_width;
                 }
-                icon_x += model_width;
             }
         }
 
-        if show_session_window {
-            draw_row(
+        let strings = language.strings();
+        let provider_text_colors = active_models > 1 && appearance.palette == Palette::System;
+        for (row, label) in [strings.session_window, strings.weekly_window]
+            .into_iter()
+            .enumerate()
+        {
+            if !visible_rows[row] {
+                continue;
+            }
+            let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+            let mut label_wide: Vec<u16> = label.encode_utf16().collect();
+            let _ = DrawTextW(
                 hdc,
-                content_x,
-                if show_weekly_window {
-                    row1_y
-                } else {
-                    single_row_y
+                &mut label_wide,
+                &mut RECT {
+                    left: content_x,
+                    top: row_y,
+                    right: content_x + label_width,
+                    bottom: row_y + row_height,
                 },
-                is_dark,
-                appearance,
-                text_color,
-                strings.session_window,
-                session_pct,
-                session_text,
-                codex_session_pct,
-                codex_session_text,
-                antigravity_session_pct,
-                antigravity_session_text,
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-                accent,
-                codex_accent,
-                antigravity_accent,
-                track,
-                label_width,
-                text_width,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
             );
-        }
-        if show_weekly_window {
-            draw_row(
-                hdc,
-                content_x,
-                if show_session_window {
-                    row2_y
-                } else {
-                    single_row_y
-                },
-                is_dark,
-                appearance,
-                text_color,
-                strings.weekly_window,
-                weekly_pct,
-                weekly_text,
-                codex_weekly_pct,
-                codex_weekly_text,
-                antigravity_weekly_pct,
-                antigravity_weekly_text,
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-                accent,
-                codex_accent,
-                antigravity_accent,
-                track,
-                label_width,
-                text_width,
-            );
+            let mut model_x = model_left + provider_mark_width(appearance);
+            for (column, provider) in WIDGET_PROVIDERS.into_iter().enumerate() {
+                if !providers[column] {
+                    continue;
+                }
+                let value_color = match provider {
+                    Provider::Codex => codex_brand_color(is_dark),
+                    Provider::Claude if provider_text_colors => claude_usage_text_color(is_dark),
+                    Provider::Antigravity if provider_text_colors => {
+                        antigravity_usage_text_color(is_dark)
+                    }
+                    _ => text_color,
+                };
+                let used = used[row][column];
+                draw_usage_bar(
+                    hdc,
+                    model_x,
+                    row_y,
+                    row_height,
+                    segment_count,
+                    mode.percentage(used),
+                    &text[row][column],
+                    &appearance.bar_color(provider, used, is_dark),
+                    &track,
+                    &value_color,
+                    text_width,
+                    is_dark,
+                    appearance,
+                );
+                model_x += model_width;
+            }
+            row_y += row_height + row_gap;
         }
 
         SelectObject(hdc, old_font);
@@ -3437,7 +3246,7 @@ fn position_at_taskbar() {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
-    let (hwnd, embedded, tray_offset, anchor_left, taskbar_hwnd, compact) = {
+    let (hwnd, embedded, tray_offset, anchor_left, taskbar_hwnd) = {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
@@ -3463,11 +3272,6 @@ fn position_at_taskbar() {
             s.tray_offset,
             s.anchor_left,
             taskbar_hwnd,
-            uses_compact_layout(
-                active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
-                s.language,
-                s.appearance,
-            ),
         )
     };
 
@@ -3510,8 +3314,8 @@ fn position_at_taskbar() {
         save_state_settings();
     }
 
-    let widget_height = preferred_widget_height().min(taskbar_height);
-    let y = compute_anchor_y(anchor_top, anchor_height, widget_height, compact);
+    let widget_height = sc(WIDGET_HEIGHT).min(taskbar_height);
+    let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
     if embedded {
         // Child window: coordinates relative to parent (taskbar)
         let x = compute_anchor_x(
@@ -3556,14 +3360,8 @@ fn compute_anchor_x(
     }
 }
 
-fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32, compact: bool) -> i32 {
-    let extra_height = (anchor_height - widget_height).max(0);
-    anchor_top
-        + if compact {
-            extra_height / 2
-        } else {
-            extra_height
-        }
+fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32) -> i32 {
+    anchor_top + (anchor_height - widget_height).max(0)
 }
 
 /// WinEvent callback for tray icon location changes
@@ -3858,19 +3656,8 @@ unsafe extern "system" fn wnd_proc(
                             let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
                             let anchor_top = taskbar_rect.top;
                             let anchor_height = taskbar_height;
-                            let widget_height =
-                                preferred_widget_height_for_state(s).min(taskbar_height);
-                            let compact = uses_compact_layout(
-                                active_model_count(
-                                    s.show_claude_code,
-                                    s.show_codex,
-                                    s.show_antigravity,
-                                ),
-                                s.language,
-                                s.appearance,
-                            );
-                            let y =
-                                compute_anchor_y(anchor_top, anchor_height, widget_height, compact);
+                            let widget_height = sc(WIDGET_HEIGHT).min(taskbar_height);
+                            let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
                             let x = if embedded {
                                 tray_left - taskbar_rect.left - widget_width - new_offset
                             } else {
@@ -4136,76 +3923,17 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     sync_tray_icons(hwnd);
                 }
-                IDM_SAVE_COLOR_PRESET => {
-                    save_current_color_preset(settings_window::dialog_owner(hwnd))
-                }
-                IDM_USER_PRESET_FIRST..=IDM_USER_PRESET_LAST => {
-                    {
-                        let mut state = lock_state();
-                        if let Some(s) = state.as_mut() {
-                            if let Some(colors) = s
-                                .color_presets
-                                .entries()
-                                .get((id - IDM_USER_PRESET_FIRST) as usize)
-                                .map(|entry| entry.colors)
-                            {
-                                s.appearance.codex_colors = colors;
-                            }
-                        }
+                IDM_THEME_SYSTEM | IDM_THEME_LIGHT | IDM_THEME_DARK => {
+                    let theme = match id {
+                        IDM_THEME_LIGHT => SettingsTheme::Light,
+                        IDM_THEME_DARK => SettingsTheme::Dark,
+                        _ => SettingsTheme::System,
+                    };
+                    if let Some(s) = lock_state().as_mut() {
+                        s.settings_theme = theme;
                     }
+                    settings_window::apply_menu_theme(theme);
                     save_state_settings();
-                    render_layered();
-                }
-                IDM_DELETE_PRESET_FIRST..=IDM_DELETE_PRESET_LAST => {
-                    delete_color_preset(
-                        settings_window::dialog_owner(hwnd),
-                        (id - IDM_DELETE_PRESET_FIRST) as usize,
-                    );
-                }
-                IDM_CODEX_ICON_COLOR | IDM_CODEX_BAR_COLOR | IDM_CODEX_PERCENT_COLOR => {
-                    let role = match id {
-                        IDM_CODEX_ICON_COLOR => ColorRole::Icon,
-                        IDM_CODEX_BAR_COLOR => ColorRole::Bar,
-                        _ => ColorRole::Percentage,
-                    };
-                    let initial = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| {
-                            s.appearance
-                                .codex_colors
-                                .color(role, s.appearance.is_dark(s.is_dark))
-                        })
-                    };
-                    // The native dialog runs a nested message loop: never hold STATE here.
-                    if let Some(initial) = initial {
-                        if let Some(color) = crate::color_picker::choose(
-                            settings_window::dialog_owner(hwnd),
-                            initial,
-                        ) {
-                            {
-                                let mut state = lock_state();
-                                if let Some(s) = state.as_mut() {
-                                    s.appearance.codex_colors.set(role, color);
-                                }
-                            }
-                            save_state_settings();
-                            render_layered();
-                        }
-                    }
-                }
-                IDM_CODEX_PRESET_FIRST..=IDM_CODEX_PRESET_LAST => {
-                    if let Some(preset) =
-                        ColorPreset::ALL.get((id - IDM_CODEX_PRESET_FIRST) as usize)
-                    {
-                        {
-                            let mut state = lock_state();
-                            if let Some(s) = state.as_mut() {
-                                s.appearance.codex_colors = CodexColors::from_preset(*preset);
-                            }
-                        }
-                        save_state_settings();
-                        render_layered();
-                    }
                 }
                 IDM_APPEARANCE_RECOMMENDED
                 | IDM_APPEARANCE_RESET
@@ -4214,13 +3942,19 @@ unsafe extern "system" fn wnd_proc(
                 | IDM_PALETTE_LIGHT
                 | IDM_BAR_CONTINUOUS
                 | IDM_BAR_SEGMENTED
-                | IDM_BAR_CLASSIC
-                | IDM_BAR_STANDARD
-                | IDM_BAR_SLIM
-                | IDM_FONT_STANDARD
-                | IDM_FONT_LARGE
-                | IDM_PROVIDER_LOGOS
-                | IDM_COMPACT_LAYOUT => {
+                | IDM_BAR_DOTS
+                | IDM_BAR_BATTERY
+                | IDM_BAR_MEDIUM
+                | IDM_BAR_THIN
+                | IDM_BAR_THICK
+                | IDM_FONT_12
+                | IDM_FONT_14
+                | IDM_FONT_16
+                | IDM_COLOR_BRAND
+                | IDM_COLOR_REMAINING
+                | IDM_COLOR_SINGLE
+                | IDM_SINGLE_COLOR_FIRST..=IDM_SINGLE_COLOR_LAST
+                | IDM_PROVIDER_LOGOS => {
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
@@ -4233,9 +3967,6 @@ unsafe extern "system" fn wnd_proc(
                                     s.appearance.hide_provider_logos =
                                         !s.appearance.hide_provider_logos
                                 }
-                                IDM_COMPACT_LAYOUT => {
-                                    s.appearance.compact_layout = !s.appearance.compact_layout
-                                }
                                 IDM_PALETTE_SYSTEM => s.appearance.palette = Palette::System,
                                 IDM_PALETTE_DARK => {
                                     s.appearance.palette = Palette::HighContrastDark
@@ -4245,15 +3976,23 @@ unsafe extern "system" fn wnd_proc(
                                 }
                                 IDM_BAR_CONTINUOUS => s.appearance.bar_style = BarStyle::Continuous,
                                 IDM_BAR_SEGMENTED => s.appearance.bar_style = BarStyle::Segmented,
-                                IDM_BAR_CLASSIC => {
-                                    s.appearance.bar_style = BarStyle::ClassicSegmented
+                                IDM_BAR_DOTS => s.appearance.bar_style = BarStyle::Dots,
+                                IDM_BAR_BATTERY => s.appearance.bar_style = BarStyle::Battery,
+                                IDM_BAR_MEDIUM => s.appearance.bar_thickness = BarThickness::Medium,
+                                IDM_BAR_THIN => s.appearance.bar_thickness = BarThickness::Thin,
+                                IDM_BAR_THICK => s.appearance.bar_thickness = BarThickness::Thick,
+                                IDM_FONT_12 => s.appearance.font_size = FontSize::Px12,
+                                IDM_FONT_14 => s.appearance.font_size = FontSize::Px14,
+                                IDM_FONT_16 => s.appearance.font_size = FontSize::Px16,
+                                IDM_COLOR_BRAND => s.appearance.color_mode = ColorMode::Brand,
+                                IDM_COLOR_REMAINING => {
+                                    s.appearance.color_mode = ColorMode::Remaining
                                 }
-                                IDM_BAR_STANDARD => {
-                                    s.appearance.bar_thickness = BarThickness::Standard
+                                IDM_COLOR_SINGLE => s.appearance.color_mode = ColorMode::Single,
+                                IDM_SINGLE_COLOR_FIRST..=IDM_SINGLE_COLOR_LAST => {
+                                    s.appearance.single_color =
+                                        SingleColor::ALL[(id - IDM_SINGLE_COLOR_FIRST) as usize];
                                 }
-                                IDM_BAR_SLIM => s.appearance.bar_thickness = BarThickness::Slim,
-                                IDM_FONT_STANDARD => s.appearance.font_size = FontSize::Standard,
-                                IDM_FONT_LARGE => s.appearance.font_size = FontSize::Large,
                                 _ => {}
                             }
                         }
@@ -4459,121 +4198,6 @@ fn select_settings_display(hwnd: HWND, target: HWND) {
     render_layered();
 }
 
-fn save_current_color_preset(hwnd: HWND) {
-    let snapshot = {
-        let state = lock_state();
-        state.as_ref().map(|s| {
-            (
-                s.appearance.codex_colors,
-                s.color_presets.clone(),
-                s.language == LanguageId::SimplifiedChinese,
-            )
-        })
-    };
-    let Some((colors, library, chinese)) = snapshot else {
-        return;
-    };
-    let initial = (1..=MAX_USER_PRESETS + 1)
-        .map(|index| {
-            if chinese {
-                format!("我的配色 {index}")
-            } else {
-                format!("Custom {index}")
-            }
-        })
-        .find(|name| library.find(name).is_none())
-        .unwrap_or_default();
-    // Both dialogs run nested message loops; all STATE guards must be released.
-    let Some(name) = crate::preset_dialog::prompt(hwnd, chinese, &initial) else {
-        return;
-    };
-    if library.find(&name).is_some() {
-        let question = if chinese {
-            format!("已存在预设“{name}”。是否用当前配色覆盖？")
-        } else {
-            format!("A preset named “{name}” already exists. Replace it with the current colors?")
-        };
-        if !confirm_preset_action(hwnd, chinese, &question) {
-            return;
-        }
-    }
-    let result = {
-        let mut state = lock_state();
-        state.as_mut().map(|s| s.color_presets.save(&name, colors))
-    };
-    if matches!(result, Some(Ok(()))) {
-        save_state_settings();
-    } else if matches!(result, Some(Err(_))) {
-        let text = native_interop::wide_str(if chinese {
-            "无法保存：名称须为 1–40 个字符，最多保存 32 个预设。请删除不需要的预设后再试。"
-        } else {
-            "Unable to save. Use a name of 1–40 characters; up to 32 presets can be saved. Delete an unused preset and try again."
-        });
-        let title = native_interop::wide_str(if chinese {
-            "配色预设"
-        } else {
-            "Color presets"
-        });
-        unsafe {
-            MessageBoxW(
-                hwnd,
-                PCWSTR(text.as_ptr()),
-                PCWSTR(title.as_ptr()),
-                MB_OK | MB_ICONINFORMATION,
-            );
-        }
-    }
-}
-
-fn confirm_preset_action(hwnd: HWND, chinese: bool, question: &str) -> bool {
-    let title = native_interop::wide_str(if chinese {
-        "配色预设"
-    } else {
-        "Color presets"
-    });
-    let question = native_interop::wide_str(question);
-    unsafe {
-        MessageBoxW(
-            hwnd,
-            PCWSTR(question.as_ptr()),
-            PCWSTR(title.as_ptr()),
-            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
-        ) == IDYES
-    }
-}
-
-fn delete_color_preset(hwnd: HWND, index: usize) {
-    let snapshot = {
-        let state = lock_state();
-        state.as_ref().and_then(|s| {
-            s.color_presets.entries().get(index).map(|entry| {
-                (
-                    entry.name.clone(),
-                    s.language == LanguageId::SimplifiedChinese,
-                )
-            })
-        })
-    };
-    let Some((name, chinese)) = snapshot else {
-        return;
-    };
-    let question = if chinese {
-        format!("删除预设“{name}”？当前显示的配色不会改变。")
-    } else {
-        format!("Delete the preset “{name}”? The current colors will not change.")
-    };
-    if !confirm_preset_action(hwnd, chinese, &question) {
-        return;
-    }
-    {
-        let mut state = lock_state();
-        if let Some(s) = state.as_mut() {
-            s.color_presets.remove(index);
-        }
-    }
-    save_state_settings();
-}
-
 fn show_context_menu(hwnd: HWND) {
     let (strings, widget_visible) = {
         let state = lock_state();
@@ -4624,68 +4248,11 @@ fn show_context_menu(hwnd: HWND) {
 
 /// Paint for non-embedded fallback (normal WM_PAINT path)
 fn paint(hdc: HDC, hwnd: HWND) {
-    let (
-        is_dark,
-        appearance,
-        language,
-        strings,
-        session_pct,
-        session_text,
-        weekly_pct,
-        weekly_text,
-        codex_session_pct,
-        codex_session_text,
-        codex_weekly_pct,
-        codex_weekly_text,
-        antigravity_session_pct,
-        antigravity_session_text,
-        antigravity_weekly_pct,
-        antigravity_weekly_text,
-        show_claude_code,
-        show_codex,
-        show_antigravity,
-        show_session_window,
-        show_weekly_window,
-    ) = {
+    let content = {
         let state = lock_state();
-        match state.as_ref() {
-            Some(s) => (
-                s.is_dark,
-                s.appearance,
-                s.language,
-                s.language.strings(),
-                s.quota_display_mode.percentage(s.session_percent),
-                s.session_text.clone(),
-                s.quota_display_mode.percentage(s.weekly_percent),
-                s.weekly_text.clone(),
-                s.quota_display_mode.percentage(s.codex_session_percent),
-                s.codex_session_text.clone(),
-                s.quota_display_mode.percentage(s.codex_weekly_percent),
-                s.codex_weekly_text.clone(),
-                s.quota_display_mode
-                    .percentage(s.antigravity_session_percent),
-                s.antigravity_session_text.clone(),
-                s.quota_display_mode
-                    .percentage(s.antigravity_weekly_percent),
-                s.antigravity_weekly_text.clone(),
-                s.show_claude_code,
-                s.show_codex,
-                s.show_antigravity,
-                s.show_session_window,
-                s.show_weekly_window,
-            ),
-            None => return,
-        }
+        let Some(s) = state.as_ref() else { return };
+        WidgetContent::from_state(s)
     };
-
-    let accent = claude_accent_color();
-    let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
-    let codex_accent = appearance
-        .codex_colors
-        .resolve(appearance.is_dark(is_dark))
-        .bar;
-    let antigravity_accent = antigravity_accent_color();
-
     unsafe {
         let mut client_rect = RECT::default();
         let _ = GetClientRect(hwnd, &mut client_rect);
@@ -4700,38 +4267,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         let mem_bmp = CreateCompatibleBitmap(hdc, width, height);
         let old_bmp = SelectObject(mem_dc, mem_bmp);
 
-        paint_content(
-            mem_dc,
-            width,
-            height,
-            is_dark,
-            appearance,
-            &bg_color,
-            &text_color,
-            &accent,
-            &track,
-            language,
-            strings,
-            session_pct,
-            &session_text,
-            weekly_pct,
-            &weekly_text,
-            codex_session_pct,
-            &codex_session_text,
-            codex_weekly_pct,
-            &codex_weekly_text,
-            antigravity_session_pct,
-            &antigravity_session_text,
-            antigravity_weekly_pct,
-            &antigravity_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            show_session_window,
-            show_weekly_window,
-            &codex_accent,
-            &antigravity_accent,
-        );
+        paint_content(mem_dc, width, height, &content);
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
 
@@ -4741,238 +4277,11 @@ fn paint(hdc: HDC, hwnd: HWND) {
     }
 }
 
-fn paint_compact_quota_rows(
-    hdc: HDC,
-    width: i32,
-    height: i32,
-    appearance: Appearance,
-    is_dark: bool,
-    text_color: &Color,
-    accent: &Color,
-    track: &Color,
-    session_percent: f64,
-    session_text: &str,
-    weekly_percent: f64,
-    weekly_text: &str,
-    show_session: bool,
-    show_weekly: bool,
-) {
-    let rows = show_session as i32 + show_weekly as i32;
-    let (row_height, text_height, bar_height, inset) = compact_row_geometry(height, rows);
-    let secondary = reset_text_color(appearance, is_dark);
-    let content_right = width - sc(12);
-    unsafe {
-        let _ = SetBkMode(hdc, TRANSPARENT);
-        let font = create_widget_font(appearance);
-        let reset_font = quota_text::create_reset_font(sc(appearance.font_px() - 1));
-        let old_font = SelectObject(hdc, font);
-        let mut row = 0;
-        for (visible, label, percent, value) in [
-            (show_session, "5h", session_percent, session_text),
-            (show_weekly, "7d", weekly_percent, weekly_text),
-        ] {
-            if !visible {
-                continue;
-            }
-            let y = row * row_height + inset;
-            let draw_text = |left: i32, right: i32, text: &str, color: &Color, flags| {
-                // No reset text is available during startup or an auth error.
-                // DrawTextW may inspect its buffer even when the count is zero.
-                if text.is_empty() {
-                    return;
-                }
-                let mut wide: Vec<u16> = text.encode_utf16().collect();
-                let mut rect = RECT {
-                    left,
-                    top: y,
-                    right,
-                    bottom: y + text_height,
-                };
-                let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
-                let _ = DrawTextW(
-                    hdc,
-                    &mut wide,
-                    &mut rect,
-                    DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | flags,
-                );
-            };
-            SelectObject(hdc, font);
-            draw_text(sc(12), sc(32), label, text_color, DT_LEFT);
-            let (percentage, reset) = quota_text::parts(value);
-            SelectObject(hdc, font);
-            let measure = |value: &str| {
-                let wide: Vec<u16> = value.encode_utf16().collect();
-                let mut size = SIZE::default();
-                if !wide.is_empty() {
-                    let _ = GetTextExtentPoint32W(hdc, &wide, &mut size);
-                }
-                size.cx
-            };
-            // Equal visible gaps, rather than a right-aligned three-digit slot.
-            let percentage_x = sc(12) + measure(label) + sc(8);
-            let reset_x = percentage_x + measure(percentage) + sc(8);
-            draw_text(percentage_x, reset_x - sc(8), percentage, accent, DT_LEFT);
-            SelectObject(hdc, reset_font);
-            // Include a small space before the suffix as in the approved SVG.
-            let reset = reset.replace("重置", " 重置");
-            draw_text(reset_x, width - sc(12), &reset, &secondary, DT_LEFT);
-
-            let gap = sc(3).min((row_height - text_height - bar_height).max(0));
-            let bar_y = y + text_height + gap;
-            let bar = RECT {
-                left: sc(12),
-                top: bar_y,
-                right: content_right,
-                bottom: bar_y + bar_height,
-            };
-            let fill = usage_bar_fill_percentage(percent, value) / 100.0;
-            if appearance.bar_style == BarStyle::Segmented {
-                let segment_width = (bar.right - bar.left) as f64 / 10.0;
-                for segment in 0..10 {
-                    let rect = RECT {
-                        left: bar.left + (segment_width * segment as f64).round() as i32,
-                        right: bar.left + (segment_width * (segment + 1) as f64).round() as i32
-                            - sc(1),
-                        ..bar
-                    };
-                    draw_rounded_rect(hdc, &rect, track, bar_height / 2);
-                    fill_rounded_bar(
-                        hdc,
-                        &rect,
-                        (fill * 10.0 - segment as f64).clamp(0.0, 1.0),
-                        accent,
-                        bar_height / 2,
-                    );
-                }
-            } else {
-                draw_rounded_rect(hdc, &bar, track, bar_height / 2);
-                fill_rounded_bar(hdc, &bar, fill, accent, bar_height / 2);
-            }
-            row += 1;
-        }
-        SelectObject(hdc, old_font);
-        let _ = DeleteObject(font);
-        let _ = DeleteObject(reset_font);
-    }
-}
-
-fn draw_row(
-    hdc: HDC,
-    x: i32,
-    y: i32,
-    is_dark: bool,
-    appearance: Appearance,
-    text_color: &Color,
-    label: &str,
-    claude_percent: f64,
-    claude_text: &str,
-    codex_percent: f64,
-    codex_text: &str,
-    antigravity_percent: f64,
-    antigravity_text: &str,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    claude_accent: &Color,
-    codex_accent: &Color,
-    antigravity_accent: &Color,
-    track: &Color,
-    label_width: i32,
-    text_width: i32,
-) {
-    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
-    let segment_count = row_bar_segment_count(active_models);
-    let use_model_text_colors = active_models > 1 && appearance.palette == Palette::System;
-    let is_dark = appearance.is_dark(is_dark);
-    let claude_value_color = if use_model_text_colors {
-        claude_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-    let codex_value_color = appearance.codex_colors.resolve(is_dark).percentage;
-    let antigravity_value_color = if use_model_text_colors {
-        antigravity_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-
-    unsafe {
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let mut label_wide: Vec<u16> = label.encode_utf16().collect();
-        let mut label_rect = RECT {
-            left: x,
-            top: y,
-            right: x + label_width,
-            bottom: y + appearance.row_height(),
-        };
-        let _ = DrawTextW(
-            hdc,
-            &mut label_wide,
-            &mut label_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-        );
-
-        let mut model_x = x + label_width + sc(LABEL_RIGHT_MARGIN);
-        if show_claude_code {
-            draw_usage_bar(
-                hdc,
-                model_x + provider_mark_width(appearance),
-                y,
-                segment_count,
-                claude_percent,
-                claude_text,
-                claude_accent,
-                track,
-                &claude_value_color,
-                text_width,
-                is_dark,
-                appearance,
-            );
-            model_x +=
-                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_codex {
-            draw_usage_bar(
-                hdc,
-                model_x + provider_mark_width(appearance),
-                y,
-                segment_count,
-                codex_percent,
-                codex_text,
-                codex_accent,
-                track,
-                &codex_value_color,
-                text_width,
-                is_dark,
-                appearance,
-            );
-            model_x +=
-                model_usage_width(segment_count, text_width, appearance) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_antigravity {
-            draw_usage_bar(
-                hdc,
-                model_x + provider_mark_width(appearance),
-                y,
-                segment_count,
-                antigravity_percent,
-                antigravity_text,
-                antigravity_accent,
-                track,
-                &antigravity_value_color,
-                text_width,
-                is_dark,
-                appearance,
-            );
-        }
-    }
-}
-
 fn segment_width(segment_count: i32) -> i32 {
     sc(if segment_count == SEGMENT_COUNT {
         SEGMENT_W
     } else {
-        COMPACT_SEGMENT_W
+        MULTI_PROVIDER_SEGMENT_W
     })
 }
 
@@ -5007,6 +4316,7 @@ fn draw_usage_bar(
     hdc: HDC,
     bar_x: i32,
     y: i32,
+    row_height: i32,
     segment_count: i32,
     percent: f64,
     text: &str,
@@ -5017,43 +4327,67 @@ fn draw_usage_bar(
     is_dark: bool,
     appearance: Appearance,
 ) {
-    let seg_w = segment_width(segment_count);
-    let seg_h = appearance.bar_height();
-    let seg_gap = sc(SEGMENT_GAP);
+    let bar_height = appearance.bar_height(row_height);
     let bar_width = usage_bar_width(segment_count);
-    let corner_r = if appearance.bar_style == BarStyle::ClassicSegmented {
-        sc(2)
-    } else {
-        seg_h / 2
+    let bar_y = y + (row_height - bar_height) / 2;
+    let rect = RECT {
+        left: bar_x,
+        top: bar_y,
+        right: bar_x + bar_width,
+        bottom: bar_y + bar_height,
     };
-    let bar_y = y + (appearance.row_height() - seg_h) / 2;
-
-    let percent_clamped = usage_bar_fill_percentage(percent, text);
-    if matches!(
-        appearance.bar_style,
-        BarStyle::Segmented | BarStyle::ClassicSegmented
-    ) {
-        for i in 0..segment_count {
-            let rect = RECT {
-                left: bar_x + i * (seg_w + seg_gap),
-                top: bar_y,
-                right: bar_x + i * (seg_w + seg_gap) + seg_w,
-                bottom: bar_y + seg_h,
-            };
-            draw_rounded_rect(hdc, &rect, track, corner_r);
-            let fraction =
-                (percent_clamped * segment_count as f64 / 100.0 - i as f64).clamp(0.0, 1.0);
-            fill_rounded_bar(hdc, &rect, fraction, accent, corner_r);
+    let ratio = usage_bar_fill_percentage(percent, text) / 100.0;
+    let radius = bar_height / 2;
+    match appearance.bar_style {
+        BarStyle::Continuous => {
+            draw_rounded_rect(hdc, &rect, track, radius);
+            fill_rounded_bar(hdc, &rect, ratio, accent, radius);
         }
-    } else {
-        let rect = RECT {
-            left: bar_x,
-            top: bar_y,
-            right: bar_x + bar_width,
-            bottom: bar_y + seg_h,
-        };
-        draw_rounded_rect(hdc, &rect, track, corner_r);
-        fill_rounded_bar(hdc, &rect, percent_clamped / 100.0, accent, corner_r);
+        BarStyle::Segmented => {
+            let width = segment_width(segment_count);
+            for i in 0..segment_count {
+                let left = bar_x + i * (width + sc(SEGMENT_GAP));
+                let segment = RECT {
+                    left,
+                    right: left + width,
+                    ..rect
+                };
+                // Square-ish corners keep segments distinct from the dot style.
+                let radius = sc(2).min(bar_height / 2).min(width / 2);
+                draw_rounded_rect(hdc, &segment, track, radius);
+                let fraction = (ratio * f64::from(segment_count) - f64::from(i)).clamp(0.0, 1.0);
+                fill_rounded_bar(hdc, &segment, fraction, accent, radius);
+            }
+        }
+        BarStyle::Dots => {
+            let diameter = drawn_bar_height(appearance, row_height);
+            let rect = RECT {
+                top: y + (row_height - diameter) / 2,
+                bottom: y + (row_height - diameter) / 2 + diameter,
+                ..rect
+            };
+            let count = bar_dot_count(bar_width, diameter, segment_count);
+            let lit = (ratio * f64::from(count)).round() as i32;
+            for i in 0..count {
+                let left = bar_x + i * (bar_width - diameter) / (count - 1);
+                let dot = RECT {
+                    left,
+                    right: left + diameter,
+                    ..rect
+                };
+                draw_ellipse(hdc, &dot, if i < lit { accent } else { track });
+            }
+        }
+        BarStyle::Battery => {
+            let height = drawn_bar_height(appearance, row_height);
+            let top = y + (row_height - height) / 2;
+            let rect = RECT {
+                top,
+                bottom: top + height,
+                ..rect
+            };
+            draw_battery(hdc, rect, ratio, accent, track, is_dark)
+        }
     }
 
     let text_x = bar_x + bar_width + sc(BAR_RIGHT_MARGIN);
@@ -5061,7 +4395,7 @@ fn draw_usage_bar(
         hdc,
         text_x,
         y,
-        appearance.row_height(),
+        row_height,
         text_width,
         text,
         text_color,
@@ -5069,6 +4403,74 @@ fn draw_usage_bar(
         appearance.font_px(),
         sc,
     );
+}
+
+/// Height the bar style actually paints. Thin dots read as noise, so they keep
+/// at least 6 px; a battery is 4 px taller so its outline and fill both show.
+fn drawn_bar_height(appearance: Appearance, row_height: i32) -> i32 {
+    let bar_height = appearance.bar_height(row_height);
+    let height = match appearance.bar_style {
+        BarStyle::Dots => bar_height.max(sc(6)),
+        BarStyle::Battery => bar_height + sc(4),
+        BarStyle::Continuous | BarStyle::Segmented => bar_height,
+    };
+    height.min((row_height - sc(2)).max(1))
+}
+
+fn bar_dot_count(width: i32, diameter: i32, segment_count: i32) -> i32 {
+    let gap = sc(1);
+    ((width + gap) / (diameter + gap)).clamp(2, segment_count)
+}
+
+// GDI regions exclude the bottom and right pixels from their supplied bounds.
+fn draw_ellipse(hdc: HDC, rect: &RECT, color: &Color) {
+    unsafe {
+        let region = CreateEllipticRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1);
+        let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
+        let _ = FillRgn(hdc, region, brush);
+        let _ = DeleteObject(brush);
+        let _ = DeleteObject(region);
+    }
+}
+
+fn draw_battery(hdc: HDC, rect: RECT, ratio: f64, accent: &Color, track: &Color, dark: bool) {
+    let edge = sc(1);
+    let height = rect.bottom - rect.top;
+    let terminal_height = (height / 2).max(1);
+    let terminal_y = rect.top + (height - terminal_height) / 2;
+    let body = RECT {
+        right: rect.right - sc(3),
+        ..rect
+    };
+    let terminal = RECT {
+        left: body.right - edge,
+        top: terminal_y,
+        bottom: terminal_y + terminal_height,
+        ..rect
+    };
+    let border = Color::from_hex(if dark { "#8A9099" } else { "#626C7A" });
+    draw_rounded_rect(hdc, &body, &border, sc(2));
+    unsafe {
+        let brush = CreateSolidBrush(COLORREF(border.to_colorref()));
+        FillRect(hdc, &terminal, brush);
+        let _ = DeleteObject(brush);
+    }
+    let inside = RECT {
+        left: body.left + edge,
+        top: body.top + edge,
+        right: body.right - edge,
+        bottom: body.bottom - edge,
+    };
+    draw_rounded_rect(hdc, &inside, track, edge);
+    // Preserve a visible fill even at 4 px, where the outline uses two pixels.
+    let vertical_gap = ((height - 2 * edge - 1) / 2).clamp(0, edge);
+    let fill = RECT {
+        left: inside.left + edge,
+        top: inside.top + vertical_gap,
+        right: inside.right - edge,
+        bottom: inside.bottom - vertical_gap,
+    };
+    fill_rounded_bar(hdc, &fill, ratio, accent, 0);
 }
 
 fn fill_rounded_bar(hdc: HDC, rect: &RECT, fraction: f64, color: &Color, radius: i32) {
@@ -5085,7 +4487,8 @@ fn fill_rounded_bar(hdc: HDC, rect: &RECT, fraction: f64, color: &Color, radius:
             radius * 2,
             radius * 2,
         );
-        let _ = SelectClipRgn(hdc, clip);
+        let saved = SaveDC(hdc);
+        let _ = ExtSelectClipRgn(hdc, clip, RGN_AND);
         let fill = RECT {
             right: rect.left + width,
             ..*rect
@@ -5093,7 +4496,7 @@ fn fill_rounded_bar(hdc: HDC, rect: &RECT, fraction: f64, color: &Color, radius:
         let brush = CreateSolidBrush(COLORREF(color.to_colorref()));
         FillRect(hdc, &fill, brush);
         let _ = DeleteObject(brush);
-        let _ = SelectClipRgn(hdc, HRGN::default());
+        let _ = RestoreDC(hdc, saved);
         let _ = DeleteObject(clip);
     }
 }
@@ -5115,7 +4518,6 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
     }
 }
 
-#[cfg(test)]
 #[path = "appearance_preview.rs"]
 mod appearance_preview;
 
@@ -5132,160 +4534,90 @@ mod tests {
     }
 
     #[test]
-    fn legacy_appearance_keeps_its_style_and_default_codex_colors() {
-        let settings: SettingsFile = serde_json::from_str(
-            r#"{"tray_offset":321,"appearance":{"bar_style":"segmented","font_size":"large"}}"#,
-        )
-        .unwrap();
-        assert_eq!(settings.tray_offset, 321);
-        assert_eq!(settings.appearance.bar_style, BarStyle::Segmented);
-        assert_eq!(settings.appearance.codex_colors, CodexColors::default());
-        assert!(settings.color_presets.entries().is_empty());
-        let mut saved = UserPresets::default();
-        saved
-            .save("Evening rose", CodexColors::from_preset(ColorPreset::Rose))
-            .unwrap();
-        let customized = SettingsFile {
-            color_presets: saved,
-            appearance: Appearance {
-                bar_style: BarStyle::ClassicSegmented,
-                codex_colors: CodexColors::from_preset(ColorPreset::Clay),
-                ..Appearance::default()
-            },
-            ..settings
-        };
-        let json = serde_json::to_string(&customized).unwrap();
-        let restored: SettingsFile = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.appearance, customized.appearance);
-        assert_eq!(restored.color_presets, customized.color_presets);
-        assert_eq!(restored.tray_offset, 321);
+    fn old_appearance_loads_without_losing_other_settings() {
+        for (font, thickness, expected_font, expected_thickness) in [
+            ("standard", "slim", FontSize::Px12, BarThickness::Thin),
+            ("large", "standard", FontSize::Px14, BarThickness::Medium),
+        ] {
+            let old = serde_json::json!({
+                "tray_offset": 321, "language": "it", "show_codex": false,
+                "quota_display_mode": "used", "color_presets": [{"name":"Old"}],
+                "appearance": {"font_size":font, "bar_thickness":thickness,
+                     "bar_style":"classic_segmented", "compact_layout":true,
+                     "hide_provider_logos":true, "codex_colors":{"bar":"#112233"}}
+            });
+            let settings: SettingsFile = serde_json::from_value(old).unwrap();
+            assert_eq!(settings.appearance.bar_style, BarStyle::Segmented);
+            assert_eq!(settings.appearance.font_size, expected_font);
+            assert_eq!(settings.appearance.bar_thickness, expected_thickness);
+            assert_eq!(settings.appearance.color_mode, ColorMode::Brand);
+            assert!(settings.appearance.hide_provider_logos);
+            assert_eq!(settings.tray_offset, 321);
+            assert_eq!(settings.language.as_deref(), Some("it"));
+            assert!(!settings.show_codex);
+            assert_eq!(settings.quota_display_mode, Some(QuotaDisplayMode::Used));
+            assert_eq!(settings.settings_theme, SettingsTheme::System);
+            let saved = serde_json::to_value(settings).unwrap();
+            assert!(saved.get("color_presets").is_none());
+            assert!(saved["appearance"].get("compact_layout").is_none());
+            assert!(saved["appearance"].get("codex_colors").is_none());
+        }
     }
 
     #[test]
-    fn compact_layout_is_opt_in_and_preserved_for_supported_selections() {
-        let mut appearance: Appearance = serde_json::from_str("{}").unwrap();
-        assert!(!appearance.compact_layout);
-        assert!(!uses_compact_layout(
-            1,
-            LanguageId::SimplifiedChinese,
-            appearance
-        ));
-        assert_eq!(
-            preferred_widget_height_for(1, LanguageId::SimplifiedChinese, true, true, appearance),
-            WIDGET_HEIGHT
-        );
-
-        appearance.compact_layout = true;
-        let restored: Appearance =
-            serde_json::from_str(&serde_json::to_string(&appearance).unwrap()).unwrap();
-        assert!(uses_compact_layout(
-            1,
-            LanguageId::SimplifiedChinese,
-            restored
-        ));
-        assert!(!uses_compact_layout(
-            2,
-            LanguageId::SimplifiedChinese,
-            restored
-        ));
-        assert!(!uses_compact_layout(1, LanguageId::English, restored));
-        assert_eq!(
-            preferred_widget_height_for(1, LanguageId::SimplifiedChinese, true, false, restored),
-            32
-        );
-        assert_eq!(
-            preferred_widget_height_for(1, LanguageId::SimplifiedChinese, true, true, restored),
-            64
-        );
-        assert_eq!(
-            preferred_widget_height_for(2, LanguageId::SimplifiedChinese, true, true, restored),
-            WIDGET_HEIGHT
-        );
-    }
-
-    #[test]
-    fn compact_width_uses_only_visible_text_and_reserves_status_markers() {
-        for font_size in [FontSize::Standard, FontSize::Large] {
+    fn remaining_color_uses_inclusive_yellow_bounds_in_both_palettes() {
+        for dark in [false, true] {
+            let green = remaining_bar_color(75.0, dark).to_colorref();
+            let yellow = remaining_bar_color(35.0, dark).to_colorref();
+            let red = remaining_bar_color(5.0, dark).to_colorref();
+            assert_ne!(green, yellow);
+            assert_ne!(yellow, red);
             let appearance = Appearance {
-                font_size,
-                compact_layout: true,
+                color_mode: ColorMode::Remaining,
                 ..Appearance::default()
             };
-            let session = "8% 18:30重置";
-            let weekly = "100% 12/31重置 *";
-            let single = compact_measured_width(appearance, session, weekly, true, false);
-            let weekly_only = compact_measured_width(appearance, session, weekly, false, true);
-            assert!(weekly_only > single);
-            assert_eq!(
-                single,
-                compact_measured_width(appearance, session, "", true, false)
-            );
-            assert_eq!(
-                weekly_only,
-                compact_measured_width(appearance, session, weekly, true, true)
-            );
-            assert!(compact_measured_width(appearance, "--", "--", true, true) < single);
-        }
-    }
-
-    #[test]
-    fn widget_is_centered_for_single_and_double_quota_rows() {
-        for (top, available, widget) in [(1704, 96, 64), (1704, 96, 96), (0, 48, 32), (-48, 48, 32)]
-        {
-            let y = compute_anchor_y(top, available, widget, true);
-            assert_eq!(y - top, top + available - y - widget);
-        }
-        assert_eq!(compute_anchor_y(100, 48, 64, true), 100);
-        assert_eq!(compute_anchor_y(100, 48, 32, false), 116);
-    }
-
-    #[test]
-    fn compact_startup_and_error_states_render_without_reset_text() {
-        unsafe {
-            let dc = CreateCompatibleDC(HDC::default());
-            assert!(!dc.is_invalid());
-            let appearance = Appearance::default();
-            let (_, text, track) = appearance_colors(appearance, false);
-            let accent = appearance.codex_colors.resolve(false).bar;
-            for value in ["--", "", "网络", "100%"] {
-                paint_compact_quota_rows(
-                    dc,
-                    sc(192),
-                    sc(48),
-                    appearance,
-                    false,
-                    &text,
-                    &accent,
-                    &track,
-                    0.0,
-                    value,
-                    0.0,
-                    value,
-                    true,
-                    true,
-                );
-            }
-            let _ = DeleteDC(dc);
-        }
-    }
-
-    #[test]
-    fn compact_rows_fit_short_taskbars_with_both_windows_visible() {
-        for dpi in [96, 120, 144, 192] {
-            let scale = |px: i32| (px as f64 * dpi as f64 / 96.0).round() as i32;
-            for height in [32, 40, 48, 64] {
-                for rows in [1, 2] {
-                    let height = scale(height);
-                    let (row_height, text_height, bar_height, inset) =
-                        compact_row_geometry_scaled(height, rows, scale);
-                    let gap = scale(3).min((row_height - text_height - bar_height).max(0));
-                    assert!(bar_height > 0);
-                    assert!(text_height >= scale(12));
-                    assert!(inset + text_height + gap + bar_height <= row_height);
-                    assert!(row_height * rows <= height);
+            for (remaining, expected) in
+                [(50.01, green), (50.0, yellow), (20.0, yellow), (19.99, red)]
+            {
+                assert_eq!(remaining_bar_color(remaining, dark).to_colorref(), expected);
+                for provider in [Provider::Claude, Provider::Codex, Provider::Antigravity] {
+                    assert_eq!(
+                        appearance
+                            .bar_color(provider, 100.0 - remaining, dark)
+                            .to_colorref(),
+                        expected
+                    );
                 }
             }
         }
+    }
+
+    #[test]
+    fn font_size_steps_down_only_when_needed() {
+        for dpi in [96, 120, 144, 192] {
+            let scale = |px| ((px * dpi + 48) / 96) as i32;
+            for (height, rows, selected, expected) in [
+                (46, 2, FontSize::Px16, FontSize::Px16),
+                (42, 2, FontSize::Px16, FontSize::Px14),
+                (40, 2, FontSize::Px16, FontSize::Px14),
+                (38, 2, FontSize::Px16, FontSize::Px12),
+                (38, 2, FontSize::Px14, FontSize::Px12),
+                (24, 1, FontSize::Px16, FontSize::Px16),
+                (46, 2, FontSize::Px12, FontSize::Px12),
+            ] {
+                assert_eq!(
+                    selected.fit(scale(height), rows, scale),
+                    expected,
+                    "{dpi} DPI, height {height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn widget_stays_anchored_to_the_bottom_of_the_taskbar() {
+        assert_eq!(compute_anchor_y(100, 48, 32), 116);
+        assert_eq!(compute_anchor_y(100, 48, 64), 100);
     }
 
     #[test]
@@ -5312,10 +4644,12 @@ mod tests {
             };
             for language in LanguageId::ALL {
                 for (palette, font_size) in [
-                    (Palette::System, FontSize::Standard),
-                    (Palette::System, FontSize::Large),
-                    (Palette::HighContrastDark, FontSize::Standard),
-                    (Palette::HighContrastDark, FontSize::Large),
+                    (Palette::System, FontSize::Px12),
+                    (Palette::System, FontSize::Px14),
+                    (Palette::System, FontSize::Px16),
+                    (Palette::HighContrastDark, FontSize::Px12),
+                    (Palette::HighContrastDark, FontSize::Px14),
+                    (Palette::HighContrastDark, FontSize::Px16),
                 ] {
                     let appearance = Appearance {
                         palette,
@@ -5702,8 +5036,8 @@ mod tests {
             ..original
         };
         let regular = total_widget_width_for(2, LanguageId::SimplifiedChinese, original);
-        let compact = total_widget_width_for(2, LanguageId::SimplifiedChinese, hidden);
-        assert_eq!(regular - compact, 2 * provider_mark_width(original));
+        let without_logos = total_widget_width_for(2, LanguageId::SimplifiedChinese, hidden);
+        assert_eq!(regular - without_logos, 2 * provider_mark_width(original));
         assert_eq!(provider_mark_width(hidden), 0);
     }
 
