@@ -57,5 +57,10 @@ fn main() {
     if diagnose_enabled {
         diagnose::log("entering window::run");
     }
+    // No window takes text input. Without this, focusing Settings loads the
+    // user's input method (often with Direct2D and ~10 threads) for good.
+    unsafe {
+        let _ = windows::Win32::UI::Input::Ime::ImmDisableIME(u32::MAX);
+    }
     window::run();
 }

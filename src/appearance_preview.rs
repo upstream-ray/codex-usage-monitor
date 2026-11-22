@@ -30,52 +30,20 @@ fn sample(
     }
 }
 
-pub(super) unsafe fn draw(
+pub(super) fn paint_sample(
     dc: HDC,
-    area: RECT,
+    width: i32,
+    height: i32,
     appearance: Appearance,
     system_dark: bool,
     language: LanguageId,
 ) {
-    let width = total_widget_width_for(3, language, appearance);
-    let height = sc(WIDGET_HEIGHT);
-    let available = area.right - area.left;
-    if available <= 0 {
-        return;
-    }
-    let target_width = width.min(available);
-    let target_height = height * target_width / width;
-    let left = area.left + (available - target_width) / 2;
-    let top = area.top + (area.bottom - area.top - target_height) / 2;
-    let memory = CreateCompatibleDC(dc);
-    let bitmap = CreateCompatibleBitmap(dc, width, height);
-    if !memory.is_invalid() && !bitmap.is_invalid() {
-        let previous = SelectObject(memory, bitmap);
-        paint_content(
-            memory,
-            width,
-            height,
-            &sample(appearance, system_dark, language),
-        );
-        let mode = SetStretchBltMode(dc, HALFTONE);
-        let _ = StretchBlt(
-            dc,
-            left,
-            top,
-            target_width,
-            target_height,
-            memory,
-            0,
-            0,
-            width,
-            height,
-            SRCCOPY,
-        );
-        let _ = SetStretchBltMode(dc, STRETCH_BLT_MODE(mode));
-        SelectObject(memory, previous);
-    }
-    let _ = DeleteObject(bitmap);
-    let _ = DeleteDC(memory);
+    paint_content(
+        dc,
+        width,
+        height,
+        &sample(appearance, system_dark, language),
+    );
 }
 
 #[cfg(test)]

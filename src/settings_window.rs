@@ -11,10 +11,10 @@ use std::collections::VecDeque;
 use std::sync::OnceLock;
 use windows::core::{w, PCSTR};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DwmFlush, DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
 };
-use windows::Win32::Graphics::GdiPlus as gp;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::System::Threading::Sleep;
 use windows::Win32::UI::Controls::{
     SetScrollInfo, SetWindowTheme, CDDS_PREPAINT, CDIS_DISABLED, CDIS_FOCUS, CDIS_HOT,
     CDIS_SELECTED, CDIS_SHOWKEYBOARDCUES, CDRF_DODEFAULT, CDRF_SKIPDEFAULT, DRAWITEMSTRUCT,
@@ -25,16 +25,21 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 
+#[path = "settings_raster.rs"]
+mod raster;
+use raster::opaque;
+
 const CLASS: PCWSTR = w!("CodexUsageSettings");
+const OVERLAY_CLASS: PCWSTR = w!("CodexUsageSettingsTransition");
 const NAV: u16 = 990;
 const FIRST_FIELD: u16 = 1000;
 const FIELDS_PER_ROW: u16 = 4;
 const REFRESH_TIMER: usize = 1;
-const ANIMATION_TIMER: usize = 2;
 const SWITCH_DURATION: Duration = Duration::from_millis(150);
 const PAGE_DURATION: Duration = Duration::from_millis(180);
 const APPLY_SELECTION: u32 = WM_APP + 1;
 const ENSURE_VISIBLE: u32 = WM_APP + 2;
+const PLAY_ANIMATIONS: u32 = WM_APP + 3;
 const SUBCLASS_ID: usize = 1;
 
 // Layout in 96-DPI pixels.
@@ -173,6 +178,16 @@ impl Row {
             Self::Check { .. } | Self::Choice { .. } => 1,
             Self::Action { buttons, .. } => buttons.len(),
             Self::Section(_) | Self::Note(_) | Self::Preview { .. } => 0,
+        }
+    }
+
+    fn control_enabled(&self, column: usize) -> bool {
+        match self {
+            Self::Check { enabled, .. } | Self::Choice { enabled, .. } => *enabled,
+            Self::Action { buttons, .. } => buttons
+                .get(column)
+                .is_some_and(|button| button.action.is_some()),
+            _ => false,
         }
     }
 }
@@ -1101,131 +1116,6 @@ unsafe fn font_installed(face: PCWSTR) -> bool {
     actual.eq_ignore_ascii_case(&face.to_string().unwrap_or_default())
 }
 
-fn gdiplus_ready() -> bool {
-    static READY: OnceLock<bool> = OnceLock::new();
-    *READY.get_or_init(|| unsafe {
-        let mut token = 0usize;
-        let input = gp::GdiplusStartupInput {
-            GdiplusVersion: 1,
-            ..Default::default()
-        };
-        gp::GdiplusStartup(&mut token, &input, std::ptr::null_mut()) == gp::Ok
-    })
-}
-
-/// Anti-aliased shapes. Text is drawn with GDI after the canvas is dropped.
-struct Canvas(*mut gp::GpGraphics);
-
-impl Canvas {
-    unsafe fn new(dc: HDC) -> Option<Self> {
-        if !gdiplus_ready() {
-            return None;
-        }
-        let mut graphics = std::ptr::null_mut();
-        if gp::GdipCreateFromHDC(dc, &mut graphics) != gp::Ok {
-            return None;
-        }
-        gp::GdipSetSmoothingMode(graphics, gp::SmoothingModeAntiAlias);
-        gp::GdipSetPixelOffsetMode(graphics, gp::PixelOffsetModeHalf);
-        Some(Self(graphics))
-    }
-
-    unsafe fn rounded(x: f32, y: f32, width: f32, height: f32, radius: f32) -> *mut gp::GpPath {
-        let mut path = std::ptr::null_mut();
-        gp::GdipCreatePath(gp::FillModeAlternate, &mut path);
-        let diameter = (radius * 2.0).min(width).min(height).max(0.1);
-        gp::GdipAddPathArc(path, x, y, diameter, diameter, 180.0, 90.0);
-        gp::GdipAddPathArc(
-            path,
-            x + width - diameter,
-            y,
-            diameter,
-            diameter,
-            270.0,
-            90.0,
-        );
-        gp::GdipAddPathArc(
-            path,
-            x + width - diameter,
-            y + height - diameter,
-            diameter,
-            diameter,
-            0.0,
-            90.0,
-        );
-        gp::GdipAddPathArc(
-            path,
-            x,
-            y + height - diameter,
-            diameter,
-            diameter,
-            90.0,
-            90.0,
-        );
-        gp::GdipClosePathFigure(path);
-        path
-    }
-
-    unsafe fn fill(&self, rect: RECT, radius: f32, color: u32) {
-        let mut brush = std::ptr::null_mut();
-        gp::GdipCreateSolidFill(0xFF00_0000 | color, &mut brush);
-        let path = Self::rounded(
-            rect.left as f32,
-            rect.top as f32,
-            (rect.right - rect.left) as f32,
-            (rect.bottom - rect.top) as f32,
-            radius,
-        );
-        gp::GdipFillPath(self.0, brush.cast(), path);
-        gp::GdipDeletePath(path);
-        gp::GdipDeleteBrush(brush.cast());
-    }
-
-    unsafe fn stroke(&self, rect: RECT, radius: f32, color: u32, width: f32) {
-        let mut pen = std::ptr::null_mut();
-        gp::GdipCreatePen1(0xFF00_0000 | color, width, gp::UnitPixel, &mut pen);
-        let inset = width / 2.0;
-        let path = Self::rounded(
-            rect.left as f32 + inset,
-            rect.top as f32 + inset,
-            (rect.right - rect.left) as f32 - width,
-            (rect.bottom - rect.top) as f32 - width,
-            radius,
-        );
-        gp::GdipDrawPath(self.0, pen, path);
-        gp::GdipDeletePath(path);
-        gp::GdipDeletePen(pen);
-    }
-
-    unsafe fn circle(&self, center_x: f32, center_y: f32, diameter: f32, color: u32) {
-        let mut brush = std::ptr::null_mut();
-        gp::GdipCreateSolidFill(0xFF00_0000 | color, &mut brush);
-        gp::GdipFillEllipse(
-            self.0,
-            brush.cast(),
-            center_x - diameter / 2.0,
-            center_y - diameter / 2.0,
-            diameter,
-            diameter,
-        );
-        gp::GdipDeleteBrush(brush.cast());
-    }
-
-    /// A filled rounded rectangle with a one-pixel border.
-    unsafe fn card(&self, rect: RECT, radius: f32, fill: u32, border: u32) {
-        self.fill(rect, radius, border);
-        self.fill(inset(rect, 1, 1), (radius - 1.0).max(0.0), fill);
-    }
-}
-
-impl Drop for Canvas {
-    fn drop(&mut self) {
-        unsafe {
-            gp::GdipDeleteGraphics(self.0);
-        }
-    }
-}
-
 fn inset(rect: RECT, x: i32, y: i32) -> RECT {
     RECT {
         left: rect.left + x,
@@ -1243,37 +1133,149 @@ fn offset(rect: RECT, y: i32) -> RECT {
     }
 }
 
-/// Paints off screen, then copies the result, so controls never flicker.
-unsafe fn buffered(target: HDC, area: RECT, paint: impl FnOnce(HDC, RECT)) {
-    let width = area.right - area.left;
-    let height = area.bottom - area.top;
-    if width <= 0 || height <= 0 {
-        return;
+fn translated(rect: RECT, x: i32, y: i32) -> RECT {
+    RECT {
+        left: rect.left + x,
+        right: rect.right + x,
+        ..offset(rect, y)
     }
-    let dc = CreateCompatibleDC(target);
-    let bitmap = CreateCompatibleBitmap(target, width, height);
-    let previous = SelectObject(dc, bitmap);
-    paint(
-        dc,
+}
+
+fn intersection(a: RECT, b: RECT) -> RECT {
+    RECT {
+        left: a.left.max(b.left),
+        top: a.top.max(b.top),
+        right: a.right.min(b.right),
+        bottom: a.bottom.min(b.bottom),
+    }
+}
+
+fn has_area(rect: RECT) -> bool {
+    rect.right > rect.left && rect.bottom > rect.top
+}
+
+struct Bitmap {
+    dc: HDC,
+    handle: HBITMAP,
+    previous: HGDIOBJ,
+    bits: std::ptr::NonNull<u32>,
+    width: i32,
+    height: i32,
+}
+
+impl Bitmap {
+    unsafe fn new(width: i32, height: i32) -> Option<Self> {
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        let dc = CreateCompatibleDC(HDC::default());
+        if dc.is_invalid() {
+            return None;
+        }
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let handle =
+            CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
+        let previous = SelectObject(dc, handle);
+        match std::ptr::NonNull::new(bits.cast()) {
+            Some(bits) if !previous.is_invalid() => Some(Self {
+                dc,
+                handle,
+                previous,
+                bits,
+                width,
+                height,
+            }),
+            _ => {
+                if !previous.is_invalid() {
+                    SelectObject(dc, previous);
+                }
+                let _ = DeleteObject(handle);
+                let _ = DeleteDC(dc);
+                None
+            }
+        }
+    }
+
+    fn bounds(&self) -> RECT {
         RECT {
-            left: 0,
-            top: 0,
-            right: width,
-            bottom: height,
-        },
-    );
-    let _ = BitBlt(
-        target, area.left, area.top, width, height, dc, 0, 0, SRCCOPY,
-    );
-    SelectObject(dc, previous);
-    let _ = DeleteObject(bitmap);
-    let _ = DeleteDC(dc);
+            right: self.width,
+            bottom: self.height,
+            ..Default::default()
+        }
+    }
+
+    unsafe fn blit(&self, target: HDC, area: RECT, x: i32, y: i32) -> bool {
+        BitBlt(
+            target,
+            area.left,
+            area.top,
+            area.right - area.left,
+            area.bottom - area.top,
+            self.dc,
+            x,
+            y,
+            SRCCOPY,
+        )
+        .is_ok()
+    }
+}
+
+struct Drawing<'a> {
+    dc: HDC,
+    bitmap: Option<&'a mut Bitmap>,
+}
+
+impl<'a> Drawing<'a> {
+    fn new(dc: HDC, bitmap: Option<&'a mut Bitmap>) -> Self {
+        Self {
+            dc: bitmap.as_ref().map_or(dc, |bitmap| bitmap.dc),
+            bitmap,
+        }
+    }
+
+    fn for_bitmap(bitmap: &'a mut Bitmap) -> Self {
+        Self {
+            dc: bitmap.dc,
+            bitmap: Some(bitmap),
+        }
+    }
+
+    unsafe fn canvas(&mut self, clip: RECT) -> Option<raster::Canvas<'_>> {
+        let bitmap = self.bitmap.as_mut()?;
+        // Flush queued GDI writes before accessing the DIB section from the CPU.
+        let _ = GdiFlush();
+        let width = bitmap.width as usize;
+        let pixels =
+            std::slice::from_raw_parts_mut(bitmap.bits.as_ptr(), width * bitmap.height as usize);
+        Some(raster::Canvas::new(pixels, width, clip))
+    }
+}
+
+impl Drop for Bitmap {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.previous);
+            let _ = DeleteObject(self.handle);
+            let _ = DeleteDC(self.dc);
+        }
+    }
 }
 
 unsafe fn fill_rect(dc: HDC, rect: RECT, color: u32) {
-    let brush = CreateSolidBrush(colorref(color));
-    FillRect(dc, &rect, brush);
-    let _ = DeleteObject(brush);
+    let _ = SetDCBrushColor(dc, colorref(color));
+    FillRect(dc, &rect, HBRUSH(GetStockObject(DC_BRUSH).0));
 }
 
 unsafe fn draw_text(
@@ -1348,6 +1350,19 @@ struct Frame {
     rect: RECT,
     /// Right edge of the label and hint text.
     text_right: i32,
+    text: TextMetrics,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TextMetrics {
+    label: i32,
+    hint: i32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    rect: RECT,
+    label_width: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -1367,6 +1382,163 @@ impl SwitchAnimation {
 fn ease_out(elapsed: Duration, duration: Duration) -> f32 {
     let t = (elapsed.as_secs_f32() / duration.as_secs_f32()).min(1.0);
     1.0 - (1.0 - t).powi(3)
+}
+
+fn page_slide(elapsed: Duration, distance: i32) -> i32 {
+    let remaining = 1.0 - (elapsed.as_secs_f32() / PAGE_DURATION.as_secs_f32()).min(1.0);
+    (distance as f32 * remaining * remaining).round() as i32
+}
+
+unsafe fn paint_slide(target: HDC, image: &Bitmap, slide: i32, background: u32) -> bool {
+    let bounds = image.bounds();
+    let top = slide.clamp(0, bounds.bottom);
+    if top > 0 {
+        fill_rect(
+            target,
+            RECT {
+                bottom: top,
+                ..bounds
+            },
+            background,
+        );
+    }
+    top == bounds.bottom || image.blit(target, RECT { top, ..bounds }, 0, 0)
+}
+
+struct Overlay(HWND);
+
+impl Overlay {
+    unsafe fn new(parent: HWND, left: i32, bounds: RECT) -> Option<Self> {
+        let overlay = Self(
+            CreateWindowExW(
+                WS_EX_NOPARENTNOTIFY,
+                OVERLAY_CLASS,
+                PCWSTR::null(),
+                WS_CHILD | WS_CLIPSIBLINGS,
+                0,
+                0,
+                0,
+                0,
+                parent,
+                HMENU::default(),
+                GetModuleHandleW(None).unwrap_or_default(),
+                None,
+            )
+            .ok()?,
+        );
+        SetWindowPos(
+            overlay.0,
+            HWND_TOP,
+            left,
+            0,
+            bounds.right,
+            bounds.bottom,
+            SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_DEFERERASE,
+        )
+        .ok()?;
+        Some(overlay)
+    }
+}
+
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SetWindowPos(
+                self.0,
+                HWND::default(),
+                0,
+                0,
+                0,
+                0,
+                SWP_HIDEWINDOW
+                    | SWP_NOMOVE
+                    | SWP_NOSIZE
+                    | SWP_NOZORDER
+                    | SWP_NOACTIVATE
+                    | SWP_NOREDRAW,
+            );
+            let _ = DestroyWindow(self.0);
+        }
+    }
+}
+
+struct Transition {
+    overlay: Overlay,
+    image: Bitmap,
+    old_rows: Vec<Row>,
+    background: u32,
+    distance: i32,
+    slide: i32,
+    start: Instant,
+    final_frame: bool,
+    trace: Option<TransitionTrace>,
+}
+
+impl Transition {
+    unsafe fn draw(&mut self, now: Instant) -> bool {
+        let elapsed = now.duration_since(self.start);
+        self.slide = page_slide(elapsed, self.distance);
+        self.final_frame = elapsed >= PAGE_DURATION;
+        let dc = GetDC(self.overlay.0);
+        if dc.is_invalid() {
+            return false;
+        }
+        let drew = paint_slide(dc, &self.image, self.slide, self.background);
+        ReleaseDC(self.overlay.0, dc);
+        let _ = GdiFlush();
+        if let Some(trace) = &mut self.trace {
+            trace
+                .frames
+                .push((elapsed.as_micros(), now.elapsed().as_micros()));
+        }
+        drew
+    }
+}
+
+struct TransitionTrace {
+    clicked: Instant,
+    first_frame_us: Option<u128>,
+    frames: Vec<(u128, u128)>,
+}
+
+impl TransitionTrace {
+    fn new(clicked: Instant) -> Self {
+        Self {
+            clicked,
+            first_frame_us: None,
+            frames: Vec::with_capacity(24),
+        }
+    }
+}
+
+impl Drop for TransitionTrace {
+    fn drop(&mut self) {
+        use std::fmt::Write;
+        let mut lines = String::new();
+        if let Some(first_frame_us) = self.first_frame_us {
+            let _ = writeln!(
+                lines,
+                "settings transition click_to_first_frame_us={first_frame_us}"
+            );
+        }
+        for (t, cost) in &self.frames {
+            let _ = writeln!(lines, "settings transition frame t_us={t} cost_us={cost}");
+        }
+        let _ = write!(
+            lines,
+            "settings transition total_frames={}",
+            self.frames.len()
+        );
+        diagnose::log(lines);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PreviewKey {
+    appearance: Appearance,
+    system_dark: bool,
+    language: LanguageId,
+    widget_dpi: u32,
 }
 
 fn mix_color(from: u32, to: u32, t: f32) -> u32 {
@@ -1409,8 +1581,10 @@ struct Panel {
     theme: Theme,
     preference: SettingsTheme,
     switches: Vec<Option<SwitchAnimation>>,
-    page_animation: Option<Instant>,
-    page_offset: i32,
+    transition: Option<Transition>,
+    page_buffer: RefCell<Option<Bitmap>>,
+    control_buffer: RefCell<Option<Bitmap>>,
+    preview: RefCell<Option<(PreviewKey, Bitmap)>>,
     fonts: Fonts,
     icon: HICON,
     dpi: u32,
@@ -1420,7 +1594,7 @@ struct Panel {
     rows: Vec<Row>,
     controls: Vec<Vec<HWND>>,
     frames: Vec<Frame>,
-    slots: Vec<Vec<RECT>>,
+    slots: Vec<Vec<Slot>>,
     banner: Option<RECT>,
     content_left: i32,
     content_right: i32,
@@ -1455,8 +1629,10 @@ impl Panel {
             theme,
             preference,
             switches: Vec::new(),
-            page_animation: None,
-            page_offset: 0,
+            transition: None,
+            page_buffer: RefCell::new(None),
+            control_buffer: RefCell::new(None),
+            preview: RefCell::new(None),
             fonts: Fonts::default(),
             icon: HICON::default(),
             dpi: 0,
@@ -1489,6 +1665,7 @@ impl Panel {
     }
 
     unsafe fn set_dpi(&mut self, dpi: u32) {
+        self.preview.get_mut().take();
         let old = std::mem::replace(&mut self.fonts, Fonts::create(dpi));
         self.dpi = dpi;
         set_font(self.nav, self.fonts.body);
@@ -1526,6 +1703,7 @@ impl Panel {
     }
 
     unsafe fn apply_theme(&mut self, theme: Theme) {
+        self.preview.get_mut().take();
         self.theme = theme;
         BACKGROUND.with(|color| color.set(theme.background));
         let dark = BOOL::from(self.theme.dark);
@@ -1558,7 +1736,7 @@ impl Panel {
     }
 
     unsafe fn sync(&mut self, force: bool) {
-        if self.menu_open {
+        if self.menu_open || (!force && self.transition.is_some()) {
             return;
         }
         let Some((language, preference, next)) = lock_state()
@@ -1575,11 +1753,37 @@ impl Panel {
             && self.save_failed == save_failed
             && self.rows == next
         {
+            if matches!(Page::ALL[self.page], Page::Appearance)
+                && self
+                    .preview
+                    .get_mut()
+                    .as_ref()
+                    .is_some_and(|(key, _)| key.widget_dpi != CURRENT_DPI.load(Ordering::Relaxed))
+            {
+                self.preview.get_mut().take();
+                request_redraw();
+            }
             return;
         }
 
-        let focus = GetFocus();
         let redraw = SuspendRedraw::new(self.hwnd);
+        self.apply_model(language, preference, save_failed);
+        let old_rows = std::mem::replace(&mut self.rows, next);
+        let lost_focus = self.sync_controls(&old_rows, force);
+        self.layout();
+        drop(redraw);
+        self.restore_focus(lost_focus);
+        if self.switches.iter().any(Option::is_some) && !self.queue_animation() {
+            self.switches.fill(None);
+        }
+    }
+
+    unsafe fn apply_model(
+        &mut self,
+        language: LanguageId,
+        preference: SettingsTheme,
+        save_failed: bool,
+    ) {
         if self.preference != preference {
             self.preference = preference;
             self.apply_theme(Theme::current(preference));
@@ -1603,14 +1807,18 @@ impl Panel {
             let _ = SendMessageW(self.nav, LB_SETCURSEL, WPARAM(self.page), LPARAM(0));
         }
         self.save_failed = save_failed;
+    }
+
+    unsafe fn sync_controls(&mut self, old_rows: &[Row], force: bool) -> Option<usize> {
+        let focus = GetFocus();
         let mut lost_focus = None;
-        let mut controls_changed = self.controls.len() != next.len();
+        let mut controls_changed = self.controls.len() != self.rows.len();
         let old_controls = std::mem::take(&mut self.controls);
         let mut old_controls = old_controls.into_iter();
         let now = Instant::now();
-        self.switches.resize(next.len(), None);
-        for (index, row) in next.iter().enumerate() {
-            let old = self.rows.get(index);
+        self.switches.resize(self.rows.len(), None);
+        for (index, row) in self.rows.iter().enumerate() {
+            let old = old_rows.get(index);
             let (controls, reused) = match old_controls.next() {
                 Some(controls) if old.is_some_and(|old| same_controls(old, row)) => {
                     (controls, true)
@@ -1656,13 +1864,12 @@ impl Panel {
         }
         for controls in old_controls {
             if controls.contains(&focus) {
-                lost_focus = Some(next.len());
+                lost_focus = Some(self.rows.len());
             }
             for control in controls {
                 let _ = DestroyWindow(control);
             }
         }
-        self.rows = next;
         if controls_changed {
             // Dialog navigation uses HWND z-order, including controls retained across pages.
             let mut previous = self.nav;
@@ -1682,18 +1889,17 @@ impl Panel {
                 }
             }
         }
-        self.layout();
-        drop(redraw);
-        if let Some(index) = lost_focus {
+        lost_focus
+    }
+
+    unsafe fn restore_focus(&self, lost_focus: Option<usize>) {
+        if let Some(index) = lost_focus.filter(|_| IsWindowVisible(self.hwnd).as_bool()) {
             let replacement = self
                 .controls
                 .get(index)
                 .and_then(|controls| controls.first())
                 .copied();
             let _ = SetFocus(replacement.unwrap_or(self.nav));
-        }
-        if self.switches.iter().any(Option::is_some) {
-            SetTimer(self.hwnd, ANIMATION_TIMER, 15, None);
         }
     }
 
@@ -1725,45 +1931,49 @@ impl Panel {
         rect
     }
 
-    /// Height of a card that shows `label` and `hint` in `text_width` pixels.
-    unsafe fn card_height(
+    unsafe fn measure_text(
         &self,
         dc: HDC,
         label: &str,
         hint: Option<&Hint>,
         text_width: i32,
-    ) -> i32 {
-        let label_height = text_height(dc, self.fonts.body, label, text_width);
-        let hint_height = hint.map_or(0, |hint| {
-            self.px(2) + text_height(dc, self.fonts.caption, hint.text(), text_width)
-        });
-        (label_height + hint_height + 2 * self.px(CARD_VPAD)).max(self.px(CARD_MIN))
+    ) -> TextMetrics {
+        TextMetrics {
+            label: text_height(dc, self.fonts.body, label, text_width),
+            hint: hint.map_or(0, |hint| {
+                text_height(dc, self.fonts.caption, hint.text(), text_width)
+            }),
+        }
     }
 
-    unsafe fn button_width(&self, dc: HDC, item: &OptionItem) -> i32 {
+    fn card_height(&self, text: TextMetrics, hint: Option<&Hint>) -> i32 {
+        let gap = if hint.is_some() { self.px(2) } else { 0 };
+        (text.label + text.hint + gap + 2 * self.px(CARD_VPAD)).max(self.px(CARD_MIN))
+    }
+
+    fn button_width(&self, label_width: i32, item: &OptionItem) -> i32 {
         let swatch = if item.swatch.is_some() {
             self.px(22)
         } else {
             0
         };
-        (text_width(dc, self.fonts.body, &item.label) + self.px(32) + swatch).max(self.px(88))
+        (label_width + self.px(32) + swatch).max(self.px(88))
     }
 
     /// Measure every row, then position the controls.
     unsafe fn layout(&mut self) {
-        // Showing or hiding the scroll bar resizes the client area while the
-        // panel is borrowed, so the nested WM_SIZE cannot lay out again.
-        for _ in 0..2 {
-            let width = self.client().right;
-            self.measure();
-            if self.client().right == width {
-                break;
-            }
-        }
-    }
-
-    unsafe fn measure(&mut self) {
+        let _redraw = SuspendRedraw::new(self.hwnd);
         let client = self.client();
+        if self
+            .control_buffer
+            .get_mut()
+            .as_ref()
+            .is_some_and(|bitmap| bitmap.width > client.right || bitmap.height > client.bottom)
+        {
+            self.control_buffer.get_mut().take();
+        }
+        self.measure_page();
+        self.place_controls();
         let _ = SetWindowPos(
             self.nav,
             HWND::default(),
@@ -1774,6 +1984,23 @@ impl Panel {
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOREDRAW,
         );
 
+        request_redraw();
+    }
+
+    unsafe fn measure_page(&mut self) {
+        // Showing or hiding the scroll bar changes the width available to the rows.
+        for _ in 0..2 {
+            let width = self.client().right;
+            self.measure();
+            self.update_scrollbar();
+            if self.client().right == width {
+                break;
+            }
+        }
+    }
+
+    unsafe fn measure(&mut self) {
+        let client = self.client();
         let dc = GetDC(self.hwnd);
         let left = self.px(NAV_WIDTH + CONTENT_LEFT);
         let right = (client.right - self.px(CONTENT_RIGHT))
@@ -1811,6 +2038,7 @@ impl Panel {
                         Frame {
                             rect,
                             text_right: right,
+                            ..Default::default()
                         },
                         Vec::new(),
                     )
@@ -1827,6 +2055,7 @@ impl Panel {
                         Frame {
                             rect,
                             text_right: right,
+                            ..Default::default()
                         },
                         Vec::new(),
                     )
@@ -1845,14 +2074,16 @@ impl Panel {
                         Frame {
                             rect,
                             text_right: right,
+                            ..Default::default()
                         },
                         Vec::new(),
                     )
                 }
                 Row::Check { item, hint, .. } => {
                     let text_right = right - pad - self.px(TOGGLE_WIDTH + CONTROL_GAP);
-                    let height =
-                        self.card_height(dc, &item.label, hint.as_ref(), text_right - left - pad);
+                    let text =
+                        self.measure_text(dc, &item.label, hint.as_ref(), text_right - left - pad);
+                    let height = self.card_height(text, hint.as_ref());
                     let rect = RECT {
                         left,
                         top: y,
@@ -1860,13 +2091,23 @@ impl Panel {
                         bottom: y + height,
                     };
                     y = rect.bottom + self.px(CARD_GAP);
-                    (Frame { rect, text_right }, vec![rect])
+                    (
+                        Frame {
+                            rect,
+                            text_right,
+                            text,
+                        },
+                        vec![Slot {
+                            rect,
+                            ..Default::default()
+                        }],
+                    )
                 }
                 Row::Choice { label, hint, .. } => {
                     let control = self.px(DROPDOWN_WIDTH).min(width * 45 / 100);
                     let text_right = right - pad - control - self.px(CONTROL_GAP);
-                    let height =
-                        self.card_height(dc, label, hint.as_ref(), text_right - left - pad);
+                    let text = self.measure_text(dc, label, hint.as_ref(), text_right - left - pad);
+                    let height = self.card_height(text, hint.as_ref());
                     let rect = RECT {
                         left,
                         top: y,
@@ -1881,26 +2122,39 @@ impl Panel {
                         right: right - pad,
                         bottom: top + self.px(BUTTON_HEIGHT),
                     };
-                    (Frame { rect, text_right }, vec![slot])
+                    (
+                        Frame {
+                            rect,
+                            text_right,
+                            text,
+                        },
+                        vec![Slot {
+                            rect: slot,
+                            ..Default::default()
+                        }],
+                    )
                 }
                 Row::Action {
                     label,
                     hint,
                     buttons,
                 } => {
-                    let widths: Vec<i32> = buttons
+                    let widths: Vec<(i32, i32)> = buttons
                         .iter()
-                        .map(|button| self.button_width(dc, button))
+                        .map(|button| {
+                            let label_width = text_width(dc, self.fonts.body, &button.label);
+                            (self.button_width(label_width, button), label_width)
+                        })
                         .collect();
-                    let total = widths.iter().sum::<i32>()
+                    let total = widths.iter().map(|(width, _)| width).sum::<i32>()
                         + self.px(BUTTON_GAP) * (widths.len() as i32 - 1).max(0);
                     let text_right = if buttons.is_empty() {
                         right - pad
                     } else {
                         right - pad - total - self.px(CONTROL_GAP)
                     };
-                    let height =
-                        self.card_height(dc, label, hint.as_ref(), text_right - left - pad);
+                    let text = self.measure_text(dc, label, hint.as_ref(), text_right - left - pad);
+                    let height = self.card_height(text, hint.as_ref());
                     let rect = RECT {
                         left,
                         top: y,
@@ -1912,18 +2166,25 @@ impl Panel {
                     let mut x = right - pad - total;
                     let row_slots = widths
                         .iter()
-                        .map(|width| {
-                            let slot = RECT {
+                        .map(|&(width, label_width)| {
+                            let rect = RECT {
                                 left: x,
                                 top,
                                 right: x + width,
                                 bottom: top + self.px(BUTTON_HEIGHT),
                             };
                             x += width + self.px(BUTTON_GAP);
-                            slot
+                            Slot { rect, label_width }
                         })
                         .collect();
-                    (Frame { rect, text_right }, row_slots)
+                    (
+                        Frame {
+                            rect,
+                            text_right,
+                            text,
+                        },
+                        row_slots,
+                    )
                 }
             };
             frames.push(frame);
@@ -1935,57 +2196,15 @@ impl Panel {
         self.content_left = left;
         self.content_right = right;
         self.content_height = y + self.px(28);
-        self.place();
     }
 
-    /// Position controls for the current scroll offset and repaint the page.
-    unsafe fn place(&mut self) {
+    unsafe fn update_scrollbar(&mut self) {
         let client = self.client();
         let height = client.bottom - client.top;
         self.scroll = self
             .scroll
             .min((self.content_height - height).max(0))
             .max(0);
-        let count = self.controls.iter().map(Vec::len).sum::<usize>();
-        let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOREDRAW | SWP_DEFERERASE;
-        let positions = || {
-            self.controls
-                .iter()
-                .zip(&self.slots)
-                .flat_map(|(controls, slots)| controls.iter().copied().zip(slots.iter().copied()))
-        };
-        if count > 0 {
-            let dy = self.page_offset - self.scroll;
-            let result = BeginDeferWindowPos(count as i32)
-                .and_then(|batch| {
-                    positions().try_fold(batch, |batch, (control, slot)| {
-                        DeferWindowPos(
-                            batch,
-                            control,
-                            HWND::default(),
-                            slot.left,
-                            slot.top + dy,
-                            slot.right - slot.left,
-                            slot.bottom - slot.top,
-                            flags,
-                        )
-                    })
-                })
-                .and_then(|batch| EndDeferWindowPos(batch));
-            if result.is_err() {
-                for (control, slot) in positions() {
-                    let _ = SetWindowPos(
-                        control,
-                        HWND::default(),
-                        slot.left,
-                        slot.top + dy,
-                        slot.right - slot.left,
-                        slot.bottom - slot.top,
-                        flags,
-                    );
-                }
-            }
-        }
         let scroll_info = SCROLLINFO {
             cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
             fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
@@ -1996,15 +2215,39 @@ impl Panel {
             ..Default::default()
         };
         SetScrollInfo(self.hwnd, SB_VERT, &scroll_info, false);
-        request_redraw();
+    }
+
+    /// Position controls in the suspended layout or scroll transaction.
+    unsafe fn place_controls(&self) {
+        let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOREDRAW | SWP_DEFERERASE;
+        for (controls, slots) in self.controls.iter().zip(&self.slots) {
+            for (&control, slot) in controls.iter().zip(slots) {
+                let rect = slot.rect;
+                let _ = SetWindowPos(
+                    control,
+                    HWND::default(),
+                    rect.left,
+                    rect.top - self.scroll,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    flags,
+                );
+            }
+        }
     }
 
     unsafe fn scroll_to(&mut self, position: i32) {
+        if self.transition.is_some() {
+            return;
+        }
         let height = self.client().bottom;
         let position = position.min((self.content_height - height).max(0)).max(0);
         if position != self.scroll {
+            let _redraw = SuspendRedraw::new(self.hwnd);
             self.scroll = position;
-            self.place();
+            self.update_scrollbar();
+            self.place_controls();
+            request_redraw();
         }
     }
 
@@ -2028,45 +2271,97 @@ impl Panel {
         }
     }
 
-    unsafe fn change_page(&mut self, page: usize) {
-        if page < Page::ALL.len() && self.page != page {
-            self.page = page;
-            self.scroll = 0;
-            self.switches.clear();
-            self.page_animation = Some(Instant::now());
-            self.page_offset = self.px(24);
-            self.sync(true);
-            SetTimer(self.hwnd, ANIMATION_TIMER, 15, None);
+    unsafe fn change_page(&mut self, page: usize, clicked: Option<Instant>) {
+        if page >= Page::ALL.len() || self.page == page || self.menu_open {
+            return;
+        }
+        self.finish_transition();
+        let Some((language, preference, next)) = lock_state()
+            .as_ref()
+            .map(|s| (s.language, s.settings_theme, rows(Page::ALL[page], s)))
+        else {
+            return;
+        };
+        let restore_focus = IsChild(self.hwnd, GetFocus()).as_bool();
+        let redraw = SuspendRedraw::new(self.hwnd);
+        self.page = page;
+        self.scroll = 0;
+        self.switches.clear();
+        self.apply_model(language, preference, SAVE_FAILED.load(Ordering::Relaxed));
+        let old_rows = std::mem::replace(&mut self.rows, next);
+        self.measure_page();
+        // Rasterize from the model and layout. The old HWNDs keep their positions
+        // until the animated handoff, so no native creation is on the first-frame path.
+        let image = self.capture_page();
+        drop(redraw);
+
+        let prepared = image.and_then(|image| {
+            let overlay = Overlay::new(self.hwnd, self.px(NAV_WIDTH), image.bounds())?;
+            Some((overlay, image))
+        });
+        if let Some((overlay, image)) = prepared {
+            let start = Instant::now();
+            let mut transition = Transition {
+                overlay,
+                image,
+                old_rows,
+                background: self.theme.background,
+                distance: self.px(24),
+                slide: 0,
+                start,
+                final_frame: false,
+                trace: clicked.map(TransitionTrace::new),
+            };
+            let displayed = transition.draw(start);
+            self.transition = Some(transition);
+            if !displayed || !self.queue_animation() {
+                self.finish_transition();
+            }
+        } else {
+            self.install_page(&old_rows);
+        }
+        if restore_focus {
+            let _ = SetFocus(self.nav);
+        }
+        request_redraw();
+    }
+
+    unsafe fn install_page(&mut self, old_rows: &[Row]) {
+        let _redraw = SuspendRedraw::new(self.hwnd);
+        self.sync_controls(old_rows, true);
+        self.switches.fill(None);
+        self.place_controls();
+    }
+
+    unsafe fn finish_transition(&mut self) {
+        if let Some(mut transition) = self.transition.take() {
+            // Keep the final bitmap over the content as native HWNDs are
+            // created or reused, then reveal the new page in one redraw.
+            self.install_page(&transition.old_rows);
+            drop(transition.trace.take());
+            drop(transition);
+            request_redraw();
         }
     }
 
-    unsafe fn animate(&mut self) {
-        let now = Instant::now();
-        let mut active = false;
-        if let Some(start) = self.page_animation {
-            let progress = ease_out(now.duration_since(start), PAGE_DURATION);
-            self.page_offset = (self.px(24) as f32 * (1.0 - progress)).round() as i32;
-            if progress == 1.0 {
-                self.page_animation = None;
-            } else {
-                active = true;
-            }
-            self.place();
-        }
+    unsafe fn queue_animation(&self) -> bool {
+        PostMessageW(self.hwnd, PLAY_ANIMATIONS, WPARAM(0), LPARAM(0)).is_ok()
+    }
+
+    fn animation_active(&self) -> bool {
+        self.transition.is_some() || self.switches.iter().any(Option::is_some)
+    }
+
+    fn switch_frames(&mut self, now: Option<Instant>, redraw: &mut Vec<HWND>) {
         for (animation, controls) in self.switches.iter_mut().zip(&self.controls) {
             if let Some(switch) = animation {
-                if now.duration_since(switch.start) >= SWITCH_DURATION {
+                if now.is_none_or(|now| now.duration_since(switch.start) >= SWITCH_DURATION) {
                     *animation = None;
-                } else {
-                    active = true;
                 }
-                if let Some(control) = controls.first() {
-                    let _ = InvalidateRect(*control, None, false);
+                if let Some(&control) = controls.first() {
+                    redraw.push(control);
                 }
             }
-        }
-        if !active {
-            let _ = KillTimer(self.hwnd, ANIMATION_TIMER);
         }
     }
 
@@ -2127,198 +2422,346 @@ impl Panel {
 
     // -- painting ---------------------------------------------------------
 
-    unsafe fn paint(&self, target: HDC) {
+    unsafe fn paint(&self, target: HDC, dirty: RECT) {
         let client = self.client();
-        buffered(target, client, |dc, client| {
-            let theme = self.theme;
-            fill_rect(dc, client, theme.background);
-            let scroll = self.scroll - self.page_offset;
+        let header = RECT {
+            right: self.px(NAV_WIDTH),
+            ..client
+        };
+        let area = if self.transition.is_some() {
+            header
+        } else {
+            client
+        };
+        let dirty = intersection(area, dirty);
+        if !has_area(dirty) {
+            return;
+        }
+        let mut buffer = self.page_buffer.borrow_mut();
+        if buffer
+            .as_ref()
+            .is_none_or(|bitmap| bitmap.bounds() != client)
+        {
+            *buffer = Bitmap::new(client.right, client.bottom);
+        }
+        let drawing = Drawing::new(target, buffer.as_mut());
+        let dc = drawing.dc;
+        fill_rect(dc, dirty, self.theme.background);
+        if has_area(intersection(header, dirty)) {
+            self.paint_header(dc);
+        }
+        let content = RECT {
+            left: header.right,
+            ..client
+        };
+        let visible = intersection(content, dirty);
+        if self.transition.is_none() && has_area(visible) {
+            self.paint_page(drawing, visible, POINT::default());
+        }
+        if let Some(buffer) = buffer.as_ref() {
+            buffer.blit(target, dirty, dirty.left, dirty.top);
+        }
+    }
 
-            // Shapes first; GDI text follows once the canvas is released.
-            if let Some(canvas) = Canvas::new(dc) {
-                let radius = self.pxf(CARD_RADIUS);
-                if let Some(banner) = self.banner {
-                    canvas.card(
-                        offset(banner, -scroll),
-                        radius,
-                        theme.critical_background,
-                        theme.card_border,
-                    );
-                }
-                for (row, frame) in self.rows.iter().zip(&self.frames) {
-                    if matches!(
-                        row,
-                        Row::Choice { .. } | Row::Action { .. } | Row::Preview { .. }
-                    ) {
-                        let rect = offset(frame.rect, -scroll);
-                        if rect.bottom >= 0 && rect.top <= client.bottom {
-                            canvas.card(rect, radius, theme.card, theme.card_border);
-                        }
+    unsafe fn paint_page(&self, mut drawing: Drawing<'_>, visible: RECT, origin: POINT) {
+        let dc = drawing.dc;
+        let theme = self.theme;
+        let x_offset = origin.x;
+        let scroll = self.scroll - origin.y;
+        // Shapes first; GDI text follows once the canvas is released.
+        if let Some(mut canvas) = drawing.canvas(visible) {
+            let radius = self.pxf(CARD_RADIUS);
+            if let Some(banner) = self.banner {
+                canvas.card(
+                    translated(banner, x_offset, -scroll),
+                    radius,
+                    theme.critical_background,
+                    theme.card_border,
+                );
+            }
+            for (row, frame) in self.rows.iter().zip(&self.frames) {
+                if matches!(
+                    row,
+                    Row::Choice { .. } | Row::Action { .. } | Row::Preview { .. }
+                ) {
+                    let rect = translated(frame.rect, x_offset, -scroll);
+                    if has_area(intersection(rect, visible)) {
+                        canvas.card(rect, radius, theme.card, theme.card_border);
                     }
                 }
             }
+        }
 
-            // Application header above the navigation.
-            let icon_size = self.px(24);
-            let header_top = self.px(22);
-            if !self.icon.is_invalid() {
-                let _ = DrawIconEx(
-                    dc,
-                    self.px(20),
-                    header_top,
-                    self.icon,
-                    icon_size,
-                    icon_size,
-                    0,
-                    HBRUSH::default(),
-                    DI_NORMAL,
-                );
-            }
-            draw_text(
-                dc,
-                self.fonts.strong,
-                theme.text,
-                "Codex Usage",
-                RECT {
-                    left: self.px(56),
-                    top: header_top,
-                    right: self.px(NAV_WIDTH),
-                    bottom: header_top + icon_size,
-                },
-                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
-            );
+        let language = self.language.unwrap_or(LanguageId::English);
+        let title = page_titles(language)[self.page];
+        draw_text(
+            dc,
+            self.fonts.title,
+            theme.text,
+            title,
+            RECT {
+                left: self.content_left + x_offset,
+                top: self.px(TOP) - scroll,
+                right: self.content_right + x_offset,
+                bottom: self.px(TOP + TITLE_HEIGHT) - scroll,
+            },
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
 
-            let language = self.language.unwrap_or(LanguageId::English);
-            let title = page_titles(language)[self.page];
-            draw_text(
-                dc,
-                self.fonts.title,
-                theme.text,
-                title,
-                RECT {
-                    left: self.content_left,
-                    top: self.px(TOP) - scroll,
-                    right: self.content_right,
-                    bottom: self.px(TOP + TITLE_HEIGHT) - scroll,
-                },
-                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
-            );
-
-            if let Some(banner) = self.banner {
-                let banner = offset(banner, -scroll);
-                let message = if language == LanguageId::SimplifiedChinese {
-                    "无法保存设置。请检查设置文件的写入权限。"
-                } else {
-                    "Could not save settings. Check write access to the settings file."
-                };
-                let mut text = inset(banner, self.px(CARD_PAD), 0);
-                if self.fonts.has_icons {
-                    draw_text(
-                        dc,
-                        self.fonts.icons,
-                        theme.critical,
-                        &GLYPH_ERROR.to_string(),
-                        text,
-                        DT_SINGLELINE | DT_VCENTER,
-                    );
-                    text.left += self.px(28);
-                }
+        if let Some(banner) = self.banner {
+            let banner = translated(banner, x_offset, -scroll);
+            let message = if language == LanguageId::SimplifiedChinese {
+                "无法保存设置。请检查设置文件的写入权限。"
+            } else {
+                "Could not save settings. Check write access to the settings file."
+            };
+            let mut text = inset(banner, self.px(CARD_PAD), 0);
+            if self.fonts.has_icons {
                 draw_text(
                     dc,
-                    self.fonts.body,
-                    theme.text,
-                    message,
+                    self.fonts.icons,
+                    theme.critical,
+                    &GLYPH_ERROR.to_string(),
                     text,
-                    DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                    DT_SINGLELINE | DT_VCENTER,
                 );
+                text.left += self.px(28);
             }
+            draw_text(
+                dc,
+                self.fonts.body,
+                theme.text,
+                message,
+                text,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+            );
+        }
 
-            for (row, frame) in self.rows.iter().zip(&self.frames) {
-                let rect = offset(frame.rect, -scroll);
-                if rect.bottom < 0 || rect.top > client.bottom {
-                    continue;
-                }
-                match row {
-                    Row::Section(title) => draw_text(
+        for (row, frame) in self.rows.iter().zip(&self.frames) {
+            let rect = translated(frame.rect, x_offset, -scroll);
+            if !has_area(intersection(rect, visible)) {
+                continue;
+            }
+            match row {
+                Row::Section(title) => draw_text(
+                    dc,
+                    self.fonts.strong,
+                    theme.text,
+                    title,
+                    RECT {
+                        bottom: rect.bottom - self.px(8),
+                        ..rect
+                    },
+                    DT_SINGLELINE | DT_BOTTOM | DT_END_ELLIPSIS,
+                ),
+                Row::Preview {
+                    appearance,
+                    system_dark,
+                } => {
+                    draw_text(
                         dc,
                         self.fonts.strong,
                         theme.text,
-                        title,
+                        language.strings().appearance_preview,
                         RECT {
-                            bottom: rect.bottom - self.px(8),
-                            ..rect
+                            left: rect.left + self.px(CARD_PAD),
+                            right: rect.right - self.px(CARD_PAD),
+                            top: rect.top + self.px(12),
+                            bottom: rect.top + self.px(32),
                         },
-                        DT_SINGLELINE | DT_BOTTOM | DT_END_ELLIPSIS,
-                    ),
-                    Row::Preview {
-                        appearance,
-                        system_dark,
-                    } => {
-                        draw_text(
-                            dc,
-                            self.fonts.strong,
-                            theme.text,
-                            language.strings().appearance_preview,
-                            RECT {
-                                left: rect.left + self.px(CARD_PAD),
-                                right: rect.right - self.px(CARD_PAD),
-                                top: rect.top + self.px(12),
-                                bottom: rect.top + self.px(32),
-                            },
-                            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
-                        );
-                        appearance_preview::draw(
-                            dc,
-                            RECT {
-                                left: rect.left + self.px(CARD_PAD),
-                                right: rect.right - self.px(CARD_PAD),
-                                top: rect.top + self.px(34),
-                                bottom: rect.bottom - self.px(12),
-                            },
-                            *appearance,
-                            *system_dark,
-                            language,
-                        );
-                    }
-                    Row::Note(hint) => draw_text(
-                        dc,
-                        self.fonts.caption,
-                        hint_color(&theme, hint, true),
-                        hint.text(),
-                        rect,
-                        DT_WORDBREAK,
-                    ),
-                    Row::Choice {
-                        label,
-                        hint,
-                        enabled,
-                        ..
-                    } => self.card_text(
+                        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                    );
+                    self.draw_preview(
                         dc,
                         RECT {
                             left: rect.left + self.px(CARD_PAD),
-                            right: frame.text_right,
-                            ..rect
+                            right: rect.right - self.px(CARD_PAD),
+                            top: rect.top + self.px(34),
+                            bottom: rect.bottom - self.px(12),
                         },
-                        label,
-                        hint.as_ref(),
-                        *enabled,
-                    ),
-                    Row::Action { label, hint, .. } => self.card_text(
-                        dc,
-                        RECT {
-                            left: rect.left + self.px(CARD_PAD),
-                            right: frame.text_right,
-                            ..rect
-                        },
-                        label,
-                        hint.as_ref(),
-                        true,
-                    ),
-                    Row::Check { .. } => {}
+                        *appearance,
+                        *system_dark,
+                        language,
+                    );
                 }
+                Row::Note(hint) => draw_text(
+                    dc,
+                    self.fonts.caption,
+                    hint_color(&theme, hint, true),
+                    hint.text(),
+                    rect,
+                    DT_WORDBREAK,
+                ),
+                Row::Choice {
+                    label,
+                    hint,
+                    enabled,
+                    ..
+                } => self.card_text(
+                    dc,
+                    RECT {
+                        left: rect.left + self.px(CARD_PAD),
+                        right: frame.text_right + x_offset,
+                        ..rect
+                    },
+                    frame.text,
+                    label,
+                    hint.as_ref(),
+                    *enabled,
+                ),
+                Row::Action { label, hint, .. } => self.card_text(
+                    dc,
+                    RECT {
+                        left: rect.left + self.px(CARD_PAD),
+                        right: frame.text_right + x_offset,
+                        ..rect
+                    },
+                    frame.text,
+                    label,
+                    hint.as_ref(),
+                    true,
+                ),
+                Row::Check { .. } => {}
             }
-        });
+        }
+    }
+
+    unsafe fn paint_header(&self, dc: HDC) {
+        let icon_size = self.px(24);
+        let top = self.px(22);
+        if !self.icon.is_invalid() {
+            let _ = DrawIconEx(
+                dc,
+                self.px(20),
+                top,
+                self.icon,
+                icon_size,
+                icon_size,
+                0,
+                HBRUSH::default(),
+                DI_NORMAL,
+            );
+        }
+        draw_text(
+            dc,
+            self.fonts.strong,
+            self.theme.text,
+            "Codex Usage",
+            RECT {
+                left: self.px(56),
+                top,
+                right: self.px(NAV_WIDTH),
+                bottom: top + icon_size,
+            },
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+    }
+
+    unsafe fn draw_preview(
+        &self,
+        dc: HDC,
+        area: RECT,
+        appearance: Appearance,
+        system_dark: bool,
+        language: LanguageId,
+    ) {
+        let available = area.right - area.left;
+        if available <= 0 {
+            return;
+        }
+        let key = PreviewKey {
+            appearance,
+            system_dark,
+            language,
+            widget_dpi: CURRENT_DPI.load(Ordering::Relaxed),
+        };
+        let mut cache = self.preview.borrow_mut();
+        if cache.as_ref().is_none_or(|(cached, _)| *cached != key) {
+            let width = total_widget_width_for(3, language, appearance);
+            let height = sc(WIDGET_HEIGHT);
+            *cache = Bitmap::new(width, height).map(|bitmap| {
+                appearance_preview::paint_sample(
+                    bitmap.dc,
+                    width,
+                    height,
+                    appearance,
+                    system_dark,
+                    language,
+                );
+                (key, bitmap)
+            });
+        }
+        let Some((_, bitmap)) = cache.as_ref() else {
+            return;
+        };
+        let width = bitmap.width.min(available);
+        let height = bitmap.height * width / bitmap.width;
+        let left = area.left + (available - width) / 2;
+        let top = area.top + (area.bottom - area.top - height) / 2;
+        if width == bitmap.width {
+            bitmap.blit(
+                dc,
+                RECT {
+                    left,
+                    top,
+                    right: left + width,
+                    bottom: top + height,
+                },
+                0,
+                0,
+            );
+        } else {
+            let mode = SetStretchBltMode(dc, HALFTONE);
+            let _ = StretchBlt(
+                dc,
+                left,
+                top,
+                width,
+                height,
+                bitmap.dc,
+                0,
+                0,
+                bitmap.width,
+                bitmap.height,
+                SRCCOPY,
+            );
+            let _ = SetStretchBltMode(dc, STRETCH_BLT_MODE(mode));
+        }
+    }
+
+    unsafe fn capture_page(&self) -> Option<Bitmap> {
+        let client = self.client();
+        let left = self.px(NAV_WIDTH);
+        let mut bitmap = Bitmap::new(client.right - left, client.bottom)?;
+        let bounds = bitmap.bounds();
+        fill_rect(bitmap.dc, bounds, self.theme.background);
+        self.paint_page(
+            Drawing::for_bitmap(&mut bitmap),
+            bounds,
+            POINT { x: -left, y: 0 },
+        );
+        let now = Instant::now();
+        for (row, (model, slots)) in self.rows.iter().zip(&self.slots).enumerate() {
+            for (column, slot) in slots.iter().enumerate() {
+                let rect = translated(slot.rect, -left, -self.scroll);
+                if !has_area(intersection(bounds, rect)) {
+                    continue;
+                }
+                let state = ControlState {
+                    disabled: !model.control_enabled(column),
+                    ..Default::default()
+                };
+                self.draw_control_at(
+                    Drawing::for_bitmap(&mut bitmap),
+                    rect,
+                    row,
+                    column,
+                    state,
+                    now,
+                );
+            }
+        }
+        Some(bitmap)
     }
 
     /// Label with an optional hint below it, centered vertically in `area`.
@@ -2326,15 +2769,15 @@ impl Panel {
         &self,
         dc: HDC,
         area: RECT,
+        metrics: TextMetrics,
         label: &str,
         hint: Option<&Hint>,
         enabled: bool,
     ) {
-        let width = area.right - area.left;
-        let label_height = text_height(dc, self.fonts.body, label, width);
-        let hint_height = hint.map_or(0, |hint| {
-            text_height(dc, self.fonts.caption, hint.text(), width)
-        });
+        let TextMetrics {
+            label: label_height,
+            hint: hint_height,
+        } = metrics;
         let gap = if hint.is_some() { self.px(2) } else { 0 };
         let mut top = area.top + (area.bottom - area.top - label_height - gap - hint_height) / 2;
         let theme = self.theme;
@@ -2369,12 +2812,11 @@ impl Panel {
 
     /// Paint using the last applied row model so native input cannot skip the animation.
     unsafe fn draw_control(&self, draw: &NMCUSTOMDRAW) {
+        if self.transition.is_some() {
+            return;
+        }
         let control = draw.hdr.hwndFrom;
         let Some((row, column)) = self.locate(draw.hdr.idFrom as u16, control) else {
-            return;
-        };
-        let index = row;
-        let (Some(row), Some(frame)) = (self.rows.get(index), self.frames.get(index)) else {
             return;
         };
         let flags = draw.uItemState;
@@ -2384,47 +2826,97 @@ impl Panel {
             focused: flags.0 & CDIS_FOCUS.0 != 0 && flags.0 & CDIS_SHOWKEYBOARDCUES.0 != 0,
             disabled: flags.0 & CDIS_DISABLED.0 != 0 || !IsWindowEnabled(control).as_bool(),
         };
-        let area = draw.rc;
-        match row {
+        self.paint_control_buffered(draw.hdc, draw.rc, |drawing, area| {
+            self.draw_control_at(drawing, area, row, column, state, Instant::now());
+        });
+    }
+
+    unsafe fn paint_control_buffered(
+        &self,
+        target: HDC,
+        area: RECT,
+        draw: impl FnOnce(Drawing<'_>, RECT),
+    ) {
+        // A scrolled control can be larger than its visible portion.
+        let mut clip = RECT::default();
+        GetClipBox(target, &mut clip);
+        let clip = intersection(clip, area);
+        if !has_area(clip) {
+            return;
+        }
+        let mut buffer = self.control_buffer.borrow_mut();
+        let width = clip.right - clip.left;
+        let height = clip.bottom - clip.top;
+        let (old_width, old_height) = buffer.as_ref().map_or((0, 0), |b| (b.width, b.height));
+        if width > old_width || height > old_height {
+            *buffer = Bitmap::new(width.max(old_width), height.max(old_height));
+        }
+        if let Some(buffer) = buffer.as_mut() {
+            draw(
+                Drawing::for_bitmap(buffer),
+                translated(area, -clip.left, -clip.top),
+            );
+            buffer.blit(target, clip, 0, 0);
+        } else {
+            draw(Drawing::new(target, None), area);
+        }
+    }
+
+    unsafe fn draw_control_at(
+        &self,
+        drawing: Drawing<'_>,
+        area: RECT,
+        row: usize,
+        column: usize,
+        state: ControlState,
+        now: Instant,
+    ) {
+        let (Some(model), Some(frame)) = (self.rows.get(row), self.frames.get(row)) else {
+            return;
+        };
+        match model {
             Row::Check {
                 item,
                 checked,
                 hint,
                 ..
             } => {
-                let progress = self.switches[index]
+                let progress = self
+                    .switches
+                    .get(row)
+                    .copied()
+                    .flatten()
                     .map_or(f32::from(u8::from(*checked)), |animation| {
-                        animation.value(Instant::now())
+                        animation.value(now)
                     });
-                let text_right = frame.text_right - frame.rect.left;
-                buffered(draw.hdc, area, |dc, rect| {
-                    self.draw_switch_card(
-                        dc,
-                        rect,
-                        text_right,
-                        &item.label,
-                        hint.as_ref(),
-                        progress,
-                        state,
-                    )
-                });
+                self.draw_switch_card(
+                    drawing,
+                    area,
+                    *frame,
+                    &item.label,
+                    hint.as_ref(),
+                    progress,
+                    state,
+                );
             }
             Row::Choice {
                 items, selected, ..
             } => {
                 if let Some(item) = items.get(*selected) {
-                    buffered(draw.hdc, area, |dc, rect| {
-                        self.draw_button(dc, rect, &item.label, item.swatch, true, state)
-                    });
+                    self.draw_button(drawing, area, item, None, state);
                 }
             }
             Row::Action { buttons, .. } => {
                 let Some(item) = buttons.get(column) else {
                     return;
                 };
-                buffered(draw.hdc, area, |dc, rect| {
-                    self.draw_button(dc, rect, &item.label, item.swatch, false, state)
-                });
+                self.draw_button(
+                    drawing,
+                    area,
+                    item,
+                    Some(self.slots[row][column].label_width),
+                    state,
+                );
             }
             Row::Section(_) | Row::Note(_) | Row::Preview { .. } => {}
         }
@@ -2433,14 +2925,15 @@ impl Panel {
     #[allow(clippy::too_many_arguments)]
     unsafe fn draw_switch_card(
         &self,
-        dc: HDC,
+        mut drawing: Drawing<'_>,
         rect: RECT,
-        text_right: i32,
+        frame: Frame,
         label: &str,
         hint: Option<&Hint>,
         progress: f32,
         state: ControlState,
     ) {
+        let dc = drawing.dc;
         let theme = self.theme;
         fill_rect(dc, rect, theme.background);
         let fill = if state.disabled {
@@ -2454,13 +2947,14 @@ impl Panel {
         };
         let toggle_width = self.px(TOGGLE_WIDTH);
         let toggle_height = self.px(TOGGLE_HEIGHT);
+        let top = rect.top + (rect.bottom - rect.top - toggle_height) / 2;
         let toggle = RECT {
             left: rect.right - self.px(CARD_PAD) - toggle_width,
-            top: (rect.bottom - toggle_height) / 2,
+            top,
             right: rect.right - self.px(CARD_PAD),
-            bottom: (rect.bottom - toggle_height) / 2 + toggle_height,
+            bottom: top + toggle_height,
         };
-        if let Some(canvas) = Canvas::new(dc) {
+        if let Some(mut canvas) = drawing.canvas(rect) {
             let radius = self.pxf(CARD_RADIUS);
             canvas.card(rect, radius, fill, theme.card_border);
             let pill = toggle_height as f32 / 2.0;
@@ -2482,27 +2976,28 @@ impl Panel {
             };
             let track = mix_color(fill, on_track, progress);
             let stroke = mix_color(off_stroke, on_track, progress);
-            canvas.fill(toggle, pill, track);
-            canvas.stroke(toggle, pill, stroke, self.pxf(1.0));
+            canvas.fill(toggle, pill, opaque(track));
+            canvas.stroke(toggle, pill, opaque(stroke), self.pxf(1.0));
             let travel = (toggle.right - toggle.left - toggle_height) as f32;
             let center_x = toggle.left as f32 + pill + travel * progress;
             canvas.circle(
                 center_x,
                 center_y,
                 knob,
-                mix_color(off_knob, on_knob, progress),
+                opaque(mix_color(off_knob, on_knob, progress)),
             );
             if state.focused {
-                canvas.stroke(rect, radius, theme.text, self.pxf(2.0));
+                canvas.stroke(rect, radius, opaque(theme.text), self.pxf(2.0));
             }
         }
         self.card_text(
             dc,
             RECT {
                 left: rect.left + self.px(CARD_PAD),
-                right: text_right,
+                right: rect.left + frame.text_right - frame.rect.left,
                 ..rect
             },
+            frame.text,
             label,
             hint,
             !state.disabled,
@@ -2511,13 +3006,13 @@ impl Panel {
 
     unsafe fn draw_button(
         &self,
-        dc: HDC,
+        mut drawing: Drawing<'_>,
         rect: RECT,
-        label: &str,
-        swatch: Option<u32>,
-        dropdown: bool,
+        item: &OptionItem,
+        label_width: Option<i32>,
         state: ControlState,
     ) {
+        let dc = drawing.dc;
         let theme = self.theme;
         fill_rect(dc, rect, theme.card);
         let fill = if state.disabled {
@@ -2532,37 +3027,32 @@ impl Panel {
         let radius = self.pxf(CONTROL_RADIUS);
         let padding = self.px(12);
         let swatch_size = self.px(14);
-        let content_width = if dropdown {
-            0
-        } else {
-            let dc_width = text_width(dc, self.fonts.body, label);
-            dc_width + swatch.map_or(0, |_| swatch_size + self.px(8))
-        };
         let mut text = inset(rect, padding, 0);
-        if !dropdown {
+        if let Some(label_width) = label_width {
+            let content_width = label_width + item.swatch.map_or(0, |_| swatch_size + self.px(8));
             text.left = rect.left + (rect.right - rect.left - content_width) / 2;
         }
-        if let Some(canvas) = Canvas::new(dc) {
+        if let Some(mut canvas) = drawing.canvas(rect) {
             canvas.card(rect, radius, fill, theme.control_border);
-            if let Some(color) = swatch {
+            if let Some(color) = item.swatch {
                 let center_y = (rect.top + rect.bottom) as f32 / 2.0;
                 let diameter = swatch_size as f32;
                 canvas.circle(
                     text.left as f32 + diameter / 2.0,
                     center_y,
                     diameter,
-                    theme.control_border,
+                    opaque(theme.control_border),
                 );
                 canvas.circle(
                     text.left as f32 + diameter / 2.0,
                     center_y,
                     diameter - self.pxf(2.0),
-                    color,
+                    opaque(color),
                 );
                 text.left += swatch_size + self.px(8);
             }
             if state.focused {
-                canvas.stroke(rect, radius, theme.text, self.pxf(2.0));
+                canvas.stroke(rect, radius, opaque(theme.text), self.pxf(2.0));
             }
         }
         let color = if state.disabled {
@@ -2572,7 +3062,7 @@ impl Panel {
         } else {
             theme.text
         };
-        if dropdown {
+        if label_width.is_none() {
             let chevron = self.px(12);
             if self.fonts.has_icons {
                 draw_text(
@@ -2596,7 +3086,7 @@ impl Panel {
                 dc,
                 self.fonts.body,
                 color,
-                label,
+                &item.label,
                 text,
                 DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
             );
@@ -2605,7 +3095,7 @@ impl Panel {
                 dc,
                 self.fonts.body,
                 color,
-                label,
+                &item.label,
                 RECT {
                     right: rect.right - padding,
                     ..text
@@ -2628,20 +3118,21 @@ impl Panel {
             item.itemState.0 & ODS_FOCUS.0 != 0 && item.itemState.0 & ODS_NOFOCUSRECT.0 == 0;
         let hot = NAV_HOVER.with(Cell::get) == index as i32;
         let theme = self.theme;
-        buffered(item.hDC, item.rcItem, |dc, rect| {
+        self.paint_control_buffered(item.hDC, item.rcItem, |mut drawing, rect| {
+            let dc = drawing.dc;
             fill_rect(dc, rect, theme.background);
             let pill = inset(rect, self.px(4), self.px(2));
-            if let Some(canvas) = Canvas::new(dc) {
+            if let Some(mut canvas) = drawing.canvas(rect) {
                 let radius = self.pxf(CONTROL_RADIUS);
                 if selected || hot {
                     canvas.fill(
                         pill,
                         radius,
-                        if selected {
+                        opaque(if selected {
                             theme.nav_selected
                         } else {
                             theme.nav_hover
-                        },
+                        }),
                     );
                 }
                 if selected {
@@ -2655,11 +3146,11 @@ impl Panel {
                             bottom: top + height,
                         },
                         self.pxf(1.5),
-                        theme.accent,
+                        opaque(theme.accent),
                     );
                 }
                 if focused {
-                    canvas.stroke(pill, radius, theme.text, self.pxf(2.0));
+                    canvas.stroke(pill, radius, opaque(theme.text), self.pxf(2.0));
                 }
             }
             let mut text = RECT {
@@ -2725,7 +3216,7 @@ unsafe fn child(owner: HWND, class: PCWSTR, id: u16, style: u32) -> HWND {
         WINDOW_EX_STYLE(0),
         class,
         PCWSTR::null(),
-        WS_CHILD | WINDOW_STYLE(style),
+        WS_CHILD | WS_CLIPSIBLINGS | WINDOW_STYLE(style),
         0,
         0,
         0,
@@ -2756,8 +3247,8 @@ unsafe fn update_row(row: &Row, controls: &[HWND]) {
         Row::Check {
             item,
             checked,
-            enabled,
             hint,
+            ..
         } => {
             set_text(controls[0], &accessible_text(&item.label, hint.as_ref()));
             let _ = SendMessageW(
@@ -2766,26 +3257,25 @@ unsafe fn update_row(row: &Row, controls: &[HWND]) {
                 WPARAM(usize::from(*checked)),
                 LPARAM(0),
             );
-            let _ = EnableWindow(controls[0], *enabled);
         }
         Row::Choice {
             label,
             items,
             selected,
-            enabled,
             ..
         } => {
             let value = items.get(*selected).map_or("", |item| item.label.as_str());
             set_text(controls[0], &format!("{label}: {value}"));
-            let _ = EnableWindow(controls[0], *enabled);
         }
         Row::Action { buttons, .. } => {
             for (item, &control) in buttons.iter().zip(controls) {
                 set_text(control, &item.label);
-                let _ = EnableWindow(control, item.action.is_some());
             }
         }
         Row::Section(_) | Row::Note(_) | Row::Preview { .. } => {}
+    }
+    for (column, &control) in controls.iter().enumerate() {
+        let _ = EnableWindow(control, row.control_enabled(column));
     }
 }
 
@@ -2833,19 +3323,32 @@ fn request_redraw() {
 }
 
 fn with_panel<T>(f: impl FnOnce(&mut Panel) -> T) -> Option<T> {
-    let (hwnd, result) = PANEL.with(|state| {
+    let (hwnd, nav, transitioning, result) = PANEL.with(|state| {
         let mut state = state.try_borrow_mut().ok()?;
         let panel = state.as_mut()?;
-        Some((panel.hwnd, f(panel)))
+        let result = f(panel);
+        Some((panel.hwnd, panel.nav, panel.transition.is_some(), result))
     })?;
     if REDRAW_PENDING.with(|pending| pending.replace(false)) {
         unsafe {
-            let _ = RedrawWindow(
-                hwnd,
-                None,
-                HRGN::default(),
-                RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_NOERASE | RDW_UPDATENOW,
-            );
+            let flags = RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW;
+            if transitioning {
+                // Layout may have changed the nonclient scroll bar and navigation.
+                let _ = RedrawWindow(
+                    hwnd,
+                    None,
+                    HRGN::default(),
+                    flags | RDW_NOCHILDREN | RDW_FRAME,
+                );
+                let _ = RedrawWindow(nav, None, HRGN::default(), flags);
+            } else {
+                let _ = RedrawWindow(
+                    hwnd,
+                    None,
+                    HRGN::default(),
+                    flags | RDW_ALLCHILDREN | RDW_FRAME,
+                );
+            }
         }
     }
     Some(result)
@@ -2909,12 +3412,20 @@ pub(super) unsafe fn show(widget: HWND) {
         return;
     };
     let instance = HINSTANCE(module.0);
+    let cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
     let _ = RegisterClassW(&WNDCLASSW {
         lpfnWndProc: Some(settings_proc),
         hInstance: instance,
         lpszClassName: CLASS,
-        hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+        hCursor: cursor,
         hIcon: LoadIconW(instance, PCWSTR(1usize as *const u16)).unwrap_or_default(),
+        ..Default::default()
+    });
+    let _ = RegisterClassW(&WNDCLASSW {
+        lpfnWndProc: Some(overlay_proc),
+        hInstance: instance,
+        lpszClassName: OVERLAY_CLASS,
+        hCursor: cursor,
         ..Default::default()
     });
     let dpi = GetDpiForWindow(widget).max(96);
@@ -2965,6 +3476,106 @@ pub(super) unsafe fn show(widget: HWND) {
     });
 }
 
+/// Keep input in the main message queue. It can end the animation, but
+/// navigation and dialog handling run later on the normal message stack.
+unsafe fn pump_animation_messages() -> bool {
+    let mut message = MSG::default();
+    for input in [
+        WM_KEYDOWN,
+        WM_SYSKEYDOWN,
+        WM_LBUTTONDOWN,
+        WM_RBUTTONDOWN,
+        WM_MBUTTONDOWN,
+        WM_XBUTTONDOWN,
+        WM_NCLBUTTONDOWN,
+        WM_NCRBUTTONDOWN,
+        WM_NCMBUTTONDOWN,
+        WM_NCXBUTTONDOWN,
+        WM_LBUTTONDBLCLK,
+        WM_NCLBUTTONDBLCLK,
+        WM_MOUSEWHEEL,
+        WM_MOUSEHWHEEL,
+        WM_POINTERDOWN,
+        WM_CLOSE,
+        WM_SYSCOMMAND,
+    ] {
+        if PeekMessageW(&mut message, HWND::default(), input, input, PM_NOREMOVE).as_bool() {
+            return false;
+        }
+    }
+
+    // Process a bounded number of paints per frame. Timer messages stay queued.
+    for _ in 0..4 {
+        if !PeekMessageW(&mut message, HWND::default(), WM_PAINT, WM_PAINT, PM_REMOVE).as_bool() {
+            break;
+        }
+        if message.message == WM_QUIT {
+            PostQuitMessage(message.wParam.0 as i32);
+            return false;
+        }
+        DispatchMessageW(&message);
+    }
+    true
+}
+
+unsafe fn play_animations(hwnd: HWND) {
+    let mut use_dwm = true;
+    let mut switches = Vec::new();
+    loop {
+        let Ok(Some((true, started))) = with_panel_ref(|panel| {
+            (
+                panel.hwnd == hwnd && panel.animation_active(),
+                panel.transition.as_ref().map(|transition| transition.start),
+            )
+        }) else {
+            break;
+        };
+        if use_dwm {
+            use_dwm = DwmFlush().is_ok();
+        }
+        if !use_dwm {
+            Sleep(8);
+        }
+        let presented_at = Instant::now();
+        // PeekMessage can dispatch sent messages, including close and DPI
+        // changes. Never hold the panel borrow or an overlay DC across it.
+        let continue_playing = pump_animation_messages();
+        with_panel(|panel| {
+            if panel.hwnd != hwnd {
+                return;
+            }
+            if let Some(transition) = panel.transition.as_mut() {
+                if Some(transition.start) != started {
+                    // A sent navigation message installed a new first frame.
+                    // Wait for its own compositor cycle before advancing it.
+                    return;
+                }
+                if let Some(trace) = transition.trace.as_mut() {
+                    trace.first_frame_us.get_or_insert_with(|| {
+                        presented_at.duration_since(trace.clicked).as_micros()
+                    });
+                }
+                if !continue_playing || transition.final_frame || !transition.draw(Instant::now()) {
+                    panel.finish_transition();
+                }
+            } else {
+                panel.switch_frames(continue_playing.then(Instant::now), &mut switches);
+            }
+        });
+        for control in switches.drain(..) {
+            let _ = RedrawWindow(
+                control,
+                None,
+                HRGN::default(),
+                RDW_INVALIDATE | RDW_NOCHILDREN | RDW_NOERASE | RDW_UPDATENOW,
+            );
+        }
+        if !continue_playing {
+            break;
+        }
+    }
+}
+
 unsafe extern "system" fn settings_proc(
     hwnd: HWND,
     msg: u32,
@@ -2979,10 +3590,12 @@ unsafe extern "system" fn settings_proc(
             if id == IDCANCEL.0 as u16 {
                 let _ = DestroyWindow(hwnd);
             } else if id == NAV && code == LBN_SELCHANGE as u16 {
+                let clicked = diagnose::is_enabled().then(Instant::now);
                 let page = SendMessageW(control, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
-                with_panel(|panel| panel.change_page(page as usize));
+                with_panel(|panel| panel.change_page(page as usize, clicked));
             } else if code == BN_CLICKED as u16 {
                 let request = with_panel(|panel| {
+                    panel.finish_transition();
                     let request = panel.choice_request(id, control);
                     panel.menu_open = request.is_some();
                     request.map(|request| (request, panel.dpi))
@@ -3023,20 +3636,30 @@ unsafe extern "system" fn settings_proc(
                     Some(Action::Group(group)) => select_antigravity_group(widget, group),
                     None => {}
                 }
-                with_panel(|panel| panel.sync(true));
+                with_panel(|panel| {
+                    panel.finish_transition();
+                    panel.sync(true);
+                });
             }
         }
         ENSURE_VISIBLE => {
-            with_panel(|panel| panel.ensure_visible(HWND(wparam.0 as *mut _)));
+            let control = HWND(wparam.0 as *mut _);
+            if control == GetFocus() {
+                with_panel(|panel| {
+                    panel.finish_transition();
+                    panel.ensure_visible(control);
+                });
+            }
         }
-        WM_TIMER if wparam.0 == ANIMATION_TIMER => {
-            with_panel(|panel| panel.animate());
-        }
+        PLAY_ANIMATIONS => play_animations(hwnd),
         WM_TIMER if wparam.0 == REFRESH_TIMER => {
             with_panel(|panel| panel.sync(false));
         }
         WM_SIZE => {
-            with_panel(|panel| panel.layout());
+            with_panel(|panel| {
+                panel.finish_transition();
+                panel.layout();
+            });
         }
         WM_GETMINMAXINFO => {
             let info = &mut *(lparam.0 as *mut MINMAXINFO);
@@ -3086,6 +3709,7 @@ unsafe extern "system" fn settings_proc(
             let dpi = wparam.0 as u16 as u32;
             let suggested = *(lparam.0 as *const RECT);
             with_panel(|panel| {
+                panel.finish_transition();
                 let _redraw = SuspendRedraw::new(hwnd);
                 panel.set_dpi(dpi);
                 let _ = SetWindowPos(
@@ -3104,6 +3728,7 @@ unsafe extern "system" fn settings_proc(
             with_panel(|panel| {
                 let theme = Theme::current(panel.preference);
                 if theme != panel.theme {
+                    panel.finish_transition();
                     let _redraw = SuspendRedraw::new(hwnd);
                     panel.apply_theme(theme);
                 }
@@ -3141,10 +3766,17 @@ unsafe extern "system" fn settings_proc(
         }
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => {
+            let started = diagnose::is_enabled().then(Instant::now);
             let mut paint = PAINTSTRUCT::default();
             let dc = BeginPaint(hwnd, &mut paint);
-            let painted = with_panel_ref(|panel| panel.paint(dc));
+            let painted = with_panel_ref(|panel| panel.paint(dc, paint.rcPaint));
             let _ = EndPaint(hwnd, &paint);
+            if let (Some(started), Ok(Some(()))) = (started, painted) {
+                diagnose::log(format!(
+                    "settings paint cost_us={}",
+                    started.elapsed().as_micros()
+                ));
+            }
             if painted.is_err() {
                 request_redraw();
             }
@@ -3154,17 +3786,59 @@ unsafe extern "system" fn settings_proc(
         }
         WM_DESTROY => {
             let _ = KillTimer(hwnd, REFRESH_TIMER);
-            let _ = KillTimer(hwnd, ANIMATION_TIMER);
+            PANEL.with(|state| {
+                if let Some(panel) = state.borrow_mut().as_mut() {
+                    panel.transition.take();
+                }
+            });
         }
         WM_NCDESTROY => {
             PANEL.with(|state| {
                 state.borrow_mut().take();
             });
+            let _ = GdiFlush();
+            REDRAW_PENDING.with(|pending| pending.set(false));
+            NAV_HOVER.with(|hover| hover.set(-1));
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     LRESULT(0)
+}
+
+unsafe extern "system" fn overlay_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            // Restore the current pose if the OS exposes this window. The
+            // animation itself paints directly and never invalidates the overlay.
+            let mut paint = PAINTSTRUCT::default();
+            let dc = BeginPaint(hwnd, &mut paint);
+            if has_area(paint.rcPaint) {
+                let _ = with_panel_ref(|panel| {
+                    if let Some(transition) =
+                        panel.transition.as_ref().filter(|t| t.overlay.0 == hwnd)
+                    {
+                        paint_slide(
+                            dc,
+                            &transition.image,
+                            transition.slide,
+                            transition.background,
+                        );
+                    }
+                });
+            }
+            let _ = EndPaint(hwnd, &paint);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
 }
 
 /// Navigation hover tracking, and scrolling focused settings into view.
@@ -3240,6 +3914,55 @@ unsafe fn invalidate_nav_item(nav: HWND, index: i32) {
 mod tests {
     use super::*;
     use poller::PollError;
+
+    #[test]
+    fn page_slide_eases_into_the_final_position() {
+        let distance = scale(24, 192);
+        assert_eq!(page_slide(Duration::ZERO, distance), 48);
+        assert_eq!(page_slide(PAGE_DURATION / 2, distance), 12);
+        assert_eq!(page_slide(PAGE_DURATION, distance), 0);
+        assert_eq!(page_slide(PAGE_DURATION * 2, distance), 0);
+    }
+
+    #[test]
+    fn reversing_a_switch_starts_at_its_interpolated_position() {
+        let start = Instant::now();
+        let forward = SwitchAnimation {
+            from: 0.0,
+            to: 1.0,
+            start,
+        };
+        let interrupted = start + SWITCH_DURATION / 2;
+        let reverse = SwitchAnimation {
+            from: forward.value(interrupted),
+            to: 0.0,
+            start: interrupted,
+        };
+        assert_eq!(reverse.value(interrupted), 0.875);
+        assert_eq!(reverse.value(interrupted + SWITCH_DURATION), 0.0);
+    }
+
+    #[test]
+    fn bitmap_slide_fills_only_the_exposed_strip_and_crops_at_the_bottom() {
+        unsafe {
+            let page = Bitmap::new(2, 3).unwrap();
+            let output = Bitmap::new(2, 4).unwrap();
+            let bounds = page.bounds();
+            fill_rect(page.dc, bounds, 0x11_1111);
+            fill_rect(page.dc, RECT { top: 1, ..bounds }, 0x22_2222);
+            fill_rect(page.dc, RECT { top: 2, ..bounds }, 0x33_3333);
+            fill_rect(output.dc, output.bounds(), 0xFF_00FF);
+            assert!(paint_slide(output.dc, &page, 1, 0x00_00FF));
+            for x in 0..2 {
+                assert_eq!(GetPixel(output.dc, x, 0), colorref(0x00_00FF));
+                assert_eq!(GetPixel(output.dc, x, 1), colorref(0x11_1111));
+                assert_eq!(GetPixel(output.dc, x, 2), colorref(0x22_2222));
+                assert_eq!(GetPixel(output.dc, x, 3), colorref(0xFF_00FF));
+            }
+            assert!(paint_slide(output.dc, &page, 0, 0x00_00FF));
+            assert_eq!(GetPixel(output.dc, 0, 2), colorref(0x33_3333));
+        }
+    }
 
     fn service_label(name: &str, monitored: bool, error: Option<PollError>) -> String {
         let hint = service_status(monitored, error, LanguageId::SimplifiedChinese)
