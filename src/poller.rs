@@ -1057,6 +1057,7 @@ fn fetch_antigravity_cli_usage(path: PathBuf, group: Option<&str>) -> Option<Usa
             "--print-timeout",
             "15s",
         ])
+        .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
