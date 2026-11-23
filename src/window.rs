@@ -2742,6 +2742,11 @@ fn update_quota_tooltips() {
             let count = active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity);
             let (label_width, text_width) = current_usage_layout_widths(s);
             let width = model_usage_width(row_bar_segment_count(count), text_width, s.appearance);
+            let credit = visible_credit_balance(s).map(|balance| {
+                let value = credit_value(balance);
+                let extra_width = credit_extra_width(s.language, s.appearance, &value);
+                (balance, value, extra_width)
+            });
             let mut left = sc(LEFT_DIVIDER_W)
                 + sc(DIVIDER_RIGHT_MARGIN)
                 + period_label_column_width(label_width, s.appearance);
@@ -2790,20 +2795,22 @@ fn update_quota_tooltips() {
                     text,
                 ));
                 left += width + sc(MODEL_RIGHT_MARGIN);
-            }
-            if let Some(balance) = visible_credit_balance(s) {
-                let value = credit_value(balance);
-                let column_width = credit_column_width(s.language, s.appearance, &value);
-                let credit_left = total_widget_width_for_state(s) - sc(RIGHT_MARGIN) - column_width;
-                regions.push((
-                    RECT {
-                        left: credit_left,
-                        top: 0,
-                        right: credit_left + column_width,
-                        bottom: sc(WIDGET_HEIGHT),
-                    },
-                    format!("{}: {balance}", credit_label(s.language)),
-                ));
+                if id == 1 {
+                    if let Some((balance, value, extra_width)) = &credit {
+                        let credit_left = left + sc(CREDIT_GAP + 1);
+                        let column_width = credit_column_width(s.language, s.appearance, value);
+                        regions.push((
+                            RECT {
+                                left: credit_left,
+                                top: 0,
+                                right: credit_left + column_width,
+                                bottom: sc(WIDGET_HEIGHT),
+                            },
+                            format!("{}: {balance}", credit_label(s.language)),
+                        ));
+                        left += extra_width;
+                    }
+                }
             }
         }
         (s.hwnd.to_hwnd(), regions)
@@ -3103,6 +3110,11 @@ fn paint_content(hdc: HDC, width: i32, height: i32, content: &WidgetContent<'_>)
                 if visible {
                     provider_icons::draw(hdc, icon_x, (height - size) / 2, size, provider);
                     icon_x += model_width;
+                    if matches!(provider, Provider::Codex) {
+                        if let Some(value) = credit.as_deref() {
+                            icon_x += credit_extra_width(language, appearance, value);
+                        }
+                    }
                 }
             }
         }
@@ -3162,13 +3174,19 @@ fn paint_content(hdc: HDC, width: i32, height: i32, content: &WidgetContent<'_>)
                     appearance,
                 );
                 model_x += model_width;
+                if matches!(provider, Provider::Codex) {
+                    if let Some(value) = credit.as_deref() {
+                        model_x += credit_extra_width(language, appearance, value);
+                    }
+                }
             }
             row_y += row_height + row_gap;
         }
 
         if let Some(value) = credit.as_deref() {
             let column_width = credit_column_width(language, appearance, value);
-            let left = width - sc(RIGHT_MARGIN) - column_width;
+            let codex_column = 1 + providers[0] as i32;
+            let left = model_left + model_width * codex_column + sc(CREDIT_GAP + 1);
             let divider = RECT {
                 left: left - sc(CREDIT_GAP) - sc(1),
                 top: divider_top,

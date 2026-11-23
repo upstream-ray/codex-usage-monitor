@@ -159,12 +159,34 @@ mod tests {
             let full = sample_with_options(appearance, true, language, providers, true);
             let before = pixels(&base, base_width);
             let after = pixels(&full, full_width);
+            let (label_width, text_width) = usage_layout_widths(language, appearance, false);
+            let active = providers.into_iter().filter(|enabled| *enabled).count() as i32;
+            let model_width =
+                model_usage_width(row_bar_segment_count(active), text_width, appearance)
+                    + sc(MODEL_RIGHT_MARGIN);
+            let insert_at = sc(LEFT_DIVIDER_W)
+                + sc(DIVIDER_RIGHT_MARGIN)
+                + period_label_column_width(label_width, appearance)
+                + model_width * (1 + providers[0] as i32);
+            let extra = full_width - base_width;
             for y in 0..sc(WIDGET_HEIGHT) as usize {
-                assert_eq!(
-                    &before[y * base_width as usize..(y + 1) * base_width as usize],
-                    &after[y * full_width as usize..y * full_width as usize + base_width as usize],
-                    "provider pixels changed with {providers:?}"
+                let preserved_end = insert_at - sc(MODEL_RIGHT_MARGIN);
+                let first_changed = (0..preserved_end as usize).find(|&x| {
+                    before[y * base_width as usize + x] != after[y * full_width as usize + x]
+                });
+                assert!(
+                    first_changed.is_none(),
+                    "Codex or earlier provider pixels changed with {providers:?} at ({first_changed:?}, {y}), insertion {insert_at}"
                 );
+                if providers[2] {
+                    assert_eq!(
+                        &before[y * base_width as usize + insert_at as usize
+                            ..(y + 1) * base_width as usize],
+                        &after[y * full_width as usize + insert_at as usize + extra as usize
+                            ..(y + 1) * full_width as usize],
+                        "Antigravity pixels changed with {providers:?}"
+                    );
+                }
             }
             let (background, _, _) = appearance_colors(appearance, true);
             let background = dib_rgb(background);
