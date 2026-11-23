@@ -614,6 +614,11 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                 } else {
                     one_window
                 }),
+                check(
+                    credit_label(s.language),
+                    IDM_SHOW_CREDIT_BALANCE,
+                    s.show_credit_balance,
+                ),
                 choice(
                     strings.quota_value,
                     &[
@@ -5627,6 +5632,7 @@ mod tests {
                     antigravity_groups: Vec::new(),
                     show_session_window: true,
                     show_weekly_window: true,
+                    show_credit_balance: false,
                     alert_threshold_percent: 20,
                     notified_quota_windows: BTreeSet::new(),
                     notify_on_reset: true,
