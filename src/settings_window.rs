@@ -4746,6 +4746,11 @@ pub(super) unsafe fn show(widget: HWND) {
     with_panel(|panel| panel.sync(true));
     SetTimer(hwnd, REFRESH_TIMER, 1000, None);
     let _ = ShowWindow(hwnd, SW_SHOW);
+    // A launcher using STARTF_USESHOWWINDOW/SW_HIDE can override the first
+    // ShowWindow call. Honor the user's request even after a hidden startup.
+    if !IsWindowVisible(hwnd).as_bool() {
+        let _ = ShowWindow(hwnd, SW_SHOW);
+    }
     let _ = SetForegroundWindow(hwnd);
     with_panel(|panel| {
         let _ = SetFocus(panel.nav);
@@ -5401,6 +5406,37 @@ unsafe fn invalidate_nav_item(nav: HWND, index: i32) {
 mod tests {
     use super::*;
     use poller::PollError;
+
+    #[test]
+    #[ignore = "run alone in a fresh process with a hidden startup window"]
+    fn settings_open_on_first_request_after_hidden_startup() {
+        unsafe {
+            show(HWND::default());
+            let hwnd = current_window();
+            let visible = !hwnd.is_invalid() && IsWindowVisible(hwnd).as_bool();
+            show(HWND::default());
+            let visible_on_second_request = IsWindowVisible(hwnd).as_bool();
+            close();
+            eprintln!("first_request_visible={visible} second_request_visible={visible_on_second_request}");
+            assert!(visible_on_second_request);
+            assert!(
+                visible,
+                "the first settings request must display the window"
+            );
+
+            show(HWND::default());
+            let hwnd = current_window();
+            assert!(IsWindowVisible(hwnd).as_bool());
+            let _ = ShowWindow(hwnd, SW_MINIMIZE);
+            show(HWND::default());
+            let restored = IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool();
+            close();
+            assert!(
+                restored,
+                "an existing minimized settings window must restore"
+            );
+        }
+    }
 
     #[test]
     fn page_slide_eases_into_the_final_position() {
