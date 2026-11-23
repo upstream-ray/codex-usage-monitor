@@ -93,6 +93,16 @@ struct CodexTokenData {
 #[derive(Deserialize)]
 struct CodexUsageResponse {
     rate_limit: Option<Option<Box<CodexRateLimitDetails>>>,
+    credits: Option<CodexCredits>,
+}
+
+#[derive(Deserialize)]
+struct CodexCredits {
+    #[serde(default)]
+    has_credits: bool,
+    #[serde(default)]
+    unlimited: bool,
+    balance: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -969,8 +979,22 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
 }
 
 fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> {
-    let details = *response.rate_limit.flatten()?;
+    let credit_balance = response.credits.and_then(|credits| {
+        if !credits.has_credits || credits.unlimited {
+            return None;
+        }
+        credits
+            .balance?
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    });
     let mut data = UsageData::default();
+    data.credit_balance = credit_balance;
+    let Some(details) = response.rate_limit.flatten() else {
+        return data.credit_balance.map(|_| data);
+    };
+    let details = *details;
     let mut has_session = false;
     let mut has_weekly = false;
 
@@ -1860,6 +1884,39 @@ mod tests {
 
         assert_eq!(usage.session.percentage, 18.0);
         assert_eq!(usage.weekly.percentage, 33.0);
+    }
+
+    #[test]
+    fn codex_credit_balance_requires_valid_available_credits() {
+        let parse = |credits: &str| {
+            let json = format!(
+                r#"{{"rate_limit":{{"primary_window":{{"used_percent":2,"reset_at":1784500338}}}},"credits":{credits}}}"#
+            );
+            let response = serde_json::from_str(&json).unwrap();
+            codex_usage_from_response(response).unwrap().credit_balance
+        };
+        assert_eq!(
+            parse(r#"{"has_credits":true,"unlimited":false,"balance":"939.7148505000"}"#),
+            Some(939.7148505)
+        );
+        for credits in [
+            r#"{"has_credits":false,"unlimited":false,"balance":"12.0"}"#,
+            r#"{"has_credits":true,"unlimited":true,"balance":"12.0"}"#,
+            r#"{"has_credits":true,"unlimited":false,"balance":null}"#,
+            r#"{"has_credits":true,"unlimited":false,"balance":"NaN"}"#,
+            r#"{"has_credits":true,"unlimited":false,"balance":"-1"}"#,
+            "null",
+        ] {
+            assert_eq!(parse(credits), None, "{credits}");
+        }
+        let credits_only: CodexUsageResponse = serde_json::from_str(
+            r#"{"rate_limit":null,"credits":{"has_credits":true,"unlimited":false,"balance":"42.5"}}"#,
+        )
+        .unwrap();
+        let usage = codex_usage_from_response(credits_only).unwrap();
+        assert_eq!(usage.credit_balance, Some(42.5));
+        assert!(!usage.session.has_reading());
+        assert!(!usage.weekly.has_reading());
     }
 
     #[test]

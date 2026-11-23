@@ -90,6 +90,8 @@ struct AppState {
     antigravity_groups: Vec<String>,
     show_session_window: bool,
     show_weekly_window: bool,
+    show_credit_balance: bool,
+    credit_hidden_for_space: bool,
     alert_threshold_percent: u8,
     notified_quota_windows: BTreeSet<String>,
     notify_on_reset: bool,
@@ -171,6 +173,7 @@ const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
 const IDM_SHOW_SESSION_WINDOW: u16 = 71;
 const IDM_SHOW_WEEKLY_WINDOW: u16 = 72;
+const IDM_SHOW_CREDIT_BALANCE: u16 = 73;
 const IDM_ALERT_OFF: u16 = 80;
 const IDM_ALERT_10: u16 = 81;
 const IDM_ALERT_20: u16 = 82;
@@ -615,6 +618,8 @@ struct SettingsFile {
     #[serde(default = "default_show_usage_window")]
     show_weekly_window: bool,
     #[serde(default)]
+    show_credit_balance: bool,
+    #[serde(default)]
     alert_threshold_percent: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     notified_quota_windows: Vec<String>,
@@ -653,6 +658,7 @@ impl Default for SettingsFile {
             antigravity_quota_group: None,
             show_session_window: true,
             show_weekly_window: true,
+            show_credit_balance: false,
             alert_threshold_percent: 0,
             notified_quota_windows: Vec::new(),
             passive_monitoring: true,
@@ -807,6 +813,7 @@ fn save_state_settings() {
             antigravity_quota_group: s.antigravity_quota_group.clone(),
             show_session_window: s.show_session_window,
             show_weekly_window: s.show_weekly_window,
+            show_credit_balance: s.show_credit_balance,
             alert_threshold_percent: s.alert_threshold_percent,
             notified_quota_windows: s.notified_quota_windows.iter().cloned().collect(),
             passive_monitoring: privacy.passive_monitoring,
@@ -1982,6 +1989,85 @@ const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 138;
 const MODEL_RIGHT_MARGIN: i32 = 9;
 const RIGHT_MARGIN: i32 = 4;
 const WIDGET_HEIGHT: i32 = 46;
+const CREDIT_GAP: i32 = 8;
+
+fn credit_label(language: LanguageId) -> &'static str {
+    match language {
+        LanguageId::English => "Extra credits",
+        LanguageId::Dutch => "Extra tegoed",
+        LanguageId::Spanish => "Créditos extra",
+        LanguageId::French => "Crédits suppl.",
+        LanguageId::German => "Extra-Guthaben",
+        LanguageId::Italian => "Crediti extra",
+        LanguageId::Japanese => "追加クレジット",
+        LanguageId::Korean => "추가 크레딧",
+        LanguageId::SimplifiedChinese => "额外点数",
+        LanguageId::TraditionalChinese => "額外點數",
+        LanguageId::Russian => "Доп. кредиты",
+        LanguageId::PortugueseBrazil => "Créditos extras",
+    }
+}
+
+fn credit_value(balance: f64) -> String {
+    if balance >= 1_000_000.0 {
+        format!("{:.1}M", balance / 1_000_000.0)
+    } else if balance >= 10_000.0 {
+        format!("{:.1}k", balance / 1_000.0)
+    } else {
+        format!("{balance:.1}")
+    }
+}
+
+fn eligible_credit_balance(state: &AppState) -> Option<f64> {
+    if !state.show_codex
+        || !state.show_credit_balance
+        || !state.has_poll_result
+        || state.monitor.services[1].error.is_some()
+    {
+        return None;
+    }
+    state.data.as_ref()?.codex.as_ref()?.credit_balance
+}
+
+fn visible_credit_balance(state: &AppState) -> Option<f64> {
+    (!state.credit_hidden_for_space)
+        .then(|| eligible_credit_balance(state))
+        .flatten()
+}
+
+fn credit_column_width(language: LanguageId, appearance: Appearance, value: &str) -> i32 {
+    unsafe {
+        let hdc = GetDC(HWND::default());
+        if hdc.is_invalid() {
+            return sc(100);
+        }
+        let font = create_widget_font(appearance);
+        if font.is_invalid() {
+            ReleaseDC(HWND::default(), hdc);
+            return sc(100);
+        }
+        let old_font = SelectObject(hdc, font);
+        let width = [credit_label(language), value]
+            .into_iter()
+            .map(|value| {
+                let wide: Vec<u16> = value.encode_utf16().collect();
+                let mut size = SIZE::default();
+                if GetTextExtentPoint32W(hdc, &wide, &mut size).as_bool() {
+                    size.cx
+                } else {
+                    0
+                }
+            })
+            .max()
+            .unwrap_or(0)
+            .max(sc(70))
+            + sc(4);
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+        ReleaseDC(HWND::default(), hdc);
+        width
+    }
+}
 
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
     let divider_h = sc(25);
@@ -2184,7 +2270,7 @@ fn widget_width_from_columns(
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    widget_width_from_columns(
+    let base = widget_width_from_columns(
         active_model_count(
             state.show_claude_code,
             state.show_codex,
@@ -2192,7 +2278,20 @@ fn total_widget_width_for_state(state: &AppState) -> i32 {
         ),
         state.appearance,
         current_usage_layout_widths(state),
-    )
+    );
+    let credit = visible_credit_balance(state).map(credit_value);
+    base + credit.as_deref().map_or(0, |value| {
+        credit_extra_width(state.language, state.appearance, value)
+    })
+}
+
+fn credit_extra_width(language: LanguageId, appearance: Appearance, value: &str) -> i32 {
+    sc(CREDIT_GAP * 2 + 1) + credit_column_width(language, appearance, value)
+}
+
+fn credit_appearance(mut appearance: Appearance, height: i32) -> Appearance {
+    appearance.font_size = appearance.font_size.fit(height, 2, sc);
+    appearance
 }
 
 fn has_cross_day_reset(
@@ -2450,6 +2549,8 @@ pub fn run() {
 
                 show_session_window: settings.show_session_window,
                 show_weekly_window: settings.show_weekly_window,
+                show_credit_balance: settings.show_credit_balance,
+                credit_hidden_for_space: false,
                 alert_threshold_percent: settings.alert_threshold_percent,
                 notified_quota_windows: settings.notified_quota_windows.into_iter().collect(),
                 notify_on_reset: settings.notify_on_reset,
@@ -2641,6 +2742,11 @@ fn update_quota_tooltips() {
             let count = active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity);
             let (label_width, text_width) = current_usage_layout_widths(s);
             let width = model_usage_width(row_bar_segment_count(count), text_width, s.appearance);
+            let credit = visible_credit_balance(s).map(|balance| {
+                let value = credit_value(balance);
+                let extra_width = credit_extra_width(s.language, s.appearance, &value);
+                (balance, value, extra_width)
+            });
             let mut left = sc(LEFT_DIVIDER_W)
                 + sc(DIVIDER_RIGHT_MARGIN)
                 + period_label_column_width(label_width, s.appearance);
@@ -2689,6 +2795,22 @@ fn update_quota_tooltips() {
                     text,
                 ));
                 left += width + sc(MODEL_RIGHT_MARGIN);
+                if id == 1 {
+                    if let Some((balance, value, extra_width)) = &credit {
+                        let credit_left = left + sc(CREDIT_GAP + 1);
+                        let column_width = credit_column_width(s.language, s.appearance, value);
+                        regions.push((
+                            RECT {
+                                left: credit_left,
+                                top: 0,
+                                right: credit_left + column_width,
+                                bottom: sc(WIDGET_HEIGHT),
+                            },
+                            format!("{}: {balance}", credit_label(s.language)),
+                        ));
+                        left += extra_width;
+                    }
+                }
             }
         }
         (s.hwnd.to_hwnd(), regions)
@@ -2707,6 +2829,7 @@ struct WidgetContent<'a> {
     visible_rows: [bool; 2],
     used: [[f64; 3]; 2],
     text: [[std::borrow::Cow<'a, str>; 3]; 2],
+    credit: Option<std::borrow::Cow<'a, str>>,
 }
 
 const WIDGET_PROVIDERS: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::Antigravity];
@@ -2745,6 +2868,7 @@ impl WidgetContent<'static> {
                     &s.antigravity_weekly_text,
                 ]),
             ],
+            credit: visible_credit_balance(s).map(|balance| credit_value(balance).into()),
         }
     }
 }
@@ -2889,6 +3013,7 @@ fn paint_content(hdc: HDC, width: i32, height: i32, content: &WidgetContent<'_>)
         visible_rows,
         used,
         ref text,
+        ref credit,
     } = *content;
     let rows = visible_rows
         .into_iter()
@@ -2985,6 +3110,11 @@ fn paint_content(hdc: HDC, width: i32, height: i32, content: &WidgetContent<'_>)
                 if visible {
                     provider_icons::draw(hdc, icon_x, (height - size) / 2, size, provider);
                     icon_x += model_width;
+                    if matches!(provider, Provider::Codex) {
+                        if let Some(value) = credit.as_deref() {
+                            icon_x += credit_extra_width(language, appearance, value);
+                        }
+                    }
                 }
             }
         }
@@ -3044,8 +3174,70 @@ fn paint_content(hdc: HDC, width: i32, height: i32, content: &WidgetContent<'_>)
                     appearance,
                 );
                 model_x += model_width;
+                if matches!(provider, Provider::Codex) {
+                    if let Some(value) = credit.as_deref() {
+                        model_x += credit_extra_width(language, appearance, value);
+                    }
+                }
             }
             row_y += row_height + row_gap;
+        }
+
+        if let Some(value) = credit.as_deref() {
+            let column_width = credit_column_width(language, appearance, value);
+            let codex_column = 1 + providers[0] as i32;
+            let left = model_left + model_width * codex_column + sc(CREDIT_GAP + 1);
+            let divider = RECT {
+                left: left - sc(CREDIT_GAP) - sc(1),
+                top: divider_top,
+                right: left - sc(CREDIT_GAP),
+                bottom: divider_bottom,
+            };
+            let divider_brush = CreateSolidBrush(COLORREF(text_color.to_colorref()));
+            FillRect(hdc, &divider, divider_brush);
+            let _ = DeleteObject(divider_brush);
+
+            let credit_appearance = credit_appearance(content.appearance, height);
+            let credit_font = create_widget_font(credit_appearance);
+            let previous_font = if credit_font.is_invalid() {
+                None
+            } else {
+                Some(SelectObject(hdc, credit_font))
+            };
+            let credit_row_height = credit_appearance.row_height().min((height / 2).max(1));
+            let credit_gap = (height - 2 * credit_row_height).clamp(0, sc(5));
+            let top = ((height - 2 * credit_row_height - credit_gap) / 2).max(0);
+            let mut label_wide: Vec<u16> = credit_label(language).encode_utf16().collect();
+            let mut value_wide: Vec<u16> = value.encode_utf16().collect();
+            let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+            let _ = DrawTextW(
+                hdc,
+                &mut label_wide,
+                &mut RECT {
+                    left,
+                    top,
+                    right: left + column_width,
+                    bottom: top + credit_row_height,
+                },
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+            let _ = SetTextColor(hdc, COLORREF(codex_brand_color(is_dark).to_colorref()));
+            let value_top = top + credit_row_height + credit_gap;
+            let _ = DrawTextW(
+                hdc,
+                &mut value_wide,
+                &mut RECT {
+                    left,
+                    top: value_top,
+                    right: left + column_width,
+                    bottom: value_top + credit_row_height,
+                },
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+            if let Some(previous_font) = previous_font {
+                SelectObject(hdc, previous_font);
+                let _ = DeleteObject(credit_font);
+            }
         }
 
         SelectObject(hdc, old_font);
@@ -3493,6 +3685,21 @@ fn position_at_taskbar() {
         }
     }
 
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            let credit = eligible_credit_balance(s).map(credit_value);
+            let base = widget_width_from_columns(
+                active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
+                s.appearance,
+                current_usage_layout_widths(s),
+            );
+            s.credit_hidden_for_space = credit.as_deref().is_some_and(|value| {
+                base + credit_extra_width(s.language, s.appearance, value)
+                    > tray_left - taskbar_rect.left
+            });
+        }
+    }
     let widget_width = total_widget_width();
     let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
     let tray_offset = tray_offset.clamp(0, max_offset);
@@ -4130,6 +4337,13 @@ unsafe extern "system" fn wnd_proc(
                     save_state_settings();
                     render_layered();
                     sync_tray_icons(hwnd);
+                }
+                IDM_SHOW_CREDIT_BALANCE => {
+                    if let Some(s) = lock_state().as_mut() {
+                        s.show_credit_balance = !s.show_credit_balance;
+                    }
+                    save_state_settings();
+                    render_layered();
                 }
                 IDM_THEME_SYSTEM | IDM_THEME_LIGHT | IDM_THEME_DARK => {
                     let theme = match id {
@@ -4985,9 +5199,52 @@ mod tests {
                         assert!(width <= reset_width, "{language:?}: {reset:?}");
                         assert!(height <= appearance.row_height(), "{language:?}: {reset:?}");
                     }
+                    let credit_width = credit_column_width(language, appearance, "9999.9");
+                    for value in [credit_label(language), "9999.9"] {
+                        let (width, height) = width_of(label_font, value);
+                        assert!(width <= credit_width, "{language:?}: {value:?}");
+                        assert!(height <= appearance.row_height(), "{language:?}: {value:?}");
+                    }
                     let _ = DeleteObject(label_font);
                     let _ = DeleteObject(reset_font);
                 }
+            }
+            ReleaseDC(HWND::default(), hdc);
+        }
+    }
+
+    #[test]
+    fn credit_balance_formats_compactly() {
+        assert_eq!(credit_value(0.0), "0.0");
+        assert_eq!(credit_value(939.7148505), "939.7");
+        assert_eq!(credit_value(10_000.0), "10.0k");
+        assert_eq!(credit_value(1_250_000.0), "1.2M");
+    }
+
+    #[test]
+    fn credit_font_fits_two_rows_even_with_one_quota_row() {
+        unsafe {
+            let hdc = GetDC(HWND::default());
+            assert!(!hdc.is_invalid());
+            let selected = Appearance {
+                font_size: FontSize::Px16,
+                ..Appearance::default()
+            };
+            for (height, expected) in [
+                (sc(38), FontSize::Px12),
+                (sc(40), FontSize::Px14),
+                (sc(46), FontSize::Px16),
+            ] {
+                let appearance = credit_appearance(selected, height);
+                assert_eq!(appearance.font_size, expected);
+                let font = create_widget_font(appearance);
+                assert!(!font.is_invalid());
+                let old = SelectObject(hdc, font);
+                let mut metrics = TEXTMETRICW::default();
+                assert!(GetTextMetricsW(hdc, &mut metrics).as_bool());
+                assert!(metrics.tmHeight <= appearance.row_height().min(height / 2));
+                SelectObject(hdc, old);
+                let _ = DeleteObject(font);
             }
             ReleaseDC(HWND::default(), hdc);
         }
@@ -5031,15 +5288,18 @@ mod tests {
         let old: SettingsFile = serde_json::from_str(&test_settings_json("zh-CN")).unwrap();
         assert_eq!(old.appearance, Appearance::default());
         assert_eq!(old.monitor_device, None);
+        assert!(!old.show_credit_balance);
 
         let customized = SettingsFile {
             appearance: Appearance::translucent_dark_taskbar(),
+            show_credit_balance: true,
             ..old
         };
         assert_eq!(customized.appearance.bar_style, BarStyle::Continuous);
         let json = serde_json::to_string(&customized).unwrap();
         let restored: SettingsFile = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.appearance, Appearance::translucent_dark_taskbar());
+        assert!(restored.show_credit_balance);
     }
 
     #[test]
