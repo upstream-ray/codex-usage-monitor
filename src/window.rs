@@ -91,6 +91,7 @@ struct AppState {
     show_session_window: bool,
     show_weekly_window: bool,
     show_credit_balance: bool,
+    credit_hidden_for_space: bool,
     alert_threshold_percent: u8,
     notified_quota_windows: BTreeSet<String>,
     notify_on_reset: bool,
@@ -2017,7 +2018,7 @@ fn credit_value(balance: f64) -> String {
     }
 }
 
-fn visible_credit_balance(state: &AppState) -> Option<f64> {
+fn eligible_credit_balance(state: &AppState) -> Option<f64> {
     if !state.show_codex
         || !state.show_credit_balance
         || !state.has_poll_result
@@ -2026,6 +2027,12 @@ fn visible_credit_balance(state: &AppState) -> Option<f64> {
         return None;
     }
     state.data.as_ref()?.codex.as_ref()?.credit_balance
+}
+
+fn visible_credit_balance(state: &AppState) -> Option<f64> {
+    (!state.credit_hidden_for_space)
+        .then(|| eligible_credit_balance(state))
+        .flatten()
 }
 
 fn credit_column_width(language: LanguageId, appearance: Appearance, value: &str) -> i32 {
@@ -2273,12 +2280,18 @@ fn total_widget_width_for_state(state: &AppState) -> i32 {
         current_usage_layout_widths(state),
     );
     let credit = visible_credit_balance(state).map(credit_value);
-    base + credit
-        .as_deref()
-        .map(|value| {
-            sc(CREDIT_GAP * 2 + 1) + credit_column_width(state.language, state.appearance, value)
-        })
-        .unwrap_or(0)
+    base + credit.as_deref().map_or(0, |value| {
+        credit_extra_width(state.language, state.appearance, value)
+    })
+}
+
+fn credit_extra_width(language: LanguageId, appearance: Appearance, value: &str) -> i32 {
+    sc(CREDIT_GAP * 2 + 1) + credit_column_width(language, appearance, value)
+}
+
+fn credit_appearance(mut appearance: Appearance, height: i32) -> Appearance {
+    appearance.font_size = appearance.font_size.fit(height, 2, sc);
+    appearance
 }
 
 fn has_cross_day_reset(
@@ -2537,6 +2550,7 @@ pub fn run() {
                 show_session_window: settings.show_session_window,
                 show_weekly_window: settings.show_weekly_window,
                 show_credit_balance: settings.show_credit_balance,
+                credit_hidden_for_space: false,
                 alert_threshold_percent: settings.alert_threshold_percent,
                 notified_quota_windows: settings.notified_quota_windows.into_iter().collect(),
                 notify_on_reset: settings.notify_on_reset,
@@ -3165,15 +3179,19 @@ fn paint_content(hdc: HDC, width: i32, height: i32, content: &WidgetContent<'_>)
             FillRect(hdc, &divider, divider_brush);
             let _ = DeleteObject(divider_brush);
 
-            let credit_row_height = appearance.row_height().min((height / 2).max(1));
+            let credit_appearance = credit_appearance(content.appearance, height);
+            let credit_font = create_widget_font(credit_appearance);
+            let previous_font = if credit_font.is_invalid() {
+                None
+            } else {
+                Some(SelectObject(hdc, credit_font))
+            };
+            let credit_row_height = credit_appearance.row_height().min((height / 2).max(1));
             let credit_gap = (height - 2 * credit_row_height).clamp(0, sc(5));
             let top = ((height - 2 * credit_row_height - credit_gap) / 2).max(0);
             let mut label_wide: Vec<u16> = credit_label(language).encode_utf16().collect();
             let mut value_wide: Vec<u16> = value.encode_utf16().collect();
-            let _ = SetTextColor(
-                hdc,
-                COLORREF(reset_text_color(appearance, is_dark).to_colorref()),
-            );
+            let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
             let _ = DrawTextW(
                 hdc,
                 &mut label_wide,
@@ -3185,7 +3203,7 @@ fn paint_content(hdc: HDC, width: i32, height: i32, content: &WidgetContent<'_>)
                 },
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE,
             );
-            let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+            let _ = SetTextColor(hdc, COLORREF(codex_brand_color(is_dark).to_colorref()));
             let value_top = top + credit_row_height + credit_gap;
             let _ = DrawTextW(
                 hdc,
@@ -3198,6 +3216,10 @@ fn paint_content(hdc: HDC, width: i32, height: i32, content: &WidgetContent<'_>)
                 },
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE,
             );
+            if let Some(previous_font) = previous_font {
+                SelectObject(hdc, previous_font);
+                let _ = DeleteObject(credit_font);
+            }
         }
 
         SelectObject(hdc, old_font);
@@ -3645,6 +3667,21 @@ fn position_at_taskbar() {
         }
     }
 
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            let credit = eligible_credit_balance(s).map(credit_value);
+            let base = widget_width_from_columns(
+                active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
+                s.appearance,
+                current_usage_layout_widths(s),
+            );
+            s.credit_hidden_for_space = credit.as_deref().is_some_and(|value| {
+                base + credit_extra_width(s.language, s.appearance, value)
+                    > tray_left - taskbar_rect.left
+            });
+        }
+    }
     let widget_width = total_widget_width();
     let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
     let tray_offset = tray_offset.clamp(0, max_offset);
@@ -5164,6 +5201,35 @@ mod tests {
         assert_eq!(credit_value(939.7148505), "939.7");
         assert_eq!(credit_value(10_000.0), "10.0k");
         assert_eq!(credit_value(1_250_000.0), "1.2M");
+    }
+
+    #[test]
+    fn credit_font_fits_two_rows_even_with_one_quota_row() {
+        unsafe {
+            let hdc = GetDC(HWND::default());
+            assert!(!hdc.is_invalid());
+            let selected = Appearance {
+                font_size: FontSize::Px16,
+                ..Appearance::default()
+            };
+            for (height, expected) in [
+                (sc(38), FontSize::Px12),
+                (sc(40), FontSize::Px14),
+                (sc(46), FontSize::Px16),
+            ] {
+                let appearance = credit_appearance(selected, height);
+                assert_eq!(appearance.font_size, expected);
+                let font = create_widget_font(appearance);
+                assert!(!font.is_invalid());
+                let old = SelectObject(hdc, font);
+                let mut metrics = TEXTMETRICW::default();
+                assert!(GetTextMetricsW(hdc, &mut metrics).as_bool());
+                assert!(metrics.tmHeight <= appearance.row_height().min(height / 2));
+                SelectObject(hdc, old);
+                let _ = DeleteObject(font);
+            }
+            ReleaseDC(HWND::default(), hdc);
+        }
     }
 
     #[test]

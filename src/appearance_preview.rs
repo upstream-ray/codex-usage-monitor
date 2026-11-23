@@ -2,11 +2,23 @@
 use super::*;
 
 const USED: [[f64; 3]; 2] = [[26.0, 62.0, 82.0], [11.0, 52.0, 83.0]];
+const SAMPLE_CREDIT: &str = "939.7";
 
+#[cfg(test)]
 fn sample(
     appearance: Appearance,
     system_dark: bool,
     language: LanguageId,
+) -> WidgetContent<'static> {
+    sample_with_options(appearance, system_dark, language, [true; 3], false)
+}
+
+fn sample_with_options(
+    appearance: Appearance,
+    system_dark: bool,
+    language: LanguageId,
+    providers: [bool; 3],
+    show_credit_balance: bool,
 ) -> WidgetContent<'static> {
     let strings = language.strings();
     let suffixes = [strings.hour_suffix, strings.day_suffix];
@@ -43,11 +55,30 @@ fn sample(
         appearance,
         language,
         mode: QuotaDisplayMode::Remaining,
-        providers: [true; 3],
+        providers,
         visible_rows: [true; 2],
         used: USED,
         text,
-        credit: None,
+        credit: (show_credit_balance && providers[1]).then(|| SAMPLE_CREDIT.into()),
+    }
+}
+
+pub(super) fn sample_width(
+    appearance: Appearance,
+    language: LanguageId,
+    providers: [bool; 3],
+    show_credit_balance: bool,
+) -> i32 {
+    let active = providers
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count()
+        .max(1) as i32;
+    let base = total_widget_width_for(active, language, appearance);
+    if show_credit_balance && providers[1] {
+        base + credit_extra_width(language, appearance, SAMPLE_CREDIT)
+    } else {
+        base
     }
 }
 
@@ -58,18 +89,95 @@ pub(super) fn paint_sample(
     appearance: Appearance,
     system_dark: bool,
     language: LanguageId,
+    providers: [bool; 3],
+    show_credit_balance: bool,
 ) {
     paint_content(
         dc,
         width,
         height,
-        &sample(appearance, system_dark, language),
+        &sample_with_options(
+            appearance,
+            system_dark,
+            language,
+            providers,
+            show_credit_balance,
+        ),
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pixels(content: &WidgetContent<'_>, width: i32) -> Vec<u32> {
+        let height = sc(WIDGET_HEIGHT);
+        unsafe {
+            let dc = CreateCompatibleDC(HDC::default());
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+            let old = SelectObject(dc, bitmap);
+            paint_content(dc, width, height, content);
+            let _ = GdiFlush();
+            let image =
+                std::slice::from_raw_parts(bits.cast::<u32>(), (width * height) as usize).to_vec();
+            SelectObject(dc, old);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(dc);
+            image
+        }
+    }
+
+    #[test]
+    fn credit_preview_preserves_existing_provider_pixels() {
+        let appearance = Appearance::default();
+        let language = LanguageId::SimplifiedChinese;
+        for providers in [
+            [false, true, false],
+            [true, true, false],
+            [true, true, true],
+        ] {
+            let base_width = sample_width(appearance, language, providers, false);
+            let full_width = sample_width(appearance, language, providers, true);
+            assert_eq!(
+                full_width - base_width,
+                credit_extra_width(language, appearance, SAMPLE_CREDIT)
+            );
+            let base = sample_with_options(appearance, true, language, providers, false);
+            let full = sample_with_options(appearance, true, language, providers, true);
+            let before = pixels(&base, base_width);
+            let after = pixels(&full, full_width);
+            for y in 0..sc(WIDGET_HEIGHT) as usize {
+                assert_eq!(
+                    &before[y * base_width as usize..(y + 1) * base_width as usize],
+                    &after[y * full_width as usize..y * full_width as usize + base_width as usize],
+                    "provider pixels changed with {providers:?}"
+                );
+            }
+            let (background, _, _) = appearance_colors(appearance, true);
+            let background = dib_rgb(background);
+            assert!((0..sc(WIDGET_HEIGHT) as usize).any(|y| {
+                (base_width as usize..full_width as usize)
+                    .any(|x| after[y * full_width as usize + x] & 0x00FF_FFFF != background)
+            }));
+        }
+        assert_eq!(
+            sample_width(appearance, language, [true, false, false], true),
+            sample_width(appearance, language, [true, false, false], false)
+        );
+    }
 
     #[test]
     #[ignore = "set CODEX_APPEARANCE_PREVIEW_DIR to render appearance fixtures"]

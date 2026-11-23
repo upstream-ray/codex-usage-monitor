@@ -165,6 +165,8 @@ enum Row {
     Preview {
         appearance: Appearance,
         system_dark: bool,
+        providers: [bool; 3],
+        show_credit_balance: bool,
     },
     Check {
         item: OptionItem,
@@ -618,7 +620,17 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                     credit_label(s.language),
                     IDM_SHOW_CREDIT_BALANCE,
                     s.show_credit_balance,
-                ),
+                )
+                .hint(s.credit_hidden_for_space.then(|| {
+                    Hint::Warning(
+                        if s.language == LanguageId::SimplifiedChinese {
+                            "任务栏空间不足，点数暂时隐藏；其他额度仍会显示。"
+                        } else {
+                            "Not enough taskbar space. Credits are hidden; other quotas remain visible."
+                        }
+                        .into(),
+                    )
+                })),
                 choice(
                     strings.quota_value,
                     &[
@@ -639,6 +651,8 @@ fn rows(page: Page, s: &AppState) -> Vec<Row> {
                 Row::Preview {
                     appearance: a,
                     system_dark: s.is_dark,
+                    providers: [s.show_claude_code, s.show_codex, s.show_antigravity],
+                    show_credit_balance: s.show_credit_balance,
                 },
                 section(strings.widget_style_section),
                 choice(
@@ -2182,6 +2196,8 @@ struct PreviewKey {
     appearance: Appearance,
     system_dark: bool,
     language: LanguageId,
+    providers: [bool; 3],
+    show_credit_balance: bool,
     widget_dpi: u32,
 }
 
@@ -3667,6 +3683,8 @@ impl Panel {
                 Row::Preview {
                     appearance,
                     system_dark,
+                    providers,
+                    show_credit_balance,
                 } => {
                     draw_text(
                         dc,
@@ -3692,6 +3710,8 @@ impl Panel {
                         *appearance,
                         *system_dark,
                         language,
+                        *providers,
+                        *show_credit_balance,
                     );
                 }
                 Row::Note(hint) => draw_text(
@@ -3849,6 +3869,8 @@ impl Panel {
         appearance: Appearance,
         system_dark: bool,
         language: LanguageId,
+        providers: [bool; 3],
+        show_credit_balance: bool,
     ) {
         let available = area.right - area.left;
         if available <= 0 {
@@ -3858,11 +3880,18 @@ impl Panel {
             appearance,
             system_dark,
             language,
+            providers,
+            show_credit_balance,
             widget_dpi: CURRENT_DPI.load(Ordering::Relaxed),
         };
         let mut cache = self.preview.borrow_mut();
         if cache.as_ref().is_none_or(|(cached, _)| *cached != key) {
-            let width = total_widget_width_for(3, language, appearance);
+            let width = appearance_preview::sample_width(
+                appearance,
+                language,
+                providers,
+                show_credit_balance,
+            );
             let height = sc(WIDGET_HEIGHT);
             *cache = Bitmap::new(width, height).map(|bitmap| {
                 appearance_preview::paint_sample(
@@ -3872,6 +3901,8 @@ impl Panel {
                     appearance,
                     system_dark,
                     language,
+                    providers,
+                    show_credit_balance,
                 );
                 (key, bitmap)
             });
@@ -5632,7 +5663,8 @@ mod tests {
                     antigravity_groups: Vec::new(),
                     show_session_window: true,
                     show_weekly_window: true,
-                    show_credit_balance: false,
+                    show_credit_balance: true,
+                    credit_hidden_for_space: false,
                     alert_threshold_percent: 20,
                     notified_quota_windows: BTreeSet::new(),
                     notify_on_reset: true,
@@ -5728,6 +5760,12 @@ mod tests {
             with_panel(|p| p.sync(true));
             let dark_general = with_panel(|p| p.capture_window()).flatten().unwrap();
             save_bmp(&dir.join("02-general-dark.bmp"), &dark_general);
+            with_panel(|p| {
+                p.page = 2;
+                p.sync(true);
+            });
+            let dark_appearance = with_panel(|p| p.capture_window()).flatten().unwrap();
+            save_bmp(&dir.join("02-appearance-dark.bmp"), &dark_appearance);
 
             // 3. Light Appearance page (scroll bar active, verify identical card width!)
             if let Some(s) = lock_state().as_mut() {

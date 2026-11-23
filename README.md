@@ -74,7 +74,7 @@ Normal uninstall preserves `%APPDATA%\CodexUsage\settings.json`. Append `-Remove
 Each enabled service gets its own column with independent status and retry handling.
 
 - **Quota rows (`5h` / `7d`):** Represent the 5-hour session window and weekly window.
-- **Extra Codex credits:** Turn on **Settings → Usage → Extra credits** to add the remaining credit balance in a separate two-line column. This is off by default and appears only when Codex reports a valid balance.
+- **Extra Codex credits:** Turn on **Settings → Usage → Extra credits** to add the remaining credit balance in a separate two-line column. This is off by default and appears only when Codex reports a valid balance. If taskbar space is insufficient, the credit column hides before the quota columns.
 - **Remaining vs. Used:** Under **Settings → Usage → Quota value**, choose **Remaining** (default for new installs) or **Used**. Percentages, bars, and tray tooltips update together across all services and languages.
 - **Reset time formats (consistent across all languages):**
 
